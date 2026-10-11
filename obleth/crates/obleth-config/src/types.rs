@@ -671,6 +671,11 @@ pub struct ResolvedModel {
     /// payloads deserializable as "listed".
     #[serde(default = "default_true")]
     pub listed: bool,
+    /// See [`ModelRoute::description`]. Carried so the discovery endpoints
+    /// can say what a model is for. `#[serde(default)]` keeps older cached
+    /// payloads deserializable as "no description".
+    #[serde(default)]
+    pub description: String,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -4584,6 +4589,7 @@ mod tests {
 
     fn resolved_fixture() -> ResolvedModel {
         ResolvedModel {
+            description: String::new(),
             model_name: "glm-5-3".into(),
             aliases: vec!["glm-5-3-fp8".into(), "glm-5-3-mxfp4".into()],
             lifecycle: Default::default(),

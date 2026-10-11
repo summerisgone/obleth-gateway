@@ -466,6 +466,7 @@ mod tests {
 
     fn brain(api_base: &str) -> ResolvedModel {
         ResolvedModel {
+            description: String::new(),
             model_name: "brain-test".to_string(),
             aliases: Vec::new(),
             lifecycle: Default::default(),

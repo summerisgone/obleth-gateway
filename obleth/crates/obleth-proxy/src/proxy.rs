@@ -1541,7 +1541,17 @@ async fn run_pipeline(
             if let obleth_config::ReasoningPlan::Apply { served, .. } = &plan {
                 effort_served = Some(*served);
             }
-            *reasoning_note = crate::reasoning::Note::of(&plan);
+            *reasoning_note = match family_level {
+                // Through a family the level picked the model, so it was
+                // served even when the member has no effort control of its
+                // own; the member's map can still serve it as another.
+                Some(level) => Some(crate::reasoning::Note::for_family(
+                    level,
+                    requested_effort.level().ok().flatten(),
+                    &plan,
+                )),
+                None => crate::reasoning::Note::of(&plan),
+            };
         }
     }
 
@@ -4378,15 +4388,15 @@ fn family_entries(
     families
         .iter()
         .filter(|f| family_visible(f, allowed))
-        .filter(|f| {
+        .filter_map(|f| {
             let default_member = f.members.get(f.default_level);
-            candidates.iter().any(|c| {
+            let member = candidates.iter().find(|c| {
                 c.model.model_name == default_member
                     && c.model.enabled
                     && c.model.lifecycle.status_at(now).listed()
-            })
+            })?;
+            Some(family_entry(f, Some(&member.model)))
         })
-        .map(|f| family_entry(f))
         .collect()
 }
 
@@ -4402,9 +4412,14 @@ fn family_visible(family: &obleth_config::ModelFamily, allowed: Option<&[String]
 }
 
 /// One family's discovery entry: which model answers at each level, and the
-/// level a request that names none gets.
-fn family_entry(family: &obleth_config::ModelFamily) -> serde_json::Value {
-    serde_json::json!({
+/// level a request that names none gets. The catalog facts (context window,
+/// prices, capabilities) are the default member's, which serves a request
+/// that names no level; `description` falls back to it too.
+fn family_entry(
+    family: &obleth_config::ModelFamily,
+    default_member: Option<&ResolvedModel>,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
         "id": family.name,
         "object": "model",
         "owned_by": "obleth",
@@ -4415,7 +4430,14 @@ fn family_entry(family: &obleth_config::ModelFamily) -> serde_json::Value {
             "default_level": family.default_level,
             "members": family.members,
         },
-    })
+    });
+    if let (Some(member), Some(obj)) = (default_member, entry.as_object_mut()) {
+        if family.description.is_empty() {
+            obj.remove("description");
+        }
+        ModelDetails::of(member).extend(obj);
+    }
+    entry
 }
 
 /// The `reasoning` a discovery entry carries: nothing for a model that
@@ -4519,6 +4541,9 @@ fn model_entry(facts: &ModelFacts) -> serde_json::Value {
     if let (Some(r), Some(obj)) = (reasoning_fields(&facts.reasoning), entry.as_object_mut()) {
         obj.insert("reasoning".into(), r);
     }
+    if let Some(obj) = entry.as_object_mut() {
+        facts.details.extend(obj);
+    }
     // Only a model on its way out says anything about its lifecycle, so an
     // active model's entry is unchanged.
     if facts.status != obleth_config::ModelStatus::Active {
@@ -4568,6 +4593,75 @@ struct ModelFacts {
     status: obleth_config::ModelStatus,
     /// How the model takes reasoning effort (a variant's is its model's).
     reasoning: obleth_config::ModelReasoning,
+    /// What a catalog shows about the model (a variant's is its model's).
+    details: ModelDetails,
+}
+
+/// The facts a model catalog needs to describe a model without a second
+/// call: what it is for, how much it reads, what it costs, what it can do.
+/// Flattened into every discovery entry under the conventional `/model/info`
+/// key names.
+#[derive(Debug, Clone, PartialEq)]
+struct ModelDetails {
+    description: String,
+    context_window: i64,
+    input_cost_per_token: f64,
+    output_cost_per_token: f64,
+    supports_function_calling: bool,
+    supports_tool_choice: bool,
+    supports_response_schema: bool,
+    supports_system_messages: bool,
+    supports_vision: bool,
+}
+
+impl ModelDetails {
+    fn of(model: &ResolvedModel) -> Self {
+        ModelDetails {
+            description: model.description.clone(),
+            context_window: model.context_window,
+            input_cost_per_token: model.input_cost_per_token,
+            output_cost_per_token: model.output_cost_per_token,
+            supports_function_calling: model.supports_function_calling,
+            supports_tool_choice: model.supports_tool_choice,
+            supports_response_schema: model.supports_response_schema,
+            supports_system_messages: model.supports_system_messages,
+            supports_vision: model.supports_vision,
+        }
+    }
+
+    /// Add these facts to a discovery entry. `description` is left to an
+    /// entry that already set its own (a variant's, a family's).
+    fn extend(&self, obj: &mut serde_json::Map<String, serde_json::Value>) {
+        obj.entry("description")
+            .or_insert_with(|| self.description.clone().into());
+        obj.insert("context_window".into(), self.context_window.into());
+        obj.insert("max_input_tokens".into(), self.context_window.into());
+        obj.insert(
+            "input_cost_per_token".into(),
+            self.input_cost_per_token.into(),
+        );
+        obj.insert(
+            "output_cost_per_token".into(),
+            self.output_cost_per_token.into(),
+        );
+        obj.insert(
+            "supports_function_calling".into(),
+            self.supports_function_calling.into(),
+        );
+        obj.insert(
+            "supports_tool_choice".into(),
+            self.supports_tool_choice.into(),
+        );
+        obj.insert(
+            "supports_response_schema".into(),
+            self.supports_response_schema.into(),
+        );
+        obj.insert(
+            "supports_system_messages".into(),
+            self.supports_system_messages.into(),
+        );
+        obj.insert("supports_vision".into(), self.supports_vision.into());
+    }
 }
 
 /// The variant-only part of a discovery entry.
@@ -4592,6 +4686,7 @@ impl ModelFacts {
             variant: None,
             lifecycle: model.lifecycle.clone(),
             reasoning: model.reasoning.clone(),
+            details: ModelDetails::of(model),
             status: model.lifecycle.status_at(chrono::Utc::now()),
         }
     }
@@ -4730,7 +4825,11 @@ fn registered_model_entry(
         if !family_visible(&family, allowed) {
             return Some(Err(()));
         }
-        return Some(Ok(family_entry(&family)));
+        let member = candidates
+            .iter()
+            .find(|c| c.model.model_name == family.members.get(family.default_level))
+            .map(|c| &c.model);
+        return Some(Ok(family_entry(&family, member)));
     };
     if !facts.answers_by_id(allowed) {
         return Some(Err(()));
@@ -6762,6 +6861,21 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["id"], "acme");
         assert_eq!(entries[0]["family"]["members"]["high"], "acme-think");
+        // A catalog can describe the family from its entry alone: the facts
+        // are the default member's.
+        assert_eq!(
+            entries[0]["context_window"],
+            candidates[0].model.context_window
+        );
+        assert_eq!(
+            entries[0]["supports_function_calling"],
+            candidates[0].model.supports_function_calling
+        );
+        // Model entries carry them too.
+        let listed = &list["data"][0];
+        assert_eq!(listed["context_window"], candidates[2].model.context_window);
+        assert!(listed.get("input_cost_per_token").is_some());
+        assert!(listed.get("description").is_some());
     }
 
     #[test]
@@ -6965,6 +7079,7 @@ mod tests {
 
     fn model_with(endpoints: Vec<ResolvedEndpoint>) -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
+            description: String::new(),
             model_name: "m".into(),
             aliases: Vec::new(),
             lifecycle: Default::default(),
@@ -7973,6 +8088,7 @@ mod tests {
 
     fn minimal_model(name: &str) -> ResolvedModel {
         ResolvedModel {
+            description: String::new(),
             model_name: name.to_string(),
             aliases: Vec::new(),
             lifecycle: Default::default(),
