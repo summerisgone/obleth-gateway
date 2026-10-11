@@ -171,6 +171,14 @@ impl Note {
         Note::Served { served, requested }
     }
 
+    /// The served value, as the response header and the usage ledger spell it.
+    pub(crate) fn served_label(&self) -> &'static str {
+        match self {
+            Note::Unsupported => "unsupported",
+            Note::Served { served, .. } => served.as_str(),
+        }
+    }
+
     pub(crate) fn apply_headers(&self, resp: &mut Response<Body>) {
         let headers = resp.headers_mut();
         match self {

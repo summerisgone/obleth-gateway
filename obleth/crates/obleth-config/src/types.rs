@@ -1182,6 +1182,22 @@ pub struct UsageRecord {
     /// `#[serde(default)]` keeps older WAL records replayable.
     #[serde(default)]
     pub model_variant: String,
+    /// The reasoning effort the request was served at (`none`, `low`,
+    /// `medium`, `high`), `unsupported` when the model has no effort control
+    /// and the caller's was removed, or empty when the effort went through as
+    /// sent (or none was named). `#[serde(default)]` keeps older WAL records
+    /// replayable.
+    #[serde(default)]
+    pub reasoning_effort: String,
+    /// The model family the client called by name ([`crate::ModelFamily`]);
+    /// empty otherwise. `model` is the member that served the request.
+    /// `#[serde(default)]` keeps older WAL records replayable.
+    #[serde(default)]
+    pub model_family: String,
+    /// The reasoning effort the caller asked for, folded to the four levels
+    /// when it was one obleth knows; empty when none was named.
+    #[serde(default)]
+    pub reasoning_effort_requested: String,
 }
 
 /// Runtime-configurable retention for the raw per-request `usage` ledger.

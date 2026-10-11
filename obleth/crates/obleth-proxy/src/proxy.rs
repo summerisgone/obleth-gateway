@@ -1140,8 +1140,10 @@ async fn run_pipeline(
     // The effort the caller asked for, read before the name resolves: a
     // family name needs it to pick the model that answers.
     let requested_effort = crate::reasoning::Requested::read(&headers, &json);
-    // Set when the name was a family's: the level the member serves at.
+    // Set when the name was a family's: the level the member serves at, and
+    // the family, which the ledger records apart from variants.
     let mut family_level: Option<obleth_config::ReasoningLevel> = None;
+    let mut family_name: Option<String> = None;
 
     // ---- model listing (OpenAI `GET /v1/models`) ----
     // Answer the plain list call from the gateway's own registry so every
@@ -1214,6 +1216,9 @@ async fn run_pipeline(
         end_user: end_user.clone().unwrap_or_default(),
         // Set below once the model name resolves.
         model_variant: String::new(),
+        reasoning_effort: String::new(),
+        reasoning_effort_requested: String::new(),
+        model_family: String::new(),
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -1393,6 +1398,7 @@ async fn run_pipeline(
                         );
                     };
                     family_level = Some(level);
+                    family_name = Some(family.name.clone());
                     (Some(r), Some(family.name.clone()))
                 }
                 None => (None, None),
@@ -1434,7 +1440,7 @@ async fn run_pipeline(
             crate::lifecycle::Gate::Refuse(resp) => {
                 // Recorded, so the operator can see who still calls the model
                 // and tell them before the 410s do.
-                req_meta.model_variant = variant.clone().unwrap_or_default();
+                record_called_name(&mut req_meta, variant.as_deref(), family_name.as_deref());
                 let elapsed = request_start.elapsed().as_millis() as u32;
                 finalize(
                     &state,
@@ -1464,7 +1470,7 @@ async fn run_pipeline(
     }
     // The name the client used, for its usage row and response headers. The
     // ledger's `model` stays the parent's.
-    req_meta.model_variant = variant.clone().unwrap_or_default();
+    record_called_name(&mut req_meta, variant.as_deref(), family_name.as_deref());
     served_variant.clone_from(&variant);
 
     if requires_registered_model(&path) {
@@ -1552,8 +1558,20 @@ async fn run_pipeline(
                 )),
                 None => crate::reasoning::Note::of(&plan),
             };
+            req_meta.reasoning_effort = reasoning_note
+                .as_ref()
+                .map(crate::reasoning::Note::served_label)
+                .unwrap_or_default()
+                .to_string();
         }
     }
+    // What the caller asked for is logged whatever the model does with it,
+    // so a pass-through request still shows the level it carried.
+    req_meta.reasoning_effort_requested = match &requested_effort {
+        crate::reasoning::Requested::Nothing => String::new(),
+        crate::reasoning::Requested::Level(level) => level.as_str().to_string(),
+        crate::reasoning::Requested::Unknown(raw) => raw.clone(),
+    };
 
     // ---- model boons (gateway-granted capabilities) ----
     // e.g. the vision boon rewrites image content into text descriptions for
@@ -5579,6 +5597,26 @@ pub(crate) struct RequestMeta {
     /// The variant name the client called the model by, else empty. The
     /// ledger's `model` is the parent's either way.
     pub(crate) model_variant: String,
+    /// The reasoning effort served (see `UsageRecord::reasoning_effort`).
+    pub(crate) reasoning_effort: String,
+    /// The reasoning effort the caller asked for, or empty.
+    pub(crate) reasoning_effort_requested: String,
+    /// The model family the client called by name, else empty.
+    pub(crate) model_family: String,
+}
+
+/// Record the name the client called the model by: a family's goes in
+/// `model_family` (the family name rides the variant slot through the
+/// pipeline, for the allowlist, the cache and the response header), a real
+/// variant's in `model_variant`.
+fn record_called_name(meta: &mut RequestMeta, variant: Option<&str>, family: Option<&str>) {
+    match family {
+        Some(f) => {
+            meta.model_family = f.to_string();
+            meta.model_variant.clear();
+        }
+        None => meta.model_variant = variant.unwrap_or_default().to_string(),
+    }
 }
 
 /// Classify a request by its OpenAI-style path suffix. Matching the suffix (not
@@ -5921,6 +5959,9 @@ pub(crate) fn finalize(
         // The client request's own row; helper rows carry its id instead.
         parent_request_id: Uuid::nil(),
         model_variant: meta.model_variant.clone(),
+        reasoning_effort: meta.reasoning_effort.clone(),
+        reasoning_effort_requested: meta.reasoning_effort_requested.clone(),
+        model_family: meta.model_family.clone(),
     });
 }
 
@@ -8082,6 +8123,9 @@ mod tests {
             device_id: "dev-1".into(),
             end_user: String::new(),
             model_variant: String::new(),
+            reasoning_effort: String::new(),
+            reasoning_effort_requested: String::new(),
+            model_family: String::new(),
         };
         assert_eq!(meta.device_id, "dev-1");
     }
@@ -8464,6 +8508,26 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn a_family_is_logged_apart_from_variants() {
+        let mut meta = super::RequestMeta {
+            session_id: String::new(),
+            session_id_source: "none",
+            request_type: "chat",
+            device_id: String::new(),
+            end_user: String::new(),
+            model_variant: String::new(),
+            reasoning_effort: String::new(),
+            reasoning_effort_requested: String::new(),
+            model_family: String::new(),
+        };
+        super::record_called_name(&mut meta, Some("acme"), Some("acme"));
+        assert_eq!(meta.model_family, "acme");
+        assert_eq!(meta.model_variant, "");
+        super::record_called_name(&mut meta, Some("glm-5-3-spec"), None);
+        assert_eq!(meta.model_variant, "glm-5-3-spec");
+    }
+
+    #[test]
     fn a_variant_is_admitted_to_its_parents_pool() {
         let h = squash(handler());
         let serve = h.find("serve_as(r,&model)").expect("variant resolution");
@@ -8477,7 +8541,7 @@ mod lifecycle_tests {
         assert!(serve < adopt && adopt < pool && pool < admit);
         // The ledger and the allowlist see the parent name; the variant rides
         // on the request's metadata for its usage row and response header.
-        assert!(h[serve..pool].contains("req_meta.model_variant="));
+        assert!(h[serve..pool].contains("record_called_name(&mutreq_meta,"));
         assert!(h[serve..pool].contains("served_variant.clone_from(&variant);"));
     }
 
