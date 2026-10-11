@@ -4478,7 +4478,8 @@ fn registry_models_list(
 ) -> serde_json::Value {
     let mut data: Vec<serde_json::Value> = candidates
         .iter()
-        .filter(|c| c.model.enabled && is_listed_model_type(&c.model.model_type))
+        // An unlisted model (and its variants) is served by name only.
+        .filter(|c| c.model.enabled && c.model.listed && is_listed_model_type(&c.model.model_type))
         .flat_map(|c| {
             std::iter::once(ModelFacts::of(&c.model)).chain(
                 c.model
@@ -4782,7 +4783,7 @@ fn registry_model_info(
     let now = chrono::Utc::now();
     candidates
         .iter()
-        .filter(|c| c.model.enabled && is_listed_model_type(&c.model.model_type))
+        .filter(|c| c.model.enabled && c.model.listed && is_listed_model_type(&c.model.model_type))
         .filter(|c| model_visible(allowed, &c.model.model_name))
         .filter(|c| c.model.lifecycle.status_at(now).listed())
         .map(|c| model_info_entry(&c.model, c.healthy))
@@ -6710,6 +6711,60 @@ mod tests {
     }
 
     #[test]
+    fn unlisted_models_are_left_out_of_the_listings_but_answer_by_id() {
+        use super::{family_entries, model_facts_index, registry_model_info, registry_models_list};
+        let mut instruct = candidate(
+            "acme-instruct",
+            "acme-i",
+            "chat",
+            "fp8",
+            &["acme-instruct-2507"],
+            &[],
+        );
+        instruct.model.listed = false;
+        let mut think = candidate("acme-think", "acme-t", "chat", "fp8", &[], &[]);
+        think.model.listed = false;
+        let other = candidate("gemma4-31b-it", "gemma", "chat", "bf16", &[], &[]);
+        let candidates = vec![instruct, think, other];
+
+        let list = registry_models_list(&candidates, None);
+        let ids: Vec<&str> = list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["gemma4-31b-it"]);
+        let info = registry_model_info(&candidates, None);
+        assert_eq!(info.len(), 1);
+        // Still a model the caller can ask about, by any of its names.
+        let index = model_facts_index(&candidates);
+        for id in ["acme-instruct", "acme-instruct-2507", "acme-think"] {
+            assert!(index[id].answers_by_id(None), "{id}");
+        }
+
+        // A family standing for unlisted members is listed itself.
+        let family = std::sync::Arc::new(obleth_config::ModelFamily {
+            id: uuid::Uuid::nil(),
+            name: "acme".into(),
+            description: String::new(),
+            default_level: obleth_config::ReasoningLevel::None,
+            members: obleth_config::FamilyMembers {
+                none: "acme-instruct".into(),
+                low: "acme-think".into(),
+                medium: "acme-think".into(),
+                high: "acme-think".into(),
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        });
+        let entries = family_entries(&[family], &candidates, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], "acme");
+        assert_eq!(entries[0]["family"]["members"]["high"], "acme-think");
+    }
+
+    #[test]
     fn model_info_entry_uses_obleth_params_and_keeps_the_conventional_keys() {
         use super::model_info_entry;
         let mut model = model_with(Vec::new());
@@ -6914,6 +6969,7 @@ mod tests {
             aliases: Vec::new(),
             lifecycle: Default::default(),
             reasoning: Default::default(),
+            listed: true,
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "m".into(),
@@ -7921,6 +7977,7 @@ mod tests {
             aliases: Vec::new(),
             lifecycle: Default::default(),
             reasoning: Default::default(),
+            listed: true,
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: name.to_string(),

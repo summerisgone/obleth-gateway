@@ -406,6 +406,12 @@ pub struct ModelRoute {
     /// `#[serde(default)]` reads older payloads as pass-through.
     #[serde(default)]
     pub reasoning: ModelReasoning,
+    /// Whether `/v1/models` and `/model/info` advertise this model. An
+    /// unlisted model is still served by name; it just isn't offered, e.g.
+    /// when a model family stands for it. `#[serde(default)]` reads older
+    /// payloads as listed.
+    #[serde(default = "default_true")]
+    pub listed: bool,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -661,6 +667,10 @@ pub struct ResolvedModel {
     /// deserializable as "pass-through".
     #[serde(default)]
     pub reasoning: ModelReasoning,
+    /// See [`ModelRoute::listed`]. `#[serde(default)]` keeps older cached
+    /// payloads deserializable as "listed".
+    #[serde(default = "default_true")]
+    pub listed: bool,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -3419,6 +3429,10 @@ pub struct ModelBackup {
     /// restores every model as pass-through.
     #[serde(default)]
     pub reasoning: ModelReasoning,
+    /// `#[serde(default)]`: a backup taken before the flag existed restores
+    /// every model as listed.
+    #[serde(default = "default_true")]
+    pub listed: bool,
     #[serde(default)]
     pub description: String,
     pub upstream_model: String,
@@ -4574,6 +4588,7 @@ mod tests {
             aliases: vec!["glm-5-3-fp8".into(), "glm-5-3-mxfp4".into()],
             lifecycle: Default::default(),
             reasoning: Default::default(),
+            listed: true,
             variants: Vec::new(),
             upstream_model: "glm-5-3-mxfp4".into(),
             api_base: "http://upstream/v1".into(),

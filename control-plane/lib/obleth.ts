@@ -216,6 +216,8 @@ export interface ModelRoute {
    * which read as pass-through.
    */
   reasoning?: ModelReasoning;
+  /** Whether /v1/models and /model/info offer the model; it is served by name either way. Missing on older gateways (listed). */
+  listed?: boolean;
   description: string;
   upstream_model: string;
   api_base: string;
@@ -313,7 +315,7 @@ export interface ModelRoute {
  * `upstream_header_names`.
  */
 export type ModelWriteFields = Partial<
-  Omit<ModelRoute, "api_key_set" | "upstream_header_names" | "variants" | "lifecycle" | "effective_status" | "reasoning">
+  Omit<ModelRoute, "api_key_set" | "upstream_header_names" | "variants" | "lifecycle" | "effective_status" | "reasoning" | "listed">
 > & {
   api_key?: string | null;
   upstream_headers?: Record<string, string | null>;
@@ -2271,6 +2273,12 @@ export const obleth = {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
+    }),
+  setModelListing: (id: string, listed: boolean, options?: AuditOptions) =>
+    api<ModelRoute>(`/models/${id}/listing`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ listed }),
     }),
   listModelFamilies: () => api<ModelFamily[]>("/model-families"),
   createModelFamily: (body: ModelFamilyWrite, options?: AuditOptions) =>

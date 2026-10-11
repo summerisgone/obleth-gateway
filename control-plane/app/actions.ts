@@ -1274,9 +1274,9 @@ async function loadModel(id: string): Promise<ModelRoute | undefined> {
 // ----------------------------------------------------------------------------
 
 /** The parts of a model's settings form, each saved through its own endpoint. */
-export type ModelSettingsSection = "model" | "cache" | "reliability" | "health" | "capacity" | "knowledge";
+export type ModelSettingsSection = "model" | "cache" | "reliability" | "health" | "capacity" | "knowledge" | "listing";
 
-const MODEL_SETTINGS_SECTIONS: readonly ModelSettingsSection[] = ["model", "cache", "reliability", "health", "capacity", "knowledge"];
+const MODEL_SETTINGS_SECTIONS: readonly ModelSettingsSection[] = ["model", "cache", "reliability", "health", "capacity", "knowledge", "listing"];
 
 const SECTION_LABELS: Record<ModelSettingsSection, string> = {
   model: "Model settings",
@@ -1285,6 +1285,7 @@ const SECTION_LABELS: Record<ModelSettingsSection, string> = {
   health: "Health checks",
   capacity: "Capacity",
   knowledge: "Knowledge collections",
+  listing: "Listing",
 };
 
 export type ModelSettingsResult =
@@ -1406,6 +1407,8 @@ export async function saveModelSettingsAction(formData: FormData): Promise<Model
           refresh();
           return { ok: false, error: `${SECTION_LABELS.capacity}: ${error}`, saved };
         }
+      } else if (section === "listing") {
+        await obleth.setModelListing(id, formData.get("listed") === "on", audit);
       } else if (section === "knowledge" && formData.has("knowledge_loaded")) {
         await obleth.setModelCollections(id, formData.getAll("knowledge_collection").map(String), audit);
       }

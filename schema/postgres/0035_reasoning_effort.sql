@@ -5,6 +5,10 @@
 -- pass-through (requests reach the model as the caller sent them).
 alter table models add column if not exists reasoning jsonb not null default '{}'::jsonb;
 
+-- Whether /v1/models and /model/info advertise the model. An unlisted model
+-- is still served by name, e.g. the members a model family stands for.
+alter table models add column if not exists listed boolean not null default true;
+
 -- One name for several models, with the effort level choosing which answers
 -- (e.g. an instruct model at `none`, its thinking sibling at the rest).
 -- `members` is {"none", "low", "medium", "high"}, each a models.model_name.

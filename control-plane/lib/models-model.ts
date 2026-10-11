@@ -354,6 +354,7 @@ export const SETTING_INDEX: SettingEntry[] = [
   { id: "set-description", label: "Description", section: "general" },
   { id: "set-type", label: "Model type", section: "general", keywords: "modality endpoint chat embedding image video audio" },
   { id: "set-aliases", label: "Aliases", section: "general", keywords: "other names rename old name" },
+  { id: "set-listed", label: "List in /v1/models", section: "general", keywords: "hide hidden discovery models list advertise family" },
   { id: "set-variants", label: "Variants", section: "general", keywords: "other names extra boons speculation spec", types: CHAT },
   { id: "set-quantization", label: "Quantization", section: "general", keywords: "format fp8 bf16 mxfp4 precision" },
   { id: "set-upstream", label: "Upstream model", section: "connection", keywords: "native name served model" },
@@ -412,13 +413,14 @@ export function searchSettings(query: string, modelType: string, limit = 6): Set
 }
 
 /** Which save call owns a form field; everything unlisted is part of the model itself. */
-export function fieldSection(name: string): "model" | "cache" | "reliability" | "health" | "capacity" | "knowledge" | null {
+export function fieldSection(name: string): "model" | "cache" | "reliability" | "health" | "capacity" | "knowledge" | "listing" | null {
   if (name === "id" || name === "sections" || name.startsWith("has_") || name === "knowledge_loaded") return null;
   if (name === "cache_enabled" || name === "cache_ttl_secs") return "cache";
   if (["request_timeout_secs", "max_retries", "retry_backoff_ms", "endpoint_selection_mode", "debug_diagnostics"].includes(name)) return "reliability";
   if (["check_interval_secs", "failure_threshold", "maintenance_until", "maintenance_note", "checks_enabled", "alerts_enabled"].includes(name)) return "health";
   if (name === "max_in_flight" || name.startsWith("capacity_") || name === "per_replica_max_in_flight") return "capacity";
   if (name === "knowledge_collection") return "knowledge";
+  if (name === "listed") return "listing";
   return "model";
 }
 
@@ -426,6 +428,7 @@ const FIELD_LABELS: [RegExp, string][] = [
   [/^description$/, "Description"],
   [/^model_type$/, "Model type"],
   [/^aliases$/, "Aliases"],
+  [/^listed$/, "Listed in /v1/models"],
   [/^variants$/, "Variants"],
   [/^quantization$/, "Quantization"],
   [/^upstream_model$/, "Upstream model"],

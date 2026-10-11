@@ -297,6 +297,9 @@ export function ModelSettings({
           <Setting id="set-aliases" label="Aliases" hint="Other names that reach this model, one per line." help={ALIASES_HINT} fields={["aliases"]}>
             <TextArea name="aliases" label="Aliases" rows={2} defaultValue={(model.aliases ?? []).join("\n")} placeholder={"old-name\nanother-name"} />
           </Setting>
+          <Setting id="set-listed" label="List in /v1/models" hint="Callers see it in /v1/models and /model/info. Turn it off to keep it out of those lists while it still answers to its name, for example when a model family stands for it." fields={["listed"]} was={{ field: "listed", checkbox: true }}>
+            <Switch name="listed" label="List in /v1/models" defaultChecked={model.listed ?? true} />
+          </Setting>
           {(chat || (model.variants?.length ?? 0) > 0) && (
             <Setting id="set-variants" label="Variants" hint="Other names for this model with extra boons turned on." help={VARIANTS_HINT} fields={["variants"]}>
               <VariantsField model={model} modelNames={modelNames} />

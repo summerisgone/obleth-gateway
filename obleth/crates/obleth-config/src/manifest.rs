@@ -131,6 +131,10 @@ pub struct ManifestModel {
     /// stored map alone. An invalid map is rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<crate::reasoning::ModelReasoning>,
+    /// Whether `/v1/models` and `/model/info` advertise the model. Absent
+    /// leaves the stored value alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listed: Option<bool>,
     /// Serving format from the fixed `QUANTIZATIONS` vocabulary. An
     /// unrecognized value is rejected rather than silently defaulted, on the
     /// same reasoning as `model_type`.
@@ -304,6 +308,7 @@ pub struct ModelConfig {
     pub aliases: Vec<String>,
     pub variants: Vec<ModelVariant>,
     pub reasoning: crate::reasoning::ModelReasoning,
+    pub listed: bool,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -358,6 +363,7 @@ impl Default for ModelConfig {
             aliases: Vec::new(),
             variants: Vec::new(),
             reasoning: Default::default(),
+            listed: true,
             upstream_model: String::new(),
             api_base: String::new(),
             api_key: None,
@@ -413,6 +419,7 @@ impl From<&ModelRoute> for ModelConfig {
             aliases: m.aliases.clone(),
             variants: m.variants.clone(),
             reasoning: m.reasoning.clone(),
+            listed: m.listed,
             upstream_model: m.upstream_model.clone(),
             api_base: m.api_base.clone(),
             api_key: m.api_key.clone(),
@@ -479,6 +486,7 @@ impl ModelConfig {
         note(self.aliases != other.aliases, "aliases");
         note(self.variants != other.variants, "variants");
         note(self.reasoning != other.reasoning, "reasoning");
+        note(self.listed != other.listed, "listed");
         note(
             self.upstream_model != other.upstream_model,
             "upstream_model",
@@ -885,6 +893,9 @@ pub fn resolve_model(
         }
     }
 
+    if let Some(listed) = entry.listed {
+        next.listed = listed;
+    }
     if let Some(r) = &entry.reasoning {
         r.validate()
             .map_err(|e| reject(format!("reasoning: {e}")))?;
@@ -1150,6 +1161,8 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
         // a map reads the same as one written before maps existed.
         reasoning: (!m.reasoning.is_passthrough() || !m.reasoning.levels.is_empty())
             .then(|| m.reasoning.clone()),
+        // Only an unlisted model says so, keeping older files' shape.
+        listed: (!m.listed).then_some(false),
         upstream_model: Some(m.upstream_model.clone()),
         api_base: Some(m.api_base.clone()),
         api_key: None,
@@ -1211,6 +1224,7 @@ mod tests {
             aliases: Vec::new(),
             lifecycle: Default::default(),
             reasoning: Default::default(),
+            listed: true,
             variants: Vec::new(),
             description: "original".into(),
             upstream_model: "upstream/original".into(),
@@ -1541,6 +1555,17 @@ mod tests {
         embed.model_type = Some("embedding".into());
         embed.reasoning = Some(unsupported.clone());
         assert!(resolve_model(&embed, Some(&existing), &[]).is_err());
+
+        // `listed` is replaced when present and exported only when off.
+        let mut hide = entry("m");
+        hide.listed = Some(false);
+        let r = resolve_model(&hide, Some(&existing), &[]).unwrap();
+        assert!(!r.config.listed);
+        assert!(r.changed_fields.contains(&"listed".to_string()));
+        let mut hidden = route("m");
+        hidden.listed = false;
+        assert_eq!(model_to_manifest_entry(&hidden).listed, Some(false));
+        assert_eq!(model_to_manifest_entry(&existing).listed, None);
 
         assert_eq!(model_to_manifest_entry(&existing).reasoning, None);
         assert_eq!(

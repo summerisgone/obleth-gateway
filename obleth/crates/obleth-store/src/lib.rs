@@ -1488,7 +1488,7 @@ impl Store {
                 capacity_service, per_replica_max_in_flight, capacity_source, capacity_headroom,
                 variants
              ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1548,7 +1548,7 @@ impl Store {
 
     pub async fn list_models(&self) -> Result<Vec<ModelRoute>> {
         let rows = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                     input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1568,7 +1568,7 @@ impl Store {
 
     pub async fn get_model(&self, id: Uuid) -> Result<ModelRoute> {
         let row = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                     input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1590,7 +1590,7 @@ impl Store {
 
     pub async fn get_model_by_name(&self, model_name: &str) -> Result<ModelRoute> {
         let row = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                     input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1701,7 +1701,7 @@ impl Store {
                 capacity_source = $38, capacity_headroom = $39, variants = $40,
                 updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1779,7 +1779,7 @@ impl Store {
         let row = sqlx::query(
             "update models set max_in_flight = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1809,7 +1809,7 @@ impl Store {
         let row = sqlx::query(
             "update models set lifecycle = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1838,7 +1838,7 @@ impl Store {
         let row = sqlx::query(
             "update models set reasoning = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1851,6 +1851,30 @@ impl Store {
         )
         .bind(id)
         .bind(sqlx::types::Json(reasoning))
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        model_from_row(&row)
+    }
+
+    /// Set whether the discovery endpoints advertise a model.
+    pub async fn set_model_listed(&self, id: Uuid, listed: bool) -> Result<ModelRoute> {
+        let row = sqlx::query(
+            "update models set listed = $2, updated_at = now()
+             where id = $1
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
+                       input_cost_per_token, output_cost_per_token,
+                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
+                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
+                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
+                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
+                       per_replica_max_in_flight, capacity_headroom,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
+                       created_at, updated_at",
+        )
+        .bind(id)
+        .bind(listed)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1991,7 +2015,7 @@ impl Store {
                     capacity_headroom = case when $3 then $8 else capacity_headroom end,
                     updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -2038,7 +2062,7 @@ impl Store {
             "update models set max_in_flight = $2, capacity_mode = 'tuned',
                     capacity_tuned_at = now(), updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -2065,7 +2089,7 @@ impl Store {
         let row = sqlx::query(
             "update models set admission_weight = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -2086,7 +2110,7 @@ impl Store {
 
     pub async fn all_resolved_models(&self) -> Result<Vec<(String, ResolvedModel)>> {
         let rows = sqlx::query(
-            "select id, model_name, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization, admission_weight, max_in_flight, enabled,
+            "select id, model_name, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization, admission_weight, max_in_flight, enabled,
                     capacity_mode, capacity_source, capacity_namespace, capacity_service,
                     per_replica_max_in_flight, capacity_headroom,
                     cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token,
@@ -2153,6 +2177,7 @@ impl Store {
                     variants: variants_from_row(row),
                     lifecycle: lifecycle_from_row(row),
                     reasoning: reasoning_from_row(row),
+                    listed: listed_from_row(row),
                     upstream_model: row.try_get("upstream_model")?,
                     api_base: row.try_get("api_base")?,
                     api_key: cipher().decrypt_opt(row.try_get("api_key")?)?,
@@ -2285,7 +2310,7 @@ impl Store {
         let row = sqlx::query(
             "update models set enabled = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -2314,7 +2339,7 @@ impl Store {
         let row = sqlx::query(
             "update models set cache_enabled = $2, cache_ttl_secs = $3, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -2351,7 +2376,7 @@ impl Store {
                     retry_backoff_ms = $4, endpoint_selection_mode = $5,
                     debug_diagnostics = $6, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -3498,7 +3523,7 @@ impl Store {
             "update models
                 set tool_servers = (tool_servers - $1) || jsonb_build_array($2::text), updated_at = now()
               where tool_servers ? $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -3541,7 +3566,7 @@ impl Store {
             "update models
                 set tool_servers = tool_servers - $1, updated_at = now()
               where tool_servers ? $1
-             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -4187,6 +4212,7 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         // column, or a value this build can't read, is an active model.
         lifecycle: lifecycle_from_row(row),
         reasoning: reasoning_from_row(row),
+        listed: listed_from_row(row),
         quantization: row
             .try_get::<String, _>("quantization")
             .unwrap_or_else(|_| obleth_config::DEFAULT_QUANTIZATION.to_string()),
@@ -4223,6 +4249,12 @@ fn family_from_row(row: &PgRow) -> Result<obleth_config::ModelFamily> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+/// Read the `listed` column, tolerating statements that do not select it
+/// (they read as listed).
+fn listed_from_row(row: &PgRow) -> bool {
+    row.try_get::<bool, _>("listed").unwrap_or(true)
 }
 
 /// Read the `reasoning` column, tolerating statements that do not select it.
@@ -4982,6 +5014,23 @@ mod tests {
             .expect("model present")
             .1;
         assert_eq!(resolved.reasoning, reasoning);
+        assert!(resolved.listed, "a new model is listed");
+
+        let hidden = store
+            .set_model_listed(model.id, false)
+            .await
+            .expect("set listed");
+        assert!(!hidden.listed);
+        assert!(!store.get_model(model.id).await.unwrap().listed);
+        let resolved = store
+            .all_resolved_models()
+            .await
+            .expect("resolved models")
+            .into_iter()
+            .find(|(n, _)| n == &name)
+            .expect("model present")
+            .1;
+        assert!(!resolved.listed);
 
         let family_name = format!("f-{}", Uuid::new_v4());
         let members = obleth_config::FamilyMembers {

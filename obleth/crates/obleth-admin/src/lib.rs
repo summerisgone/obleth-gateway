@@ -274,6 +274,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/models/:id/capacity", put(set_model_capacity))
         .route("/api/v1/models/:id/status", put(set_model_status))
         .route("/api/v1/models/:id/reasoning", put(set_model_reasoning))
+        .route("/api/v1/models/:id/listing", put(set_model_listing))
         .route(
             "/api/v1/model-families",
             get(list_model_families).post(create_model_family),
@@ -1334,6 +1335,14 @@ pub struct SetModelStatus {
     pub redirect: Option<bool>,
 }
 
+/// Whether the discovery endpoints advertise a model.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetModelListing {
+    /// `false` keeps the model out of `/v1/models` and `/model/info`; it is
+    /// still served by name.
+    pub listed: bool,
+}
+
 /// A model family, written whole.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ModelFamilyWrite {
@@ -1872,6 +1881,10 @@ pub struct ModelRouteView {
     /// none/low/medium/high translated to fields its server understands), or
     /// unsupported. Set with `PUT /api/v1/models/{id}/reasoning`.
     pub reasoning: obleth_config::ModelReasoning,
+    /// Whether `/v1/models` and `/model/info` advertise the model. An
+    /// unlisted model is still served by name. Set with
+    /// `PUT /api/v1/models/{id}/listing`.
+    pub listed: bool,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -2041,6 +2054,7 @@ impl From<ModelRoute> for ModelRouteView {
             variants,
             lifecycle,
             reasoning,
+            listed,
             description,
             upstream_model,
             api_base,
@@ -2097,6 +2111,7 @@ impl From<ModelRoute> for ModelRouteView {
             effective_status: lifecycle.status_at(chrono::Utc::now()),
             lifecycle,
             reasoning,
+            listed,
             description,
             upstream_model,
             api_base,
@@ -7193,6 +7208,36 @@ async fn set_model_reasoning(
     Ok(Json(model.into()))
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/models/{id}/listing", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = SetModelListing,
+    responses((status = 200, body = ModelRouteView))
+)]
+async fn set_model_listing(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetModelListing>,
+) -> Result<Json<ModelRouteView>> {
+    let model = state.store.set_model_listed(id, body.listed).await?;
+    sync_model(&state, &model).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_model_listing",
+            "model",
+            &id.to_string(),
+            serde_json::json!({
+                "model_name": model.model_name,
+                "listed": body.listed,
+            }),
+        )
+        .await?;
+    Ok(Json(model.into()))
+}
+
 /// Refuse `name` for a model, alias or variant when a family already uses
 /// it: a client sending `model: "x"` must reach one thing.
 async fn reject_family_name(state: &AdminState, name: &str, what: &str) -> Result<()> {
@@ -8665,6 +8710,7 @@ fn resolved_model_of(
         aliases: model.aliases.clone(),
         lifecycle: model.lifecycle.clone(),
         reasoning: model.reasoning.clone(),
+        listed: model.listed,
         variants: model.variants.clone(),
         upstream_model: model.upstream_model.clone(),
         api_base: model.api_base.clone(),
@@ -11480,6 +11526,7 @@ mod tests {
             aliases: Vec::new(),
             lifecycle: Default::default(),
             reasoning: Default::default(),
+            listed: true,
             variants: Vec::new(),
             description: String::new(),
             upstream_model: name.to_string(),

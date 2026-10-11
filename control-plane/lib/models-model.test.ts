@@ -212,6 +212,7 @@ describe("tracking changes on the settings form", () => {
     expect(fieldSection("max_retries")).toBe("reliability");
     expect(fieldSection("capacity_headroom")).toBe("capacity");
     expect(fieldSection("cache_ttl_secs")).toBe("cache");
+    expect(fieldSection("listed")).toBe("listing");
     expect(fieldSection("maintenance_note")).toBe("health");
     expect(fieldSection("tag_level_coding")).toBe("model");
     expect(fieldSection("has_tags")).toBeNull();
