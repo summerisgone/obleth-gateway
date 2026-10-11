@@ -1571,6 +1571,7 @@ mod registry_refresh_tests {
 
     fn model(name: &str, request_timeout_secs: Option<i64>) -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
+            description: String::new(),
             model_name: name.to_string(),
             aliases: Vec::new(),
             lifecycle: Default::default(),

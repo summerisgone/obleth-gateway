@@ -8711,6 +8711,7 @@ fn resolved_model_of(
         lifecycle: model.lifecycle.clone(),
         reasoning: model.reasoning.clone(),
         listed: model.listed,
+        description: model.description.clone(),
         variants: model.variants.clone(),
         upstream_model: model.upstream_model.clone(),
         api_base: model.api_base.clone(),

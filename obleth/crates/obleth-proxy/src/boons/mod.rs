@@ -1494,6 +1494,7 @@ mod tests {
 
     pub(super) fn test_route() -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
+            description: String::new(),
             model_name: "test".to_string(),
             aliases: Vec::new(),
             lifecycle: Default::default(),

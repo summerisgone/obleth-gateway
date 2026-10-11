@@ -2110,7 +2110,7 @@ impl Store {
 
     pub async fn all_resolved_models(&self) -> Result<Vec<(String, ResolvedModel)>> {
         let rows = sqlx::query(
-            "select id, model_name, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization, admission_weight, max_in_flight, enabled,
+            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, variants, lifecycle, reasoning, listed, quantization, admission_weight, max_in_flight, enabled,
                     capacity_mode, capacity_source, capacity_namespace, capacity_service,
                     per_replica_max_in_flight, capacity_headroom,
                     cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token,
@@ -2178,6 +2178,7 @@ impl Store {
                     lifecycle: lifecycle_from_row(row),
                     reasoning: reasoning_from_row(row),
                     listed: listed_from_row(row),
+                    description: row.try_get("description").unwrap_or_default(),
                     upstream_model: row.try_get("upstream_model")?,
                     api_base: row.try_get("api_base")?,
                     api_key: cipher().decrypt_opt(row.try_get("api_key")?)?,

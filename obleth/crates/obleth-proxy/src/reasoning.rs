@@ -156,6 +156,21 @@ impl Note {
         }
     }
 
+    /// The note for a request that came through a family at `level`: the
+    /// level the member served (after its own map), and the one the caller
+    /// asked for when that differs.
+    pub(crate) fn for_family(
+        level: ReasoningLevel,
+        requested: Option<ReasoningLevel>,
+        plan: &ReasoningPlan,
+    ) -> Self {
+        let served = match plan {
+            ReasoningPlan::Apply { served, .. } => *served,
+            ReasoningPlan::Untouched | ReasoningPlan::Strip { .. } => level,
+        };
+        Note::Served { served, requested }
+    }
+
     pub(crate) fn apply_headers(&self, resp: &mut Response<Body>) {
         let headers = resp.headers_mut();
         match self {
@@ -283,6 +298,41 @@ mod tests {
                 requested: Some(ReasoningLevel::Low)
             }),
             Some(Note::Unsupported)
+        );
+    }
+
+    #[test]
+    fn a_family_reports_the_level_it_served() {
+        let strip = ReasoningPlan::Strip {
+            requested: Some(ReasoningLevel::High),
+        };
+        assert_eq!(
+            Note::for_family(ReasoningLevel::High, Some(ReasoningLevel::High), &strip),
+            Note::Served {
+                served: ReasoningLevel::High,
+                requested: Some(ReasoningLevel::High)
+            }
+        );
+        // No level named: the family's default is what was served.
+        assert_eq!(
+            Note::for_family(ReasoningLevel::None, None, &ReasoningPlan::Untouched),
+            Note::Served {
+                served: ReasoningLevel::None,
+                requested: None
+            }
+        );
+        // A member that serves the level as another says so.
+        let used = ReasoningPlan::Apply {
+            requested: Some(ReasoningLevel::None),
+            served: ReasoningLevel::Low,
+            send: Default::default(),
+        };
+        assert_eq!(
+            Note::for_family(ReasoningLevel::None, Some(ReasoningLevel::None), &used),
+            Note::Served {
+                served: ReasoningLevel::Low,
+                requested: Some(ReasoningLevel::None)
+            }
         );
     }
 
@@ -606,6 +656,7 @@ mod pipeline {
         let resp = gw.post("/v1/chat/completions", &secret, chat("acme")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()[crate::proxy::MODEL_VARIANT_HEADER], "acme");
+        assert_eq!(resp.headers()[SERVED_HEADER], "none", "the family default");
         assert_eq!(
             seen.lock().unwrap().pop().unwrap()["model"],
             "acme-instruct-upstream"
