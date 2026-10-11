@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::reasoning::ModelReasoning;
+
 /// How global concurrency is divided among tenants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -400,6 +402,10 @@ pub struct ModelRoute {
     /// as active.
     #[serde(default)]
     pub lifecycle: ModelLifecycle,
+    /// How the model takes reasoning effort (see [`ModelReasoning`]).
+    /// `#[serde(default)]` reads older payloads as pass-through.
+    #[serde(default)]
+    pub reasoning: ModelReasoning,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -650,6 +656,11 @@ pub struct ResolvedModel {
     /// keeps older cached payloads deserializable as "active".
     #[serde(default)]
     pub lifecycle: ModelLifecycle,
+    /// See [`ModelRoute::reasoning`]. Read per request to translate the
+    /// caller's effort. `#[serde(default)]` keeps older cached payloads
+    /// deserializable as "pass-through".
+    #[serde(default)]
+    pub reasoning: ModelReasoning,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -3282,6 +3293,9 @@ pub struct BackupData {
     pub mcp_servers: Vec<McpServerBackup>,
     #[serde(default)]
     pub app_settings: Vec<AppSettingBackup>,
+    /// Absent in backups taken before families existed.
+    #[serde(default)]
+    pub model_families: Vec<crate::reasoning::ModelFamily>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -3401,6 +3415,10 @@ pub struct ModelBackup {
     /// every model as active.
     #[serde(default)]
     pub lifecycle: ModelLifecycle,
+    /// `#[serde(default)]`: a backup taken before effort maps existed
+    /// restores every model as pass-through.
+    #[serde(default)]
+    pub reasoning: ModelReasoning,
     #[serde(default)]
     pub description: String,
     pub upstream_model: String,
@@ -3568,6 +3586,8 @@ pub struct RestoreReport {
     pub model_endpoints: RestoreCounts,
     pub mcp_servers: RestoreCounts,
     pub app_settings: RestoreCounts,
+    #[serde(default)]
+    pub model_families: RestoreCounts,
     #[serde(default)]
     pub warnings: Vec<String>,
 }
@@ -4553,6 +4573,7 @@ mod tests {
             model_name: "glm-5-3".into(),
             aliases: vec!["glm-5-3-fp8".into(), "glm-5-3-mxfp4".into()],
             lifecycle: Default::default(),
+            reasoning: Default::default(),
             variants: Vec::new(),
             upstream_model: "glm-5-3-mxfp4".into(),
             api_base: "http://upstream/v1".into(),

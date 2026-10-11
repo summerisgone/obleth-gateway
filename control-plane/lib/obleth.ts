@@ -132,6 +132,59 @@ export interface SetModelStatus {
   redirect?: boolean;
 }
 
+/** A reasoning-effort level, as callers name it. */
+export type ReasoningLevel = "none" | "low" | "medium" | "high";
+
+/**
+ * How a model takes reasoning effort: `passthrough` leaves requests as the
+ * caller sent them, `mapped` translates the four levels with `levels`, and
+ * `unsupported` removes the caller's effort before the request goes out.
+ */
+export type ReasoningMode = "passthrough" | "mapped" | "unsupported";
+
+/**
+ * What one level becomes: fields merged into the request body (`{}` sends
+ * nothing, so the server's own default applies), or another level that sends.
+ */
+export type ReasoningAction = { send: Record<string, unknown> } | { use: ReasoningLevel };
+
+/** A model's reasoning-effort map. Absent or `{mode: "passthrough"}` changes nothing. */
+export interface ModelReasoning {
+  mode: ReasoningMode;
+  /** The level served when a caller names none (`mapped` only). Unset sends nothing. */
+  default_level?: ReasoningLevel | null;
+  /** One action per level. `mapped` needs all four; the other modes keep them for later. */
+  levels?: Partial<Record<ReasoningLevel, ReasoningAction>>;
+}
+
+/** The chat model that answers a family's name at each level. */
+export interface FamilyMembers {
+  none: string;
+  low: string;
+  medium: string;
+  high: string;
+}
+
+/** One name for several models, with the reasoning level choosing which one answers. */
+export interface ModelFamily {
+  id: string;
+  name: string;
+  description: string;
+  /** The level a request that names none is served at. */
+  default_level: ReasoningLevel;
+  members: FamilyMembers;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `POST /model-families` and `PUT /model-families/{id}`: the family written whole. */
+export interface ModelFamilyWrite {
+  name: string;
+  description?: string;
+  default_level: ReasoningLevel;
+  members: FamilyMembers;
+}
+
 export interface ModelRoute {
   id: string;
   model_name: string;
@@ -157,6 +210,12 @@ export interface ModelRoute {
   lifecycle?: ModelLifecycle;
   /** The status in force now: a deprecated model past its date reads `retired`. */
   effective_status?: LifecycleStatus;
+  /**
+   * How the model takes reasoning effort. Set on its own with
+   * `PUT /models/{id}/reasoning`. Absent from gateways older than the field,
+   * which read as pass-through.
+   */
+  reasoning?: ModelReasoning;
   description: string;
   upstream_model: string;
   api_base: string;
@@ -254,7 +313,7 @@ export interface ModelRoute {
  * `upstream_header_names`.
  */
 export type ModelWriteFields = Partial<
-  Omit<ModelRoute, "api_key_set" | "upstream_header_names" | "variants" | "lifecycle" | "effective_status">
+  Omit<ModelRoute, "api_key_set" | "upstream_header_names" | "variants" | "lifecycle" | "effective_status" | "reasoning">
 > & {
   api_key?: string | null;
   upstream_headers?: Record<string, string | null>;
@@ -2205,6 +2264,31 @@ export const obleth = {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
+    }),
+  /** Replace a model's reasoning-effort map whole. */
+  setModelReasoning: (id: string, body: ModelReasoning, options?: AuditOptions) =>
+    api<ModelRoute>(`/models/${id}/reasoning`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  listModelFamilies: () => api<ModelFamily[]>("/model-families"),
+  createModelFamily: (body: ModelFamilyWrite, options?: AuditOptions) =>
+    api<ModelFamily>("/model-families", {
+      method: "POST",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  updateModelFamily: (id: string, body: ModelFamilyWrite, options?: AuditOptions) =>
+    api<ModelFamily>(`/model-families/${id}`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  deleteModelFamily: (id: string, options?: AuditOptions) =>
+    api<void>(`/model-families/${id}`, {
+      method: "DELETE",
+      headers: auditActorHeaders(options),
     }),
   setModelCapacity: (
     id: string,

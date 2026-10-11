@@ -126,6 +126,11 @@ pub struct ManifestModel {
     /// Blank and duplicate names and unknown boons are dropped with a warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variants: Option<Vec<ModelVariant>>,
+    /// How the model takes reasoning effort (pass-through, mapped or
+    /// unsupported). Replaced as a whole when present; absent leaves the
+    /// stored map alone. An invalid map is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<crate::reasoning::ModelReasoning>,
     /// Serving format from the fixed `QUANTIZATIONS` vocabulary. An
     /// unrecognized value is rejected rather than silently defaulted, on the
     /// same reasoning as `model_type`.
@@ -298,6 +303,7 @@ pub struct ModelConfig {
     pub description: String,
     pub aliases: Vec<String>,
     pub variants: Vec<ModelVariant>,
+    pub reasoning: crate::reasoning::ModelReasoning,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -351,6 +357,7 @@ impl Default for ModelConfig {
             description: String::new(),
             aliases: Vec::new(),
             variants: Vec::new(),
+            reasoning: Default::default(),
             upstream_model: String::new(),
             api_base: String::new(),
             api_key: None,
@@ -405,6 +412,7 @@ impl From<&ModelRoute> for ModelConfig {
             description: m.description.clone(),
             aliases: m.aliases.clone(),
             variants: m.variants.clone(),
+            reasoning: m.reasoning.clone(),
             upstream_model: m.upstream_model.clone(),
             api_base: m.api_base.clone(),
             api_key: m.api_key.clone(),
@@ -470,6 +478,7 @@ impl ModelConfig {
         note(self.description != other.description, "description");
         note(self.aliases != other.aliases, "aliases");
         note(self.variants != other.variants, "variants");
+        note(self.reasoning != other.reasoning, "reasoning");
         note(
             self.upstream_model != other.upstream_model,
             "upstream_model",
@@ -876,6 +885,18 @@ pub fn resolve_model(
         }
     }
 
+    if let Some(r) = &entry.reasoning {
+        r.validate()
+            .map_err(|e| reject(format!("reasoning: {e}")))?;
+        next.reasoning = r.clone();
+    }
+    if !next.reasoning.is_passthrough() && next.model_type != crate::types::DEFAULT_MODEL_TYPE {
+        return Err(reject(format!(
+            "reasoning: a `{}` model cannot take reasoning effort; only chat models can",
+            next.model_type
+        )));
+    }
+
     if let Some(raw) = &entry.variants {
         next.variants = normalize_variants(raw);
         // Like aliases, a variant name colliding with another model's names is
@@ -1125,6 +1146,10 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
         description: Some(m.description.clone()),
         aliases: Some(m.aliases.clone()),
         variants: Some(m.variants.clone()),
+        // Left out while pass-through, so a file exported before anyone set
+        // a map reads the same as one written before maps existed.
+        reasoning: (!m.reasoning.is_passthrough() || !m.reasoning.levels.is_empty())
+            .then(|| m.reasoning.clone()),
         upstream_model: Some(m.upstream_model.clone()),
         api_base: Some(m.api_base.clone()),
         api_key: None,
@@ -1185,6 +1210,7 @@ mod tests {
             model_name: name.to_string(),
             aliases: Vec::new(),
             lifecycle: Default::default(),
+            reasoning: Default::default(),
             variants: Vec::new(),
             description: "original".into(),
             upstream_model: "upstream/original".into(),
@@ -1480,6 +1506,47 @@ mod tests {
         let r = resolve_model(&entry("m"), Some(&existing), &[]).unwrap();
         assert_eq!(r.config.variants, existing.variants);
         assert!(!r.changed_fields.contains(&"variants".to_string()));
+    }
+
+    #[test]
+    fn a_reasoning_map_is_imported_checked_and_exported_only_when_set() {
+        use crate::reasoning::{ModelReasoning, ReasoningMode};
+        let existing = route("m");
+        let unsupported = ModelReasoning {
+            mode: ReasoningMode::Unsupported,
+            ..Default::default()
+        };
+        let mut e = entry("m");
+        e.reasoning = Some(unsupported.clone());
+        let r = resolve_model(&e, Some(&existing), &[]).unwrap();
+        assert_eq!(r.config.reasoning, unsupported);
+        assert!(r.changed_fields.contains(&"reasoning".to_string()));
+
+        // Absent leaves the stored map alone.
+        let mut mapped_route = route("m");
+        mapped_route.reasoning = unsupported.clone();
+        let r = resolve_model(&entry("m"), Some(&mapped_route), &[]).unwrap();
+        assert_eq!(r.config.reasoning, unsupported);
+
+        // A mapped model needs every level.
+        let mut bad = entry("m");
+        bad.reasoning = Some(ModelReasoning {
+            mode: ReasoningMode::Mapped,
+            ..Default::default()
+        });
+        assert!(resolve_model(&bad, Some(&existing), &[]).is_err());
+
+        // Only chat models take effort.
+        let mut embed = entry("m");
+        embed.model_type = Some("embedding".into());
+        embed.reasoning = Some(unsupported.clone());
+        assert!(resolve_model(&embed, Some(&existing), &[]).is_err());
+
+        assert_eq!(model_to_manifest_entry(&existing).reasoning, None);
+        assert_eq!(
+            model_to_manifest_entry(&mapped_route).reasoning,
+            Some(unsupported)
+        );
     }
 
     #[test]

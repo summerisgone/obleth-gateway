@@ -28,6 +28,22 @@ import {
   lifecycleStatus,
   retireAtFromInput,
   retiredMessage,
+  familyGroups,
+  familyMemberOptions,
+  familyNameProblem,
+  familyPreview,
+  familyProblem,
+  familyWrite,
+  levelAction,
+  levelDraft,
+  reasoningDirty,
+  reasoningDraft,
+  reasoningFromDraft,
+  reasoningNavCount,
+  reasoningPreview,
+  reasoningProblem,
+  sendWords,
+  takenModelNames,
 } from "./models-model";
 import type { ModelHealthSummary, ModelRoute } from "./obleth";
 
@@ -165,6 +181,11 @@ describe("finding a setting", () => {
     expect(searchSettings("variants", "image").map((r) => r.label)).not.toContain("Variants");
     expect(searchSettings("router tags", "image").map((r) => r.label)).not.toContain("Router tags");
     expect(searchSettings("", "chat")).toEqual([]);
+  });
+
+  it("finds the reasoning section on chat models only", () => {
+    expect(searchSettings("thinking", "chat")[0]).toMatchObject({ id: "reasoning", label: "Reasoning effort", section: "reasoning" });
+    expect(searchSettings("reasoning_effort", "embedding")).toEqual([]);
   });
 });
 
@@ -305,5 +326,153 @@ describe("lifecycle", () => {
     expect(retireAtFromInput("")).toBeNull();
     expect(dateInputValue("2026-10-19T00:00:00Z")).toBe("2026-10-19");
     expect(dateInputValue(null)).toBe("");
+  });
+});
+
+describe("reasoning effort", () => {
+  const glmLike = {
+    mode: "mapped" as const,
+    levels: {
+      none: { use: "low" as const },
+      low: { send: { reasoning_effort: "low" } },
+      medium: { send: {} },
+      high: { send: { reasoning_effort: "max" } },
+    },
+  };
+
+  it("reads a missing map as pass-through", () => {
+    expect(reasoningDraft(model()).mode).toBe("passthrough");
+    expect(reasoningNavCount(model())).toBeUndefined();
+    expect(reasoningNavCount(model({ reasoning: glmLike }))).toBe("translated");
+    expect(reasoningNavCount(model({ reasoning: { mode: "unsupported" } }))).toBe("removed");
+  });
+
+  it("shows a stored action as the preset it matches exactly, else as custom JSON", () => {
+    expect(levelDraft("medium", { send: {} }).preset).toBe("default");
+    expect(levelDraft("high", { send: { reasoning_effort: "max" } })).toMatchObject({ preset: "effort", effort: "max" });
+    expect(levelDraft("none", { send: { chat_template_kwargs: { enable_thinking: false } } }).preset).toBe("thinking_off");
+    expect(levelDraft("high", { send: { chat_template_kwargs: { enable_thinking: true } } }).preset).toBe("thinking_on");
+    expect(levelDraft("none", { use: "low" })).toMatchObject({ preset: "use", use: "low" });
+    const mixed = levelDraft("high", { send: { reasoning_effort: "high", chat_template_kwargs: { enable_thinking: true } } });
+    expect(mixed.preset).toBe("custom");
+    expect(JSON.parse(mixed.json)).toEqual({ reasoning_effort: "high", chat_template_kwargs: { enable_thinking: true } });
+    expect(levelDraft("low", { send: { chat_template_kwargs: { enable_thinking: true, other: 1 } } }).preset).toBe("custom");
+  });
+
+  it("turns each preset back into the stored action", () => {
+    for (const [level, action] of Object.entries(glmLike.levels)) {
+      expect(levelAction(levelDraft(level as "none", action))).toEqual({ ok: true, action });
+    }
+    expect(levelAction({ ...levelDraft("low"), preset: "thinking_off" })).toEqual({ ok: true, action: { send: { chat_template_kwargs: { enable_thinking: false } } } });
+    expect(levelAction({ ...levelDraft("low"), effort: "  xhigh " })).toEqual({ ok: true, action: { send: { reasoning_effort: "xhigh" } } });
+  });
+
+  it("says plainly when a row can't be saved", () => {
+    expect(levelAction({ ...levelDraft("low"), effort: " " })).toMatchObject({ ok: false, error: expect.stringContaining("Type the value") });
+    expect(levelAction({ ...levelDraft("low"), preset: "custom", json: "{nope" })).toMatchObject({ ok: false, error: expect.stringContaining("not valid JSON") });
+    expect(levelAction({ ...levelDraft("low"), preset: "custom", json: "[1]" })).toMatchObject({ ok: false, error: expect.stringContaining("must be a JSON object") });
+  });
+
+  it("refuses what the gateway refuses", () => {
+    expect(reasoningProblem(glmLike, "chat")).toBeNull();
+    expect(reasoningProblem({ mode: "mapped", levels: { low: { send: {} } } })).toBe("Set all four levels to translate them. Not set: none, medium, high.");
+    expect(reasoningProblem({ ...glmLike, levels: { ...glmLike.levels, low: { use: "medium" } } })).toContain("which is itself the same as another level");
+    expect(reasoningProblem({ ...glmLike, levels: { ...glmLike.levels, high: { use: "high" } } })).toContain("can't be the same as itself");
+    expect(reasoningProblem({ ...glmLike, levels: { ...glmLike.levels, high: { send: { stream: true } } } })).toBe("High may not set stream. A level can only send fields about effort.");
+    expect(reasoningProblem({ ...glmLike, levels: { ...glmLike.levels, high: { send: { x: "y".repeat(5000) } } } })).toContain("at most 4096");
+    expect(reasoningProblem({ mode: "unsupported" }, "embedding")).toContain("Only chat models");
+    // Outside mapped, a use may point anywhere but at itself: the levels wait there for later.
+    expect(reasoningProblem({ mode: "passthrough", levels: { none: { use: "low" } } })).toBeNull();
+  });
+
+  it("keeps the stored levels when switching away from translating", () => {
+    const m = model({ reasoning: glmLike });
+    const draft = { ...reasoningDraft(m), mode: "passthrough" as const };
+    expect(reasoningFromDraft(draft, m)).toEqual({ ok: true, reasoning: { mode: "passthrough", levels: glmLike.levels } });
+    expect(reasoningDirty(draft, m)).toBe(true);
+    expect(reasoningDirty(reasoningDraft(m), m)).toBe(false);
+  });
+
+  it("never invents levels for a model that has none", () => {
+    const m = model();
+    expect(reasoningFromDraft({ ...reasoningDraft(m), mode: "unsupported" }, m)).toEqual({ ok: true, reasoning: { mode: "unsupported" } });
+    expect(reasoningDirty(reasoningDraft(m), m)).toBe(false);
+    // Translating starts every level at reasoning_effort = its own name.
+    const mapped = reasoningFromDraft({ ...reasoningDraft(m), mode: "mapped", defaultLevel: "medium" }, m);
+    expect(mapped).toEqual({
+      ok: true,
+      reasoning: {
+        mode: "mapped",
+        default_level: "medium",
+        levels: { none: { send: { reasoning_effort: "none" } }, low: { send: { reasoning_effort: "low" } }, medium: { send: { reasoning_effort: "medium" } }, high: { send: { reasoning_effort: "high" } } },
+      },
+    });
+  });
+
+  it("names the level whose row is unfinished", () => {
+    const m = model({ reasoning: glmLike });
+    const draft = reasoningDraft(m);
+    draft.levels.high = { ...draft.levels.high, preset: "custom", json: "{" };
+    expect(reasoningFromDraft(draft, m)).toMatchObject({ ok: false, error: expect.stringMatching(/^High: The custom fields are not valid JSON/) });
+    expect(reasoningDirty(draft, m)).toBe(true);
+    expect(reasoningFromDraft({ ...reasoningDraft(model({ model_type: "embedding" })), mode: "unsupported" }, model({ model_type: "embedding" }))).toMatchObject({ ok: false });
+  });
+
+  it("previews each level in plain words", () => {
+    expect(sendWords({})).toBe("sends nothing, so the server's own default applies");
+    expect(sendWords({ chat_template_kwargs: { enable_thinking: false }, reasoning_effort: "low" })).toBe("sends chat_template_kwargs.enable_thinking: false, reasoning_effort: low");
+    expect(reasoningPreview(glmLike)).toEqual([
+      "none → served as low, which sends reasoning_effort: low (this model has no off switch)",
+      "low → sends reasoning_effort: low",
+      "medium → sends nothing, so the server's own default applies",
+      "high → sends reasoning_effort: max",
+      "no effort set → sent as it came, so the server's own default applies",
+    ]);
+    expect(reasoningPreview({ ...glmLike, default_level: "high" }).at(-1)).toBe("no effort set → served as high");
+    expect(reasoningPreview({ mode: "passthrough" })).toHaveLength(1);
+    expect(reasoningPreview({ mode: "unsupported" })[0]).toContain("removes reasoning_effort and reasoning");
+  });
+});
+
+describe("model families", () => {
+  const members = { none: "acme-7b-instruct", low: "acme-7b-think", medium: "acme-7b-think", high: "acme-7b-think" };
+  const taken = { modelNames: takenModelNames([model({ model_name: "acme-7b-think", aliases: ["acme-think"], variants: [{ name: "acme-think-spec", description: "", boons: [] }] })]), familyNames: ["other"] };
+
+  it("checks a name the way the gateway does", () => {
+    expect(taken.modelNames).toEqual(["acme-7b-think", "acme-think", "acme-think-spec"]);
+    expect(familyNameProblem("acme-7b", taken)).toBeNull();
+    expect(familyNameProblem(" ", taken)).toContain("Give the family a name");
+    expect(familyNameProblem("acme 7b", taken)).toBe("A family name can't contain spaces.");
+    expect(familyNameProblem("auto", taken)).toBe("auto is the router's own name.");
+    expect(familyNameProblem("acme-think", taken)).toBe("A model already answers to that name.");
+    expect(familyNameProblem("other", taken)).toBe("Another family already has that name.");
+    expect(familyNameProblem("x".repeat(129), taken)).toContain("128 characters");
+  });
+
+  it("asks for a model at every level", () => {
+    const draft = { name: "acme-7b", description: "", default_level: "none" as const, members: { ...members, medium: "" } };
+    expect(familyProblem(draft, taken)).toBe("Pick the model that answers at medium.");
+    expect(familyProblem({ ...draft, members }, taken)).toBeNull();
+    expect(familyWrite({ ...draft, name: " acme-7b ", description: " d ", members })).toEqual({ name: "acme-7b", description: "d", default_level: "none", members });
+  });
+
+  it("previews where requests go, grouping the levels each model answers", () => {
+    expect(familyGroups(members)).toEqual([{ levels: ["none"], model: "acme-7b-instruct" }, { levels: ["low", "medium", "high"], model: "acme-7b-think" }]);
+    expect(familyPreview({ name: "acme-7b", default_level: "none", members })).toEqual({
+      lead: "A request for acme-7b with no effort set goes to acme-7b-instruct.",
+      levels: "none → acme-7b-instruct · low, medium, high → acme-7b-think",
+    });
+    expect(familyPreview({ name: "acme-7b", default_level: "none", members: { ...members, high: "" } })).toBeNull();
+  });
+
+  it("offers chat models that are still served, and keeps a chosen one", () => {
+    const models = [
+      model({ model_name: "b-chat" }),
+      model({ model_name: "a-old", lifecycle: { status: "deprecated" } }),
+      model({ model_name: "gone", lifecycle: { status: "retired" } }),
+      model({ model_name: "embed", model_type: "embedding" }),
+    ];
+    expect(familyMemberOptions(models)).toEqual([{ value: "a-old", label: "a-old (deprecated)" }, { value: "b-chat", label: "b-chat" }]);
+    expect(familyMemberOptions(models, ["gone"]).map((o) => o.value)).toEqual(["a-old", "b-chat", "gone"]);
   });
 });

@@ -37,6 +37,9 @@ pub struct AppState {
     /// Enumerable list of candidate models for `auto` selection. Kept fresh by
     /// a background refresh task; the `model_cache` above is not enumerable.
     pub model_registry: ModelRegistry,
+    /// Model families by name, refreshed by the same background task that
+    /// refreshes `model_registry`.
+    pub families: crate::reasoning::FamilyRegistry,
     /// Intent classifier for `auto` routing; its settings are refreshed by the
     /// same background task that refreshes `model_registry`.
     pub classifier: Classifier,
