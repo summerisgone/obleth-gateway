@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  effortText,
   bucketFor,
   bucketLabel,
   DEFAULT_LOG_FILTERS,
@@ -181,5 +182,17 @@ describe("saved views", () => {
     expect(loadViews()).toEqual([]);
     vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("full"); });
     expect(storeViews([])).toBe(false);
+  });
+});
+
+describe("the reasoning effort line", () => {
+  it("says what was asked and what the model got", () => {
+    expect(effortText({ reasoning_effort: "", reasoning_effort_requested: "" })).toBeNull();
+    expect(effortText({})).toBeNull();
+    expect(effortText({ reasoning_effort: "high", reasoning_effort_requested: "high" })).toBe("Asked for high, served at high.");
+    expect(effortText({ reasoning_effort: "low", reasoning_effort_requested: "none" })).toBe("Asked for none, served as low: this model has no none level.");
+    expect(effortText({ reasoning_effort: "unsupported", reasoning_effort_requested: "medium" })).toMatch(/no effort control/);
+    expect(effortText({ reasoning_effort: "", reasoning_effort_requested: "medium" })).toMatch(/as asked/);
+    expect(effortText({ reasoning_effort: "none", reasoning_effort_requested: "" })).toMatch(/default for this model/);
   });
 });

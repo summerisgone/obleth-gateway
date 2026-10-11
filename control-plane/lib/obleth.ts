@@ -864,6 +864,12 @@ export interface UsageLogEntry {
   parent_request_id?: string;
   /** The variant the client named, when it called the model through one; `model` is still the model's own name. Absent from older gateways. */
   model_variant?: string;
+  /** The model family the client named; `model` is the member that answered. Absent from older gateways. */
+  model_family?: string;
+  /** The reasoning effort served (none, low, medium, high), "unsupported" when it was removed, or empty when it went through as sent. Absent from older gateways. */
+  reasoning_effort?: string;
+  /** The reasoning effort the caller asked for, or empty. Absent from older gateways. */
+  reasoning_effort_requested?: string;
 }
 
 /// One recorded span from the flight-recorder tracer for a single request.

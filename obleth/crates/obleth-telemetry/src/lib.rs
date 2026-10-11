@@ -92,6 +92,9 @@ struct UsageRow<'a> {
     #[serde(with = "clickhouse::serde::uuid")]
     parent_request_id: Uuid,
     model_variant: &'a str,
+    reasoning_effort: &'a str,
+    reasoning_effort_requested: &'a str,
+    model_family: &'a str,
 }
 
 impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
@@ -124,6 +127,9 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             end_user: &r.end_user,
             parent_request_id: r.parent_request_id,
             model_variant: &r.model_variant,
+            reasoning_effort: &r.reasoning_effort,
+            reasoning_effort_requested: &r.reasoning_effort_requested,
+            model_family: &r.model_family,
         }
     }
 }
@@ -752,6 +758,9 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             end_user String DEFAULT '',
             parent_request_id UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
             model_variant String DEFAULT '',
+            reasoning_effort LowCardinality(String) DEFAULT '',
+            reasoning_effort_requested LowCardinality(String) DEFAULT '',
+            model_family String DEFAULT '',
             ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms),
             INDEX idx_ts_ms ts_ms TYPE minmax GRANULARITY 4
         ) ENGINE = MergeTree()
@@ -851,6 +860,20 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
     client
         .query(&format!(
             "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS model_variant String DEFAULT ''"
+        ))
+        .execute()
+        .await?;
+    for column in ["reasoning_effort", "reasoning_effort_requested"] {
+        client
+            .query(&format!(
+                "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS {column} LowCardinality(String) DEFAULT ''"
+            ))
+            .execute()
+            .await?;
+    }
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS model_family String DEFAULT ''"
         ))
         .execute()
         .await?;
@@ -1191,6 +1214,9 @@ mod conv_tests {
             end_user: String::new(),
             parent_request_id: Uuid::nil(),
             model_variant: String::new(),
+            reasoning_effort: String::new(),
+            reasoning_effort_requested: String::new(),
+            model_family: String::new(),
         }
     }
 
@@ -1413,6 +1439,9 @@ mod conv_tests {
             end_user: String::new(),
             parent_request_id: Uuid::nil(),
             model_variant: String::new(),
+            reasoning_effort: String::new(),
+            reasoning_effort_requested: String::new(),
+            model_family: String::new(),
         };
         let row = UsageRow::from(&rec);
         assert_eq!(row.session_id_source, "derived");
@@ -1449,6 +1478,9 @@ mod conv_tests {
             end_user: String::new(),
             parent_request_id: Uuid::nil(),
             model_variant: String::new(),
+            reasoning_effort: String::new(),
+            reasoning_effort_requested: String::new(),
+            model_family: String::new(),
         };
         rec.energy_wh = 1.5;
         rec.energy_cost_usd = 0.0002;
@@ -1482,6 +1514,18 @@ mod conv_tests {
         let row = UsageRow::from(&rec);
         assert_eq!(row.parent_request_id, parent);
         assert_eq!(row.model_variant, "glm-5-3-spec");
+        rec.reasoning_effort = "low".into();
+        rec.reasoning_effort_requested = "none".into();
+        rec.model_family = "acme".into();
+        let row = UsageRow::from(&rec);
+        assert_eq!(
+            (
+                row.reasoning_effort,
+                row.reasoning_effort_requested,
+                row.model_family
+            ),
+            ("low", "none", "acme")
+        );
     }
 }
 

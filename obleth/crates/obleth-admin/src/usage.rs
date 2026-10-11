@@ -207,6 +207,14 @@ pub struct UsageLogRow {
     /// The variant name the client called the model by, or empty. `model` is
     /// the parent model's name either way.
     pub model_variant: String,
+    /// The reasoning effort the request was served at, `unsupported` when the
+    /// model has no effort control, or empty when it went through as sent.
+    pub reasoning_effort: String,
+    /// The reasoning effort the caller asked for, or empty.
+    pub reasoning_effort_requested: String,
+    /// The model family the caller named, or empty; `model` is the member
+    /// that served the request.
+    pub model_family: String,
 }
 
 /// A bind value for the request-log filters, in placeholder order.
@@ -294,7 +302,8 @@ const USAGE_LOG_SELECT: &str =
      admission, status_code, input_tokens, output_tokens, \
      toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
      cached_input_tokens, queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
-     energy_wh, energy_cost_usd, co2_g, parent_request_id, model_variant \
+     energy_wh, energy_cost_usd, co2_g, parent_request_id, model_variant, \
+     reasoning_effort, reasoning_effort_requested, model_family \
      from usage";
 
 /// Read individual `usage` rows newest-first, honoring the supplied filters and
@@ -1857,6 +1866,9 @@ mod alias_tests {
                 "co2_g",
                 "parent_request_id",
                 "model_variant",
+                "reasoning_effort",
+                "reasoning_effort_requested",
+                "model_family",
             ]
         );
     }

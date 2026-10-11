@@ -213,6 +213,16 @@ describe("the request panel", () => {
     expect(fact("Variant")).toBeNull();
   });
 
+  it("names the family a client called and the reasoning effort it got", async () => {
+    await show(entry({ model: "acme-think", model_family: "acme", reasoning_effort: "high", reasoning_effort_requested: "high" }));
+    expect(fact("Called as")!.textContent).toBe("acme, a model family. The reasoning level picked acme-think to answer.");
+    expect(fact("Reasoning effort")!.textContent).toBe("Asked for high, served at high.");
+    expect(fact("Variant")).toBeNull();
+    await show(entry({ request_id: "f0000000-0000-0000-0000-000000000000" }));
+    expect(fact("Called as")).toBeNull();
+    expect(fact("Reasoning effort")).toBeNull();
+  });
+
   it("lists the helper calls a client request made, oldest first, each linked to its own row", async () => {
     helpers = [check, draft];
     await show(entry());

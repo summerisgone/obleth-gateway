@@ -8,7 +8,7 @@ import { RouteExplainPanel } from "@/components/playground/route-explain";
 import { Button } from "@/components/ui/button";
 import { logsHref } from "@/lib/log-links";
 import { modelHref } from "@/lib/model-links";
-import { cost, describeRequest, duration, helperCallsParams, helperPurpose, HTTP_REASONS, isFailure, servedRequest, timeSplit, type LogFilters } from "@/lib/logs-model";
+import { cost, describeRequest, duration, effortText, helperCallsParams, helperPurpose, HTTP_REASONS, isFailure, servedRequest, timeSplit, type LogFilters } from "@/lib/logs-model";
 import type { SpanEntry, UsageLogEntry } from "@/lib/obleth";
 import { parseAttrs, parseRouteExplain, spanHint, spanLabel, timeline, type SpanNode } from "@/lib/trace-model";
 import { cn } from "@/lib/utils";
@@ -281,6 +281,12 @@ export function RequestPanel({
           <Fact label="First token" mono>{row.ttft_ms > 0 ? duration(row.ttft_ms) : "—"}</Fact>
           <Fact label="Total" mono>{duration(row.total_ms)}</Fact>
           <Fact label="Type">{helperPurpose(row.request_type)}</Fact>
+          {row.model_family && (
+            <Fact label="Called as" wide>
+              <span className="font-mono">{row.model_family}</span>, a model family. The reasoning level picked <span className="font-mono">{row.model}</span> to answer.
+            </Fact>
+          )}
+          {effortText(row) && <Fact label="Reasoning effort" wide>{effortText(row)}</Fact>}
           {row.model_variant && (
             <Fact label="Variant" wide>
               <span className="font-mono">{row.model_variant}</span>, a variant of <span className="font-mono">{row.model}</span> with extra boons

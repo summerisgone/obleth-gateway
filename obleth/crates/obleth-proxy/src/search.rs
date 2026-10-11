@@ -206,6 +206,9 @@ async fn handle(
         device_id,
         end_user: end_user.clone().unwrap_or_default(),
         model_variant: String::new(),
+        reasoning_effort: String::new(),
+        reasoning_effort_requested: String::new(),
+        model_family: String::new(),
     };
 
     // ---- tenant input guardrails ----

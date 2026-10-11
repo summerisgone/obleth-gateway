@@ -1328,6 +1328,9 @@ fn helper_usage_record(
         // A helper row is the helper model's own call; the variant the client
         // used is recorded on the request's row.
         model_variant: String::new(),
+        reasoning_effort: String::new(),
+        reasoning_effort_requested: String::new(),
+        model_family: String::new(),
     }
 }
 
