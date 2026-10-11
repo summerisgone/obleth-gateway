@@ -635,6 +635,18 @@ kubectl patch storageclass <name> \
   -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
 ```
 
+If the PVC is `Bound` but the datastore pod sits in `ContainerCreating` with
+`AttachVolume.Attach failed ... does not contain driver`, the storage driver is
+not installed on the node the pod landed on (common when a CSI driver runs on
+a subset of nodes). Keep the datastores on nodes that have it:
+
+```bash
+--set 'datastores.nodeSelector.longhorn\.io/disk-ready=true'
+# or in values: datastores: { nodeSelector: { ...label of nodes with the driver... } }
+```
+
+`datastores.tolerations` is there too, for storage nodes that carry a taint.
+
 `local-path` (k3s/k0s) and similar node-local provisioners use
 `volumeBindingMode: WaitForFirstConsumer` — the PVC binds only once a consuming
 pod is scheduled, and the volume is then pinned to that node. That is fine for a

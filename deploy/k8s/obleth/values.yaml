@@ -272,6 +272,15 @@ ingress:
 #      ALL DATA IS LOST when the pod restarts. Use only for throwaway test envs.
 #   3. External: `enabled: false` + `external.url` points obleth at a managed or
 #      self-hosted datastore and the bundled container is not deployed at all.
+# Placement for the bundled datastores below (Postgres, Redis, ClickHouse).
+# Their persistent volumes come from the cluster's storage, which on some
+# clusters can only attach on some nodes (a storage driver not installed
+# everywhere, local disks); pin the datastores to nodes that have it. Both
+# empty (the default) leaves scheduling to Kubernetes.
+datastores:
+  nodeSelector: {}   # e.g. { longhorn.io/disk-ready: "true" }
+  tolerations: []
+
 postgres:
   enabled: true
   image: postgres:16
