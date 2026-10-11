@@ -8,6 +8,7 @@ import { Check, ChevronDown, Download, Plus, Search, Upload, X } from "lucide-re
 import { checkModelsHealthAction, deleteModelsAction, setModelsEnabledAction, type BulkModelResult } from "@/app/actions";
 import { useCapacityDiscovery, useFairshareLive } from "@/components/fairshare/hooks";
 import { AddModelSheet, type AddMode } from "@/components/models/add-model";
+import { FamiliesSection } from "@/components/models/families";
 import { Notice, ProviderMark, StatusMark, Tile } from "@/components/models/ui";
 import { Meter, Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
@@ -37,7 +38,7 @@ import {
   type StatusFilter,
   type TypeGroup,
 } from "@/lib/models-model";
-import type { CacheStats, ModelHealthSummary, ModelRoute, UsageModelAgg } from "@/lib/obleth";
+import type { CacheStats, ModelFamily, ModelHealthSummary, ModelRoute, UsageModelAgg } from "@/lib/obleth";
 import { compact, formatMs, isBenchmarkRoute } from "@/lib/overview-model";
 import { logsHref } from "@/lib/log-links";
 import { cn, getJson } from "@/lib/utils";
@@ -57,6 +58,7 @@ export function ModelsList({
   cacheStats,
   slurmEnabled,
   initialAdd,
+  families = [],
 }: {
   models: ModelRoute[];
   health: ModelHealthSummary[];
@@ -64,6 +66,8 @@ export function ModelsList({
   cacheStats?: CacheStats;
   slurmEnabled: boolean;
   initialAdd?: AddMode | null;
+  /** Model families, or null when the gateway could not list them. */
+  families?: ModelFamily[] | null;
 }) {
   const router = useRouter();
   const { confirm, confirmElement } = useConfirm();
@@ -325,6 +329,8 @@ export function ModelsList({
           </div>
         )}
       </section>
+
+      <FamiliesSection families={families} models={models} />
 
       {selected.size > 0 && (
         <div role="region" aria-label="Selected models" className="sticky bottom-5 z-30 mx-auto flex flex-wrap items-center gap-2 rounded-xl border border-muted-foreground/50 bg-card px-3 py-2 shadow-2xl">

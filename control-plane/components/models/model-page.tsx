@@ -12,6 +12,7 @@ import { Switch } from "@/components/models/fields";
 import { LifecycleSection, type LifecycleCandidate } from "@/components/models/lifecycle";
 import { ModelOverview } from "@/components/models/model-overview";
 import { ModelSettings, type SettingsState } from "@/components/models/model-settings";
+import { ReasoningSection } from "@/components/models/reasoning";
 import { Notice, ProviderMark, StatusMark } from "@/components/models/ui";
 import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
@@ -26,6 +27,7 @@ import {
   lifecycleStatus,
   MODEL_TYPE_NAMES,
   modelStatus,
+  reasoningNavCount,
   RUNS_LABELS,
   runsOn,
   searchSettings,
@@ -252,7 +254,7 @@ export function ModelPage({
 
   // Which part of the page is on screen, for the section list.
   useEffect(() => {
-    const ids: NavId[] = ["overview", "general", "connection", "routing", "capabilities", "pricing", "capacity", "health", "endpoints", "deployment", "lifecycle", "activity"];
+    const ids: NavId[] = ["overview", "general", "connection", "routing", "capabilities", "pricing", "capacity", "health", "reasoning", "endpoints", "deployment", "lifecycle", "activity"];
     const els = ids.map((id) => document.getElementById(id)).filter((e): e is HTMLElement => !!e);
     const observer = new IntersectionObserver(
       (entries) => {
@@ -282,6 +284,7 @@ export function ModelPage({
     { id: "pricing", label: "Pricing" },
     { id: "capacity", label: "Capacity", count: load.cap || undefined },
     { id: "health", label: "Health" },
+    { id: "reasoning", label: "Reasoning", count: reasoningNavCount(model), show: chat },
     { id: "endpoints", label: "Endpoints", count: endpoints.length || undefined },
     { id: "deployment", label: "Deployment" },
     { id: "lifecycle", label: "Lifecycle", count: lifecycleStatus(model) === "active" ? undefined : lifecycleStatus(model) },
@@ -388,6 +391,7 @@ export function ModelPage({
             load={load}
             onStateChange={onSettings}
           />
+          {chat && <ReasoningSection model={model} onChanged={() => router.refresh()} />}
           <EndpointsSection model={model} endpoints={endpoints} onChanged={() => router.refresh()} />
           <DeploymentSection model={model} managed={managed} runs={runs} />
           <LifecycleSection model={model} models={lifecycleModels} callers={callers} onChanged={() => router.refresh()} />

@@ -1172,6 +1172,8 @@ mod tests {
             model_name: name.to_string(),
             aliases: Vec::new(),
             lifecycle: Default::default(),
+            reasoning: Default::default(),
+            listed: true,
             variants: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),

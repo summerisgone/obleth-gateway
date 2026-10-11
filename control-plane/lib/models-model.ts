@@ -2,11 +2,18 @@ import type {
   AuditEntry,
   CapacityDiscoveryView,
   FairshareLiveView,
+  FamilyMembers,
   LifecycleStatus,
+  ModelFamily,
+  ModelFamilyWrite,
   ModelHealthSummary,
   ModelLifecycle,
+  ModelReasoning,
   ModelRoute,
   ModelUsageTimePoint,
+  ReasoningAction,
+  ReasoningLevel,
+  ReasoningMode,
   UsageModelAgg,
 } from "@/lib/obleth";
 import { healthState, isBenchmarkRoute, poolOccupancy, type HealthState } from "@/lib/overview-model";
@@ -312,6 +319,7 @@ export type SettingsSectionId =
   | "pricing"
   | "capacity"
   | "health"
+  | "reasoning"
   | "endpoints"
   | "deployment";
 
@@ -323,6 +331,7 @@ export const SECTIONS: { id: SettingsSectionId; label: string }[] = [
   { id: "pricing", label: "Pricing" },
   { id: "capacity", label: "Capacity" },
   { id: "health", label: "Health" },
+  { id: "reasoning", label: "Reasoning" },
   { id: "endpoints", label: "Endpoints" },
   { id: "deployment", label: "Deployment" },
 ];
@@ -345,6 +354,7 @@ export const SETTING_INDEX: SettingEntry[] = [
   { id: "set-description", label: "Description", section: "general" },
   { id: "set-type", label: "Model type", section: "general", keywords: "modality endpoint chat embedding image video audio" },
   { id: "set-aliases", label: "Aliases", section: "general", keywords: "other names rename old name" },
+  { id: "set-listed", label: "List in /v1/models", section: "general", keywords: "hide hidden discovery models list advertise family" },
   { id: "set-variants", label: "Variants", section: "general", keywords: "other names extra boons speculation spec", types: CHAT },
   { id: "set-quantization", label: "Quantization", section: "general", keywords: "format fp8 bf16 mxfp4 precision" },
   { id: "set-upstream", label: "Upstream model", section: "connection", keywords: "native name served model" },
@@ -373,6 +383,7 @@ export const SETTING_INDEX: SettingEntry[] = [
   { id: "set-checks", label: "Health checks", section: "health", keywords: "interval probe scheduled alerts slack" },
   { id: "set-threshold", label: "Failure threshold", section: "health", keywords: "failures alert" },
   { id: "set-maintenance", label: "Maintenance window", section: "health", keywords: "maintenance pause note" },
+  { id: "reasoning", label: "Reasoning effort", section: "reasoning", keywords: "thinking reasoning_effort enable_thinking levels none low medium high translate", types: CHAT },
   { id: "endpoints", label: "Endpoints", section: "endpoints", keywords: "clusters priority weight add endpoint" },
   { id: "deployment", label: "Deployment", section: "deployment", keywords: "slurm replicas provisioning launch" },
 ];
@@ -402,13 +413,14 @@ export function searchSettings(query: string, modelType: string, limit = 6): Set
 }
 
 /** Which save call owns a form field; everything unlisted is part of the model itself. */
-export function fieldSection(name: string): "model" | "cache" | "reliability" | "health" | "capacity" | "knowledge" | null {
+export function fieldSection(name: string): "model" | "cache" | "reliability" | "health" | "capacity" | "knowledge" | "listing" | null {
   if (name === "id" || name === "sections" || name.startsWith("has_") || name === "knowledge_loaded") return null;
   if (name === "cache_enabled" || name === "cache_ttl_secs") return "cache";
   if (["request_timeout_secs", "max_retries", "retry_backoff_ms", "endpoint_selection_mode", "debug_diagnostics"].includes(name)) return "reliability";
   if (["check_interval_secs", "failure_threshold", "maintenance_until", "maintenance_note", "checks_enabled", "alerts_enabled"].includes(name)) return "health";
   if (name === "max_in_flight" || name.startsWith("capacity_") || name === "per_replica_max_in_flight") return "capacity";
   if (name === "knowledge_collection") return "knowledge";
+  if (name === "listed") return "listing";
   return "model";
 }
 
@@ -416,6 +428,7 @@ const FIELD_LABELS: [RegExp, string][] = [
   [/^description$/, "Description"],
   [/^model_type$/, "Model type"],
   [/^aliases$/, "Aliases"],
+  [/^listed$/, "Listed in /v1/models"],
   [/^variants$/, "Variants"],
   [/^quantization$/, "Quantization"],
   [/^upstream_model$/, "Upstream model"],
@@ -610,4 +623,346 @@ export function dateInputValue(iso?: string | null): string {
 /** A date input's value as the start of that day in UTC, or null when blank. */
 export function retireAtFromInput(value: string): string | null {
   return /^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T00:00:00Z` : null;
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning effort
+// ---------------------------------------------------------------------------
+
+export const REASONING_LEVELS: readonly ReasoningLevel[] = ["none", "low", "medium", "high"];
+
+export const REASONING_LEVEL_LABELS: Record<ReasoningLevel, string> = { none: "None", low: "Low", medium: "Medium", high: "High" };
+
+/** Request fields a level may not set. Mirrors `RESERVED_REASONING_FIELDS` in the gateway's `reasoning.rs`. */
+export const RESERVED_REASONING_FIELDS = ["model", "messages", "prompt", "input", "stream", "stream_options", "tools", "tool_choice", "n"];
+
+/** The most one level may send, as compact JSON. */
+export const MAX_REASONING_SEND_BYTES = 4096;
+
+/** A model's map with what older gateways leave out filled in: pass-through, no default, no levels. */
+export function modelReasoning(model: Pick<ModelRoute, "reasoning">): { mode: ReasoningMode; default_level: ReasoningLevel | null; levels: Partial<Record<ReasoningLevel, ReasoningAction>> } {
+  const r = model.reasoning;
+  return { mode: r?.mode ?? "passthrough", default_level: r?.default_level ?? null, levels: { ...(r?.levels ?? {}) } };
+}
+
+/** The section list's word for a model that does something with effort, or undefined when it passes it through. */
+export function reasoningNavCount(model: Pick<ModelRoute, "reasoning">): string | undefined {
+  const mode = modelReasoning(model).mode;
+  return mode === "mapped" ? "translated" : mode === "unsupported" ? "removed" : undefined;
+}
+
+/** The ways one level can be translated, as the Reasoning section offers them. */
+export type LevelPreset = "default" | "effort" | "thinking_off" | "thinking_on" | "use" | "custom";
+
+export const LEVEL_PRESETS: { value: LevelPreset; label: string }[] = [
+  { value: "default", label: "Server default (send nothing)" },
+  { value: "effort", label: "Send reasoning_effort =" },
+  { value: "thinking_off", label: "Turn thinking off (enable_thinking: false)" },
+  { value: "thinking_on", label: "Turn thinking on (enable_thinking: true)" },
+  { value: "use", label: "Same as another level" },
+  { value: "custom", label: "Custom fields (JSON)" },
+];
+
+/** One level's row as the section edits it. Every input keeps its text, so switching presets back and forth loses nothing. */
+export interface LevelDraft {
+  preset: LevelPreset;
+  effort: string;
+  use: ReasoningLevel;
+  json: string;
+}
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** The level next to `level`, the first choice for "Same as another level". */
+function neighbour(level: ReasoningLevel): ReasoningLevel {
+  const i = REASONING_LEVELS.indexOf(level);
+  return REASONING_LEVELS[i === REASONING_LEVELS.length - 1 ? i - 1 : i + 1];
+}
+
+/**
+ * A stored action as a row: the preset it matches exactly, or Custom with its
+ * JSON. A level with nothing stored starts as `reasoning_effort` = its own name.
+ */
+export function levelDraft(level: ReasoningLevel, action?: ReasoningAction): LevelDraft {
+  const draft: LevelDraft = { preset: "effort", effort: level, use: neighbour(level), json: "{}" };
+  if (!action) return draft;
+  if ("use" in action) return { ...draft, preset: "use", use: action.use };
+  const send = isObject(action.send) ? action.send : {};
+  const keys = Object.keys(send);
+  const json = JSON.stringify(send, null, 2);
+  if (keys.length === 0) return { ...draft, preset: "default", json };
+  if (keys.length === 1 && typeof send.reasoning_effort === "string") return { ...draft, preset: "effort", effort: send.reasoning_effort, json };
+  const kwargs = send.chat_template_kwargs;
+  if (keys.length === 1 && isObject(kwargs) && Object.keys(kwargs).length === 1 && typeof kwargs.enable_thinking === "boolean") {
+    return { ...draft, preset: kwargs.enable_thinking ? "thinking_on" : "thinking_off", json };
+  }
+  return { ...draft, preset: "custom", json };
+}
+
+export type LevelBuild = { ok: true; action: ReasoningAction } | { ok: false; error: string };
+
+/** A row as the action the gateway stores, or why it can't be one. */
+export function levelAction(draft: LevelDraft): LevelBuild {
+  switch (draft.preset) {
+    case "default":
+      return { ok: true, action: { send: {} } };
+    case "effort": {
+      const value = draft.effort.trim();
+      if (!value) return { ok: false, error: "Type the value to send as reasoning_effort, such as low or high." };
+      return { ok: true, action: { send: { reasoning_effort: value } } };
+    }
+    case "thinking_off":
+      return { ok: true, action: { send: { chat_template_kwargs: { enable_thinking: false } } } };
+    case "thinking_on":
+      return { ok: true, action: { send: { chat_template_kwargs: { enable_thinking: true } } } };
+    case "use":
+      return { ok: true, action: { use: draft.use } };
+    case "custom": {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(draft.json);
+      } catch {
+        return { ok: false, error: "The custom fields are not valid JSON. Write an object in braces, such as {\"reasoning_effort\": \"high\"}." };
+      }
+      if (!isObject(parsed)) return { ok: false, error: "The custom fields must be a JSON object in braces, such as {\"reasoning_effort\": \"high\"}." };
+      return { ok: true, action: { send: parsed } };
+    }
+  }
+}
+
+/**
+ * Why the gateway would refuse a map, in a sentence, or null. Mirrors
+ * `ModelReasoning::validate` and the chat-only rule in the admin API, so the
+ * section can say so before saving; the gateway checks again.
+ */
+export function reasoningProblem(r: ModelReasoning, modelType?: string): string | null {
+  const levels = r.levels ?? {};
+  const label = (l: ReasoningLevel) => REASONING_LEVEL_LABELS[l];
+  if (r.mode !== "passthrough" && modelType !== undefined && modelType !== "chat") return "Only chat models take reasoning effort. Leave this model on pass through.";
+  for (const level of REASONING_LEVELS) {
+    const action = levels[level];
+    if (!action) continue;
+    if ("use" in action) {
+      if (action.use === level) return `${label(level)} can't be the same as itself. Pick another level.`;
+      if (r.mode !== "mapped") continue;
+      const target = levels[action.use];
+      if (!target) return `${label(level)} is the same as ${label(action.use)}, but ${label(action.use)} has nothing set.`;
+      if ("use" in target) return `${label(level)} is the same as ${label(action.use)}, which is itself the same as another level. Point it at a level that sends something.`;
+      continue;
+    }
+    const field = RESERVED_REASONING_FIELDS.find((f) => f in action.send);
+    if (field) return `${label(level)} may not set ${field}. A level can only send fields about effort.`;
+    const bytes = new TextEncoder().encode(JSON.stringify(action.send)).length;
+    if (bytes > MAX_REASONING_SEND_BYTES) return `${label(level)} sends ${bytes} bytes of fields; one level can send at most ${MAX_REASONING_SEND_BYTES}.`;
+  }
+  if (r.mode === "mapped") {
+    const missing = REASONING_LEVELS.filter((l) => !levels[l]);
+    if (missing.length) return `Set all four levels to translate them. Not set: ${missing.join(", ")}.`;
+  }
+  return null;
+}
+
+/** The Reasoning section's state. */
+export interface ReasoningDraft {
+  mode: ReasoningMode;
+  /** "" leaves a request without effort to the model's server. */
+  defaultLevel: ReasoningLevel | "";
+  levels: Record<ReasoningLevel, LevelDraft>;
+}
+
+export function reasoningDraft(model: Pick<ModelRoute, "reasoning">): ReasoningDraft {
+  const r = modelReasoning(model);
+  return {
+    mode: r.mode,
+    defaultLevel: r.default_level ?? "",
+    levels: Object.fromEntries(REASONING_LEVELS.map((l) => [l, levelDraft(l, r.levels[l])])) as Record<ReasoningLevel, LevelDraft>,
+  };
+}
+
+/** Object keys sorted at every depth, so two maps compare as strings. */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (isObject(value)) return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
+/** The stored map in the shape the section writes, for comparing. */
+function storedForm(model: Pick<ModelRoute, "reasoning">): ModelReasoning {
+  const r = modelReasoning(model);
+  return { mode: r.mode, ...(r.default_level ? { default_level: r.default_level } : {}), ...(Object.keys(r.levels).length ? { levels: r.levels } : {}) };
+}
+
+export type ReasoningBuild = { ok: true; reasoning: ModelReasoning } | { ok: false; error: string };
+
+/**
+ * The section's state as the map to save. The level rows are written when
+ * translating, or when someone changed them; otherwise the stored levels go
+ * back as they were, so switching to pass through keeps them for later and
+ * opening the page never invents levels.
+ */
+export function reasoningFromDraft(draft: ReasoningDraft, model: Pick<ModelRoute, "reasoning" | "model_type">): ReasoningBuild {
+  const stored = modelReasoning(model);
+  const initial = reasoningDraft(model);
+  const touched = REASONING_LEVELS.some((l) => canonical(levelAction(draft.levels[l])) !== canonical(levelAction(initial.levels[l])));
+  let levels: Partial<Record<ReasoningLevel, ReasoningAction>> = stored.levels;
+  if (draft.mode === "mapped" || touched) {
+    levels = {};
+    for (const level of REASONING_LEVELS) {
+      const built = levelAction(draft.levels[level]);
+      if (!built.ok) return { ok: false, error: `${REASONING_LEVEL_LABELS[level]}: ${built.error}` };
+      levels[level] = built.action;
+    }
+  }
+  const reasoning: ModelReasoning = {
+    mode: draft.mode,
+    ...(draft.defaultLevel ? { default_level: draft.defaultLevel } : {}),
+    ...(Object.keys(levels).length ? { levels } : {}),
+  };
+  const problem = reasoningProblem(reasoning, model.model_type);
+  return problem ? { ok: false, error: problem } : { ok: true, reasoning };
+}
+
+/** Whether the section holds something other than what is stored. A row that can't be saved counts as a change. */
+export function reasoningDirty(draft: ReasoningDraft, model: Pick<ModelRoute, "reasoning" | "model_type">): boolean {
+  const built = reasoningFromDraft(draft, model);
+  if (!built.ok) return canonical(draft) !== canonical(reasoningDraft(model));
+  return canonical(built.reasoning) !== canonical(storedForm(model));
+}
+
+/** Fields as "a.b: value" pairs, nested objects flattened. */
+function flatFields(obj: Record<string, unknown>, prefix = ""): string[] {
+  return Object.entries(obj).flatMap(([k, v]) =>
+    isObject(v) && Object.keys(v).length > 0 ? flatFields(v, `${prefix}${k}.`) : [`${prefix}${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`],
+  );
+}
+
+/** What a level's fields do to a request: "sends reasoning_effort: max", or "sends nothing, so the server's own default applies". */
+export function sendWords(send: Record<string, unknown>): string {
+  const fields = flatFields(send);
+  return fields.length ? `sends ${fields.join(", ")}` : "sends nothing, so the server's own default applies";
+}
+
+/**
+ * The live preview: one line per level for a translated model ("high → sends
+ * reasoning_effort: max", "none → served as low, which sends …"), then what
+ * happens when a caller names no level. One sentence for the other modes.
+ */
+export function reasoningPreview(r: ModelReasoning): string[] {
+  if (r.mode === "passthrough") return ["Every request reaches the model as the caller sent it, effort included."];
+  if (r.mode === "unsupported") return ["obleth removes reasoning_effort and reasoning from every request, so the model's server never sees them."];
+  const levels = r.levels ?? {};
+  const lines = REASONING_LEVELS.map((level) => {
+    const action = levels[level];
+    if (!action) return `${level} → not set yet`;
+    if (!("use" in action)) return `${level} → ${sendWords(action.send)}`;
+    const target = levels[action.use];
+    const then = target && !("use" in target) ? `, which ${sendWords(target.send)}` : "";
+    return `${level} → served as ${action.use}${then}${level === "none" ? " (this model has no off switch)" : ""}`;
+  });
+  lines.push(r.default_level ? `no effort set → served as ${r.default_level}` : "no effort set → sent as it came, so the server's own default applies");
+  return lines;
+}
+
+// ---------------------------------------------------------------------------
+// Model families: one name, a model per reasoning level
+// ---------------------------------------------------------------------------
+
+/** Longest family name and description the gateway keeps. */
+export const MAX_FAMILY_NAME_CHARS = 128;
+export const MAX_FAMILY_DESCRIPTION_CHARS = 500;
+
+/** A family as its editor holds it. */
+export interface FamilyDraft {
+  name: string;
+  description: string;
+  default_level: ReasoningLevel;
+  members: FamilyMembers;
+}
+
+export function familyDraft(family?: ModelFamily | null): FamilyDraft {
+  if (!family) return { name: "", description: "", default_level: "none", members: { none: "", low: "", medium: "", high: "" } };
+  return { name: family.name, description: family.description ?? "", default_level: family.default_level, members: { ...family.members } };
+}
+
+/** The editor's state as the gateway takes it, names and description trimmed. */
+export function familyWrite(draft: FamilyDraft): ModelFamilyWrite {
+  return {
+    name: draft.name.trim(),
+    description: draft.description.trim(),
+    default_level: draft.default_level,
+    members: Object.fromEntries(REASONING_LEVELS.map((l) => [l, draft.members[l].trim()])) as unknown as FamilyMembers,
+  };
+}
+
+/** Every name a model answers to: its own, its aliases and its variants. A family may use none of them. */
+export function takenModelNames(models: Pick<ModelRoute, "model_name" | "aliases" | "variants">[]): string[] {
+  return models.flatMap((m) => [m.model_name, ...(m.aliases ?? []), ...(m.variants ?? []).map((v) => v.name)]);
+}
+
+/** Why a family name can't be saved, in a sentence, or null. Mirrors the gateway's checks; it checks again. */
+export function familyNameProblem(name: string, taken: { modelNames: string[]; familyNames: string[] }): string | null {
+  const n = name.trim();
+  if (!n) return "Give the family a name. Callers send it as the model.";
+  if (/\s/.test(n)) return "A family name can't contain spaces.";
+  if (n.length > MAX_FAMILY_NAME_CHARS) return `Keep the name to ${MAX_FAMILY_NAME_CHARS} characters.`;
+  if (n === "auto") return "auto is the router's own name.";
+  if (taken.modelNames.includes(n)) return "A model already answers to that name.";
+  if (taken.familyNames.includes(n)) return "Another family already has that name.";
+  return null;
+}
+
+/** Why a family can't be saved, or null: its name, its description, then the first level with no model. */
+export function familyProblem(draft: FamilyDraft, taken: { modelNames: string[]; familyNames: string[] }): string | null {
+  const name = familyNameProblem(draft.name, taken);
+  if (name) return name;
+  if (draft.description.trim().length > MAX_FAMILY_DESCRIPTION_CHARS) return `Keep the description to ${MAX_FAMILY_DESCRIPTION_CHARS} characters.`;
+  const missing = REASONING_LEVELS.find((l) => !draft.members[l].trim());
+  return missing ? `Pick the model that answers at ${missing}.` : null;
+}
+
+/** The levels each member answers, in level order: [{ levels: ["none"], model: "a" }, { levels: ["low", "medium", "high"], model: "b" }]. */
+export function familyGroups(members: FamilyMembers): { levels: ReasoningLevel[]; model: string }[] {
+  const groups: { levels: ReasoningLevel[]; model: string }[] = [];
+  for (const level of REASONING_LEVELS) {
+    const model = members[level];
+    const group = groups.find((g) => g.model === model);
+    if (group) group.levels.push(level);
+    else groups.push({ levels: [level], model });
+  }
+  return groups;
+}
+
+/**
+ * A family in plain words: "A request for acme-7b with no effort set goes to
+ * acme-7b-instruct." and "none → acme-7b-instruct · low, medium, high →
+ * acme-7b-think". Null until every level has a model.
+ */
+export function familyPreview(f: Pick<FamilyDraft, "name" | "default_level" | "members">): { lead: string; levels: string } | null {
+  if (REASONING_LEVELS.some((l) => !f.members[l].trim())) return null;
+  const name = f.name.trim() || "this family";
+  return {
+    lead: `A request for ${name} with no effort set goes to ${f.members[f.default_level]}.`,
+    levels: familyGroups(f.members).map((g) => `${g.levels.join(", ")} → ${g.model}`).join(" · "),
+  };
+}
+
+/**
+ * The models a family may use: chat models that are still served, sorted,
+ * deprecated ones marked. A member already chosen stays on the list whatever
+ * its state, so the editor can show it.
+ */
+export function familyMemberOptions(
+  models: Pick<ModelRoute, "model_name" | "model_type" | "lifecycle" | "effective_status">[],
+  chosen: string[] = [],
+): { value: string; label: string }[] {
+  const options = models
+    .filter((m) => m.model_type === "chat" && (lifecycleStatus(m) !== "retired" || chosen.includes(m.model_name)))
+    .map((m) => {
+      const status = lifecycleStatus(m);
+      return { value: m.model_name, label: status === "active" ? m.model_name : `${m.model_name} (${status})` };
+    });
+  for (const name of chosen) {
+    if (name && !options.some((o) => o.value === name)) options.push({ value: name, label: `${name} (not a chat model)` });
+  }
+  return options.sort((a, b) => a.value.localeCompare(b.value));
 }

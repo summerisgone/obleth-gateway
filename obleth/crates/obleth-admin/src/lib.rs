@@ -273,6 +273,16 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/models/:id/weight", put(set_model_weight))
         .route("/api/v1/models/:id/capacity", put(set_model_capacity))
         .route("/api/v1/models/:id/status", put(set_model_status))
+        .route("/api/v1/models/:id/reasoning", put(set_model_reasoning))
+        .route("/api/v1/models/:id/listing", put(set_model_listing))
+        .route(
+            "/api/v1/model-families",
+            get(list_model_families).post(create_model_family),
+        )
+        .route(
+            "/api/v1/model-families/:id",
+            put(update_model_family).delete(delete_model_family),
+        )
         .route(
             "/api/v1/models/:id/capacity-mode",
             put(set_model_capacity_mode),
@@ -1325,6 +1335,29 @@ pub struct SetModelStatus {
     pub redirect: Option<bool>,
 }
 
+/// Whether the discovery endpoints advertise a model.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetModelListing {
+    /// `false` keeps the model out of `/v1/models` and `/model/info`; it is
+    /// still served by name.
+    pub listed: bool,
+}
+
+/// A model family, written whole.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ModelFamilyWrite {
+    /// The name callers pass in `model`. Must not be any model's name, alias
+    /// or variant, or another family's name.
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The level a request that names none is served at.
+    pub default_level: obleth_config::ReasoningLevel,
+    /// The chat model that answers at each level, by name or alias (stored
+    /// as its `model_name`).
+    pub members: obleth_config::FamilyMembers,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetModelCapacityMode {
     pub capacity_mode: String,
@@ -1844,6 +1877,14 @@ pub struct ModelRouteView {
     /// The status in force now: a deprecated model past its retirement date
     /// reads `retired` here while `lifecycle.status` still says `deprecated`.
     pub effective_status: obleth_config::ModelStatus,
+    /// How the model takes reasoning effort: pass-through, mapped (each of
+    /// none/low/medium/high translated to fields its server understands), or
+    /// unsupported. Set with `PUT /api/v1/models/{id}/reasoning`.
+    pub reasoning: obleth_config::ModelReasoning,
+    /// Whether `/v1/models` and `/model/info` advertise the model. An
+    /// unlisted model is still served by name. Set with
+    /// `PUT /api/v1/models/{id}/listing`.
+    pub listed: bool,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -2012,6 +2053,8 @@ impl From<ModelRoute> for ModelRouteView {
             aliases,
             variants,
             lifecycle,
+            reasoning,
+            listed,
             description,
             upstream_model,
             api_base,
@@ -2067,6 +2110,8 @@ impl From<ModelRoute> for ModelRouteView {
             variants,
             effective_status: lifecycle.status_at(chrono::Utc::now()),
             lifecycle,
+            reasoning,
+            listed,
             description,
             upstream_model,
             api_base,
@@ -6388,6 +6433,7 @@ async fn validate_aliases(
                 )));
             }
         }
+        reject_family_name(state, alias, "alias").await?;
     }
     Ok(aliases)
 }
@@ -6482,6 +6528,7 @@ async fn validate_variants(
                 )));
             }
         }
+        reject_family_name(state, &v.name, "variant").await?;
     }
     Ok(variants)
 }
@@ -6628,6 +6675,7 @@ async fn create_model(
             )));
         }
     }
+    reject_family_name(&state, &body.model_name, "model name").await?;
     let aliases = validate_aliases(
         &state,
         body.aliases.as_deref().unwrap_or_default(),
@@ -7113,6 +7161,268 @@ async fn set_model_status(
         )
         .await?;
     Ok(Json(model.into()))
+}
+
+/// Check a reasoning map for `model`: well formed, and only on a chat
+/// model unless it is pass-through.
+fn check_reasoning(model: &ModelRoute, reasoning: &obleth_config::ModelReasoning) -> Result<()> {
+    reasoning.validate().map_err(AdminError::BadRequest)?;
+    if !reasoning.is_passthrough() && model.model_type != "chat" {
+        return Err(AdminError::BadRequest(format!(
+            "`{}` is a `{}` model; only chat models take reasoning effort",
+            model.model_name, model.model_type
+        )));
+    }
+    Ok(())
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/models/{id}/reasoning", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = obleth_config::ModelReasoning,
+    responses((status = 200, body = ModelRouteView))
+)]
+async fn set_model_reasoning(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<obleth_config::ModelReasoning>,
+) -> Result<Json<ModelRouteView>> {
+    let existing = state.store.get_model(id).await?;
+    check_reasoning(&existing, &body)?;
+    let model = state.store.set_model_reasoning(id, &body).await?;
+    sync_model(&state, &model).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_model_reasoning",
+            "model",
+            &id.to_string(),
+            serde_json::json!({
+                "model_name": model.model_name,
+                "reasoning": body,
+            }),
+        )
+        .await?;
+    Ok(Json(model.into()))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/models/{id}/listing", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = SetModelListing,
+    responses((status = 200, body = ModelRouteView))
+)]
+async fn set_model_listing(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetModelListing>,
+) -> Result<Json<ModelRouteView>> {
+    let model = state.store.set_model_listed(id, body.listed).await?;
+    sync_model(&state, &model).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_model_listing",
+            "model",
+            &id.to_string(),
+            serde_json::json!({
+                "model_name": model.model_name,
+                "listed": body.listed,
+            }),
+        )
+        .await?;
+    Ok(Json(model.into()))
+}
+
+/// Refuse `name` for a model, alias or variant when a family already uses
+/// it: a client sending `model: "x"` must reach one thing.
+async fn reject_family_name(state: &AdminState, name: &str, what: &str) -> Result<()> {
+    if let Some((_, family)) = state.store.family_name_owner(name).await? {
+        return Err(AdminError::BadRequest(format!(
+            "{what} '{}' is already the name of model family '{family}'",
+            name.trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a family write and return it in storage form: the name trimmed
+/// and unclaimed, every member a registered chat model named canonically.
+async fn check_family(
+    state: &AdminState,
+    body: ModelFamilyWrite,
+    editing: Option<Uuid>,
+) -> Result<(
+    String,
+    String,
+    obleth_config::ReasoningLevel,
+    obleth_config::FamilyMembers,
+)> {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err(AdminError::BadRequest("name must not be empty".into()));
+    }
+    if name.chars().count() > obleth_config::reasoning::MAX_FAMILY_NAME_CHARS
+        || name.chars().any(char::is_whitespace)
+    {
+        return Err(AdminError::BadRequest(format!(
+            "name must be at most {} characters with no spaces",
+            obleth_config::reasoning::MAX_FAMILY_NAME_CHARS
+        )));
+    }
+    if name == obleth_config::routing::AUTO_MODEL_NAME {
+        return Err(AdminError::BadRequest(format!(
+            "'{name}' is reserved for automatic model selection"
+        )));
+    }
+    if let Some((_, owner)) = state.store.model_name_owner(&name).await? {
+        return Err(AdminError::BadRequest(format!(
+            "'{name}' is already a name of model '{owner}'"
+        )));
+    }
+    if let Some((owner_id, _)) = state.store.family_name_owner(&name).await? {
+        if Some(owner_id) != editing {
+            return Err(AdminError::BadRequest(format!(
+                "a model family named '{name}' already exists"
+            )));
+        }
+    }
+    let description = body.description.unwrap_or_default().trim().to_string();
+    if description.chars().count() > obleth_config::reasoning::MAX_FAMILY_DESCRIPTION_CHARS {
+        return Err(AdminError::BadRequest(format!(
+            "description is longer than {} characters",
+            obleth_config::reasoning::MAX_FAMILY_DESCRIPTION_CHARS
+        )));
+    }
+    let mut members = obleth_config::FamilyMembers::default();
+    for level in obleth_config::ReasoningLevel::ALL {
+        let raw = body.members.get(level).trim();
+        if raw.is_empty() {
+            return Err(AdminError::BadRequest(format!(
+                "choose the model that answers at `{level}`"
+            )));
+        }
+        let Some((id, _)) = state.store.model_name_owner(raw).await? else {
+            return Err(AdminError::BadRequest(format!(
+                "`{level}`: '{raw}' is not a registered model"
+            )));
+        };
+        let model = state.store.get_model(id).await?;
+        if model.model_type != "chat" {
+            return Err(AdminError::BadRequest(format!(
+                "`{level}`: '{}' is a `{}` model; a family's members must be chat models",
+                model.model_name, model.model_type
+            )));
+        }
+        *members.get_mut(level) = model.model_name;
+    }
+    Ok((name, description, body.default_level, members))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/model-families", tag = "models",
+    responses((status = 200, body = [obleth_config::ModelFamily]))
+)]
+async fn list_model_families(
+    State(state): State<AdminState>,
+) -> Result<Json<Vec<obleth_config::ModelFamily>>> {
+    Ok(Json(state.store.list_model_families().await?))
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/model-families", tag = "models",
+    request_body = ModelFamilyWrite,
+    responses((status = 200, body = obleth_config::ModelFamily))
+)]
+async fn create_model_family(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(body): Json<ModelFamilyWrite>,
+) -> Result<Json<obleth_config::ModelFamily>> {
+    let (name, description, default_level, members) = check_family(&state, body, None).await?;
+    let family = state
+        .store
+        .create_model_family(&name, &description, default_level, &members)
+        .await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "create_model_family",
+            "model_family",
+            &family.id.to_string(),
+            serde_json::json!({
+                "name": family.name,
+                "default_level": family.default_level,
+                "members": family.members,
+            }),
+        )
+        .await?;
+    Ok(Json(family))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/model-families/{id}", tag = "models",
+    params(("id" = Uuid, Path, description = "Family id")),
+    request_body = ModelFamilyWrite,
+    responses((status = 200, body = obleth_config::ModelFamily))
+)]
+async fn update_model_family(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<ModelFamilyWrite>,
+) -> Result<Json<obleth_config::ModelFamily>> {
+    state.store.get_model_family(id).await?;
+    let (name, description, default_level, members) = check_family(&state, body, Some(id)).await?;
+    let family = state
+        .store
+        .update_model_family(id, &name, &description, default_level, &members)
+        .await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "update_model_family",
+            "model_family",
+            &id.to_string(),
+            serde_json::json!({
+                "name": family.name,
+                "default_level": family.default_level,
+                "members": family.members,
+            }),
+        )
+        .await?;
+    Ok(Json(family))
+}
+
+#[utoipa::path(
+    delete, path = "/api/v1/model-families/{id}", tag = "models",
+    params(("id" = Uuid, Path, description = "Family id")),
+    responses((status = 204))
+)]
+async fn delete_model_family(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode> {
+    let family = state.store.get_model_family(id).await?;
+    state.store.delete_model_family(id).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "delete_model_family",
+            "model_family",
+            &id.to_string(),
+            serde_json::json!({ "name": family.name }),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -7890,6 +8200,20 @@ async fn delete_model(
     headers: HeaderMap,
 ) -> Result<StatusCode> {
     let model = state.store.get_model(id).await?;
+    // A family names its members; deleting one would leave a level of that
+    // family answering 404.
+    let families = state.store.families_using(&model.model_name).await?;
+    if !families.is_empty() {
+        return Err(AdminError::BadRequest(format!(
+            "'{}' answers for model family {}; change or delete the family first",
+            model.model_name,
+            families
+                .iter()
+                .map(|f| format!("'{f}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     state.store.delete_model(id).await?;
     // Aliases and variants are resolver keys of their own, so a delete has to
     // clear all of them or the model stays reachable under its old names.
@@ -8385,6 +8709,8 @@ fn resolved_model_of(
         model_name: model.model_name.clone(),
         aliases: model.aliases.clone(),
         lifecycle: model.lifecycle.clone(),
+        reasoning: model.reasoning.clone(),
+        listed: model.listed,
         variants: model.variants.clone(),
         upstream_model: model.upstream_model.clone(),
         api_base: model.api_base.clone(),
@@ -11122,6 +11448,42 @@ mod tests {
     }
 
     #[test]
+    fn the_published_model_carries_its_reasoning_map() {
+        // The request path reads the published copy: a map left at its
+        // default here would pass every caller's effort through untouched.
+        let mut m = fixture_model_route("two-level");
+        m.reasoning = obleth_config::ModelReasoning {
+            mode: obleth_config::ReasoningMode::Unsupported,
+            ..Default::default()
+        };
+        let resolved = resolved_model_of(&m, Vec::new(), Vec::new());
+        assert_eq!(resolved.reasoning, m.reasoning);
+        let view = ModelRouteView::from(m.clone());
+        assert_eq!(view.reasoning, m.reasoning);
+    }
+
+    #[test]
+    fn reasoning_maps_are_checked_and_kept_to_chat_models() {
+        let chat = fixture_model_route("chat-model");
+        let mut embed = fixture_model_route("embed-model");
+        embed.model_type = "embedding".into();
+        let unsupported = obleth_config::ModelReasoning {
+            mode: obleth_config::ReasoningMode::Unsupported,
+            ..Default::default()
+        };
+        assert!(check_reasoning(&chat, &unsupported).is_ok());
+        assert!(check_reasoning(&embed, &unsupported).is_err());
+        // Pass-through is fine anywhere: it changes nothing.
+        assert!(check_reasoning(&embed, &Default::default()).is_ok());
+        let incomplete = obleth_config::ModelReasoning {
+            mode: obleth_config::ReasoningMode::Mapped,
+            ..Default::default()
+        };
+        let err = check_reasoning(&chat, &incomplete).unwrap_err();
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
     fn the_published_model_carries_its_lifecycle() {
         // The request path reads the published copy, not Postgres: a
         // lifecycle left at its default here means a retired model is served.
@@ -11163,6 +11525,8 @@ mod tests {
             model_name: name.to_string(),
             aliases: Vec::new(),
             lifecycle: Default::default(),
+            reasoning: Default::default(),
+            listed: true,
             variants: Vec::new(),
             description: String::new(),
             upstream_model: name.to_string(),
@@ -11399,6 +11763,43 @@ mod tests {
             ],
         );
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn an_import_cannot_take_a_family_name() {
+        let write =
+            |name: &str, aliases: &[&str], variants: &[&str]| obleth_store::ModelImportWrite {
+                model_name: name.into(),
+                config: obleth_config::ModelConfig {
+                    aliases: aliases.iter().map(|a| a.to_string()).collect(),
+                    variants: variants
+                        .iter()
+                        .map(|v| obleth_config::ModelVariant {
+                            name: v.to_string(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                endpoints: None,
+            };
+        let families: std::collections::HashSet<String> = ["acme".to_string()].into();
+        let errors = crate::models_io::family_conflicts(
+            &families,
+            &[
+                write("acme", &[], &[]),
+                write("acme-think", &["acme"], &["acme"]),
+                write("other", &["other-old"], &[]),
+            ],
+        );
+        assert_eq!(
+            errors,
+            vec![
+                "model 'acme': 'acme' is already the name of a model family",
+                "model 'acme-think': 'acme' is already the name of a model family",
+                "model 'acme-think': 'acme' is already the name of a model family",
+            ]
+        );
     }
 
     #[test]

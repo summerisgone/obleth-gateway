@@ -3,7 +3,7 @@ import { ModelsList } from "@/components/models/models-list";
 import type { AddMode } from "@/components/models/add-model";
 import { requireAdmin } from "@/lib/auth/roles";
 import { modelHref } from "@/lib/models-model";
-import { obleth, type CacheStats, type ModelHealthSummary } from "@/lib/obleth";
+import { obleth, type CacheStats, type ModelFamily, type ModelHealthSummary } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
@@ -18,12 +18,14 @@ export default async function ModelsPage({ searchParams }: { searchParams: Promi
   // Launching on a cluster lives under Deployments now.
   if (params.add === "slurm") redirect("/deployments/new");
 
-  const [models, cacheStats, health, slurm, managedSpecs] = await Promise.all([
+  const [models, cacheStats, health, slurm, managedSpecs, families] = await Promise.all([
     safe(obleth.listModels(), []),
     safe<CacheStats | undefined>(obleth.cacheStats(), undefined),
     safe<ModelHealthSummary[]>(obleth.modelHealth(), []),
     safe(obleth.getSlurmSettings(), null),
     safe(obleth.listManagedModels(), []),
+    // Null when the gateway can't list them (one from before families), so the page can say so.
+    safe<ModelFamily[] | null>(obleth.listModelFamilies(), null),
   ]);
   const managed = Object.fromEntries(managedSpecs.map((spec) => [spec.model_id, true]));
   const add = ADD_MODES.find((m) => m === params.add) ?? (params.add ? "connect" : null);
@@ -36,6 +38,7 @@ export default async function ModelsPage({ searchParams }: { searchParams: Promi
       cacheStats={cacheStats}
       slurmEnabled={slurm?.enabled ?? false}
       initialAdd={add}
+      families={families}
     />
   );
 }
