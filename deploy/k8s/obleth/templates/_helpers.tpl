@@ -156,3 +156,18 @@ and opentelemetry_span_log, whose custom engine takes no TTL, are left alone.
 {{- end }}
 </clickhouse>
 {{- end -}}
+
+{{/*
+Where the bundled datastores (Postgres, Redis, ClickHouse) may run. Their
+volumes come from the cluster's storage, which on some clusters only reaches
+some nodes; `datastores.nodeSelector` and `datastores.tolerations` keep them on
+nodes that can attach it. Renders nothing when both are empty.
+*/}}
+{{- define "obleth.datastorePlacement" -}}
+{{- with .Values.datastores.nodeSelector }}
+nodeSelector: {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .Values.datastores.tolerations }}
+tolerations: {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end -}}
