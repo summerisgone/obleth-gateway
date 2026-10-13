@@ -127,9 +127,13 @@ async fn main() -> anyhow::Result<()> {
             obleth_fairshare::SharedSlotsConfig {
                 reconcile_interval: cfg.fairshare_replica_heartbeat,
                 split_on_fallback: cfg.fairshare_replica_aware,
-                // Dashboards poll every couple of seconds; a view refreshed
-                // as often keeps the cluster-wide counts current.
-                view_interval: cfg.fairshare_replica_heartbeat.min(Duration::from_secs(2)),
+                // The cluster-wide counts add up views published at
+                // different moments; requests that finish or start between
+                // them blur the sum, so publish often enough that the
+                // blur stays a slot or two.
+                view_interval: cfg
+                    .fairshare_replica_heartbeat
+                    .min(Duration::from_millis(500)),
                 ..Default::default()
             },
         );
