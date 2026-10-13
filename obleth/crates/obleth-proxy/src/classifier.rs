@@ -31,7 +31,7 @@ use obleth_config::{AutoRouterSettings, ResolvedModel};
 use crate::router::Intent;
 use crate::verdicts::prompt::{self as vprompt, LabelSemantics};
 use crate::verdicts::types::Question;
-use crate::verdicts::{answers, fan_out, QuestionCall, QuestionOutcome};
+use crate::verdicts::{answers, fan_out, QuestionCall, QuestionOutcome, SharedPrompt};
 
 /// Hot-swappable classifier configuration plus a short-lived result cache.
 #[derive(Clone)]
@@ -170,22 +170,21 @@ async fn call_brain(
         questions.push((format!("tag:{tag}"), tag_question(tag)));
     }
 
+    let shared = std::sync::Arc::new(SharedPrompt {
+        upstream_model: brain.upstream_model.clone(),
+        system,
+        images: Vec::new(),
+    });
     let calls: Vec<QuestionCall> = questions
         .iter()
         .map(|(id, q)| {
             let labels = vprompt::labels_for(q);
-            let user_msg = vprompt::render_user(q, &labels);
             QuestionCall {
                 id: id.clone(),
                 boolean: matches!(labels.semantics, LabelSemantics::Boolean),
+                user: vprompt::render_user(q, &labels),
                 labels: labels.labels,
-                body: vprompt::build_body(&brain.upstream_model, &system, &user_msg),
-                prefill_body: vprompt::build_body_prefilled(
-                    &brain.upstream_model,
-                    &system,
-                    &user_msg,
-                ),
-                splice_body: vprompt::build_body_spliced(&brain.upstream_model, &system, &user_msg),
+                shared: shared.clone(),
             }
         })
         .collect();

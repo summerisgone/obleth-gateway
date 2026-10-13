@@ -1,10 +1,10 @@
 //! Wire types for `POST /v1/verdicts`.
 //!
-//! A `state` (string | object | array) is evaluated against a map of typed
-//! questions — `boolean`, `choice`, `score` — and each question comes back as
-//! a typed verdict with a probability distribution and a confidence. Unknown
-//! fields are ignored rather than rejected so the request shape can grow
-//! without breaking older gateways.
+//! A `state` (string | object | array), optionally with `images`, is
+//! evaluated against a map of typed questions — `boolean`, `choice`, `score` —
+//! and each question comes back as a typed verdict with a probability
+//! distribution and a confidence. Unknown fields are ignored rather than
+//! rejected so the request shape can grow without breaking older gateways.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -29,6 +29,15 @@ pub(crate) const MAX_SCORE_LEVELS: usize = 10;
 pub(crate) const MAX_STATE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_QUESTION_ID_LEN: usize = 64;
 pub(crate) const MAX_OPTION_NAME_LEN: usize = 200;
+/// Upper bound on images per request.
+pub(crate) const MAX_IMAGES: usize = 8;
+/// Cap on the summed length of the image URLs (a base64 data URL is the
+/// image itself, about 4/3 of its file size).
+pub(crate) const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+/// Cap on image bytes × questions. Every question is its own upstream call
+/// and each call carries the images, so this bounds what one request sends
+/// upstream (and holds in flight) rather than what it uploads.
+pub(crate) const MAX_FANOUT_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The top-level request: one state, one model, one or more typed questions.
 ///
@@ -37,8 +46,14 @@ pub(crate) const MAX_OPTION_NAME_LEN: usize = 200;
 /// `preserve_order`, so client key order is not observable anyway.
 #[derive(Debug, Deserialize)]
 pub(crate) struct VerdictsRequest {
-    /// The content to evaluate: a plain string, or structured JSON.
+    /// The content to evaluate: a plain string, or structured JSON. May be
+    /// left out when `images` carry the content.
+    #[serde(default)]
     pub state: serde_json::Value,
+    /// Images evaluated together with the state: `data:image/…` URLs or
+    /// `http(s)` URLs the model's backend fetches itself.
+    #[serde(default)]
+    pub images: Vec<String>,
     pub model: String,
     pub questions: BTreeMap<String, Question>,
 }
@@ -161,9 +176,12 @@ pub(crate) fn validate(req: &VerdictsRequest) -> Result<(), String> {
         serde_json::Value::String(_)
         | serde_json::Value::Object(_)
         | serde_json::Value::Array(_) => {}
+        serde_json::Value::Null if !req.images.is_empty() => {}
         _ => {
             return Err(
-                "`state` must be a string, object, or array (see the verdicts docs)".to_string(),
+                "`state` must be a string, object, or array, and may be left out only \
+                 when `images` are given (see the verdicts docs)"
+                    .to_string(),
             )
         }
     }
@@ -179,6 +197,7 @@ pub(crate) fn validate(req: &VerdictsRequest) -> Result<(), String> {
             req.questions.len()
         ));
     }
+    validate_images(&req.images, req.questions.len())?;
     for (id, q) in &req.questions {
         if id.trim().is_empty() {
             return Err("question ids must be non-empty".to_string());
@@ -229,6 +248,40 @@ pub(crate) fn validate(req: &VerdictsRequest) -> Result<(), String> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Image limits: a count, a size, and a size × question bound, plus a URL
+/// shape check so a typo fails here as a 400 rather than as a backend error.
+fn validate_images(images: &[String], questions: usize) -> Result<(), String> {
+    if images.len() > MAX_IMAGES {
+        return Err(format!(
+            "too many images: {} (maximum {MAX_IMAGES})",
+            images.len()
+        ));
+    }
+    for (i, url) in images.iter().enumerate() {
+        let data = url.starts_with("data:image/") && url.contains(";base64,");
+        let remote = url.starts_with("https://") || url.starts_with("http://");
+        if !data && !remote {
+            return Err(format!(
+                "image {i}: expected a `data:image/...;base64,` URL or an http(s) URL"
+            ));
+        }
+    }
+    let bytes: usize = images.iter().map(String::len).sum();
+    if bytes > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "images are too large: {bytes} bytes (maximum {MAX_IMAGE_BYTES})"
+        ));
+    }
+    if bytes.saturating_mul(questions) > MAX_FANOUT_IMAGE_BYTES {
+        return Err(format!(
+            "images are sent once per question: {questions} questions × {bytes} bytes of \
+             images is over {MAX_FANOUT_IMAGE_BYTES} bytes; ask fewer questions per \
+             request or send smaller images"
+        ));
     }
     Ok(())
 }
@@ -356,6 +409,82 @@ mod tests {
             });
             assert!(validate(&parse(body)).unwrap_err().contains("levels"));
         }
+    }
+
+    #[test]
+    fn images_default_to_none_and_accept_data_and_http_urls() {
+        let req = parse(valid_request());
+        assert!(req.images.is_empty());
+
+        let mut body = valid_request();
+        body["images"] = serde_json::json!([
+            "data:image/png;base64,iVBORw0KGgo=",
+            "https://example.com/photo.jpg"
+        ]);
+        let req = parse(body);
+        assert_eq!(req.images.len(), 2);
+        assert!(validate(&req).is_ok());
+    }
+
+    #[test]
+    fn state_may_be_left_out_only_when_images_are_given() {
+        let mut body = valid_request();
+        body.as_object_mut().unwrap().remove("state");
+        assert!(validate(&parse(body.clone()))
+            .unwrap_err()
+            .contains("state"));
+        body["images"] = serde_json::json!(["https://example.com/photo.jpg"]);
+        let req = parse(body);
+        assert!(req.state.is_null());
+        assert!(validate(&req).is_ok());
+    }
+
+    #[test]
+    fn image_count_shape_and_size_limits_are_enforced() {
+        let mut body = valid_request();
+        body["images"] = serde_json::json!(vec!["https://example.com/x.png"; MAX_IMAGES + 1]);
+        assert!(validate(&parse(body))
+            .unwrap_err()
+            .contains("too many images"));
+
+        for bad in [
+            "file:///etc/passwd",
+            "photo.jpg",
+            "data:text/plain;base64,aGk=",
+            "data:image/png,raw",
+        ] {
+            let mut body = valid_request();
+            body["images"] = serde_json::json!([bad]);
+            assert!(
+                validate(&parse(body)).unwrap_err().contains("image 0"),
+                "{bad} should be refused"
+            );
+        }
+
+        let mut body = valid_request();
+        let big = format!("data:image/png;base64,{}", "A".repeat(MAX_IMAGE_BYTES));
+        body["images"] = serde_json::json!([big]);
+        assert!(validate(&parse(body)).unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    fn image_bytes_times_questions_is_bounded() {
+        // An ~18 MiB image fits the per-request cap. With the three questions
+        // of `valid_request` the fan-out is ~54 MiB (fits); a fourth question
+        // takes it to ~72 MiB, over the cap.
+        let image = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(MAX_IMAGE_BYTES * 9 / 10)
+        );
+        let mut body = valid_request();
+        body["images"] = serde_json::json!([image.clone()]);
+        assert!(validate(&parse(body)).is_ok());
+
+        let mut body = valid_request();
+        body["images"] = serde_json::json!([image]);
+        body["questions"]["fourth"] = serde_json::json!({"type": "boolean", "instructions": "?"});
+        let err = validate(&parse(body)).unwrap_err();
+        assert!(err.contains("once per question"), "{err}");
     }
 
     #[test]

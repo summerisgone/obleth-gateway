@@ -715,6 +715,10 @@ impl TooLong {
     }
 }
 
+/// Flat input-token estimate for one image part. Images aren't tokenized
+/// here, and their real cost depends on the model and the resolution.
+pub(crate) const IMAGE_PART_TOKEN_ESTIMATE: u64 = 1500;
+
 /// `estimate_request` counts message text only. That undercounts badly for a
 /// tool-heavy client: Claude Code's own `tools` array runs 10-20k tokens by
 /// itself, and an image part's few bytes of URL are nothing like its real
@@ -753,7 +757,7 @@ fn messages_input_estimate(chat_body: &serde_json::Value, text_estimate: u64) ->
     // know ahead of the upstream. Large enough that a handful of images still
     // pushes the clamp, small enough not to starve `max_tokens` on a single
     // screenshot.
-    text_estimate + tools_tokens + image_count * 1500
+    text_estimate + tools_tokens + image_count * IMAGE_PART_TOKEN_ESTIMATE
 }
 
 /// Clamp a client-requested `max_tokens` to what the resolved model's context
