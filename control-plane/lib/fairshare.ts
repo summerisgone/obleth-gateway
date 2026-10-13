@@ -3,18 +3,32 @@ import type { FairshareLiveView, TenantFairshareView } from "@/lib/obleth";
 // Canonical starvation predicate shared by the overview and fairshare pages so
 // both agree on which tenants count as waiting below their fair share.
 export interface FairshareTenantSlots {
+  tenant_id: string;
   queued: number;
   in_flight: number;
   expected_slots: number;
 }
 
+/** Whether a tenant's row in one pool holds at least a whole slot more than its fair share. */
+export function isAboveShare(t: FairshareTenantSlots): boolean {
+  return t.in_flight - t.expected_slots >= 1;
+}
+
 /**
  * Whether a tenant's row in one pool is waiting below its fair share: it has
- * requests queued while it holds fewer slots than its share of that pool.
+ * requests queued while it holds fewer slots than its share of that pool, and
+ * another tenant in the same pool holds more than its own. Admission never
+ * takes a slot back, so a tenant only waits short of its share while someone
+ * else is borrowing. Without a borrower the wait is the pool or a cap being
+ * full, which counts gathered from several gateways can blur by a slot or two.
  * Only meaningful inside one pool; see {@link belowShareInPools}.
  */
-export function isWaitingBelowShare(t: FairshareTenantSlots): boolean {
-  return t.queued > 0 && t.in_flight < Math.floor(t.expected_slots);
+export function isWaitingBelowShare(t: FairshareTenantSlots, poolTenants: readonly FairshareTenantSlots[]): boolean {
+  return (
+    t.queued > 0 &&
+    t.in_flight < Math.floor(t.expected_slots) &&
+    poolTenants.some((o) => o.tenant_id !== t.tenant_id && isAboveShare(o))
+  );
 }
 
 /**
@@ -45,8 +59,8 @@ export interface BelowShare {
  */
 export function belowShareInPools(view: FairshareLiveView | undefined): BelowShare[] {
   if (!view) return [];
-  if (!view.pools) return view.tenants.filter(isWaitingBelowShare).map((tenant) => ({ model: null, tenant }));
-  return view.pools.flatMap((p) => p.tenants.filter(isWaitingBelowShare).map((tenant) => ({ model: p.model, tenant })));
+  if (!view.pools) return view.tenants.filter((t) => isWaitingBelowShare(t, view.tenants)).map((tenant) => ({ model: null, tenant }));
+  return view.pools.flatMap((p) => p.tenants.filter((t) => isWaitingBelowShare(t, p.tenants)).map((tenant) => ({ model: p.model, tenant })));
 }
 
 /** Tenants waiting below their fair share in at least one pool. */
@@ -56,7 +70,6 @@ export function tenantsBelowShare(view: FairshareLiveView | undefined): Set<stri
 
 /** Tenants holding at least one slot above their fair share in some pool. */
 export function tenantsAboveShare(view: FairshareLiveView | undefined): Set<string> {
-  const above = (t: TenantFairshareView) => t.in_flight - t.expected_slots >= 1;
   const rows = view?.pools ? view.pools.flatMap((p) => p.tenants) : view?.tenants ?? [];
-  return new Set(rows.filter(above).map((t) => t.tenant_id));
+  return new Set(rows.filter(isAboveShare).map((t) => t.tenant_id));
 }

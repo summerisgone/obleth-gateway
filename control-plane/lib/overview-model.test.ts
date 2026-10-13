@@ -100,10 +100,12 @@ describe("buildAttention", () => {
       [],
     );
     const short = { tenant_id: "t1", name: "cs-teaching", fairshare_group: "", weight: 1, in_flight: 1, queued: 2, served_tokens: 0, share_score: 0, weight_share: 0, expected_slots: 3.6 };
+    // Another tenant holds the slots cs-teaching is short of.
+    const borrower = { ...short, tenant_id: "t2", name: "ops", in_flight: 3, queued: 0, expected_slots: 0.4 };
     const { items, watching } = buildAttention(fleet, fairshare({
       global_queued: 2,
-      tenants: [short],
-      pools: [{ model: "kimi", cap: 4, in_flight: 4, queued: 2, borrowed: 0, groups: [], tenants: [short], keys: [] }],
+      tenants: [short, borrower],
+      pools: [{ model: "kimi", cap: 4, in_flight: 4, queued: 2, borrowed: 0, groups: [], tenants: [short, borrower], keys: [] }],
     }));
     expect(items.map((i) => i.key)).toEqual(["down:flux", "full:kimi", "share:kimi:t1"]);
     expect(items[0]).toMatchObject({ badge: "Down", urgent: true });
@@ -154,7 +156,7 @@ describe("buildAttention", () => {
       tenants: [row({ in_flight: 11, queued: 4, expected_slots: 10 })],
       pools: [
         { model: "a", cap: 10, in_flight: 10, queued: 0, borrowed: 0, groups: [], keys: [], tenants: [row({ in_flight: 10, queued: 0, expected_slots: 5 })] },
-        { model: "b", cap: 10, in_flight: 10, queued: 4, borrowed: 0, groups: [], keys: [], tenants: [row({ in_flight: 1, queued: 4, expected_slots: 5 })] },
+        { model: "b", cap: 10, in_flight: 10, queued: 4, borrowed: 0, groups: [], keys: [], tenants: [row({ in_flight: 1, queued: 4, expected_slots: 5 }), { ...row({ in_flight: 9, queued: 0, expected_slots: 5 }), tenant_id: "u", name: "other" }] },
       ],
     });
     const { items } = buildAttention([], view);

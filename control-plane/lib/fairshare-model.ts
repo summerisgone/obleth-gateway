@@ -7,7 +7,7 @@ import type {
   ModelRoute,
   TenantFairshareView,
 } from "@/lib/obleth";
-import { isWaitingBelowShare } from "@/lib/fairshare";
+import { isAboveShare, isWaitingBelowShare } from "@/lib/fairshare";
 import { formatNumber } from "@/lib/utils";
 import { isBenchmarkRoute, poolOccupancy } from "@/lib/overview-model";
 
@@ -286,7 +286,7 @@ export function poolTenantRows(tenants: TenantFairshareView[]): PoolTenantRow[] 
   const line = nextInLine(tenants);
   const place = new Map(line.map((t, i) => [t.tenant_id, i + 1]));
   const standingOf = (t: TenantFairshareView): Standing =>
-    isWaitingBelowShare(t) ? "next" : t.queued > 0 ? "waiting" : t.in_flight - t.expected_slots >= 1 ? "above" : "within";
+    isWaitingBelowShare(t, tenants) ? "next" : t.queued > 0 ? "waiting" : isAboveShare(t) ? "above" : "within";
   const order: Record<Standing, number> = { next: 0, waiting: 1, above: 2, within: 3 };
   return tenants
     .filter((t) => t.in_flight > 0 || t.queued > 0)

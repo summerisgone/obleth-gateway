@@ -191,7 +191,7 @@ impl Default for SharedSlotsConfig {
             op_timeout: Duration::from_secs(1),
             max_pending_per_pool: 8,
             split_on_fallback: true,
-            view_interval: Duration::from_secs(2),
+            view_interval: Duration::from_millis(500),
         }
     }
 }

@@ -213,15 +213,16 @@ describe("gateway modes", () => {
   it("marks a tenant below share when it is short in one pool, though over its share in another", async () => {
     const plenty = tenant("lab", { in_flight: 10, queued: 0, expected_slots: 5 });
     const short = tenant("lab", { in_flight: 1, queued: 4, expected_slots: 5 });
+    const borrower = tenant("ops", { in_flight: 9, queued: 0, expected_slots: 5 });
     mocks.routes = [route("a", 10), route("b", 10)];
     mocks.view = {
-      ...mocks.view!, global_in_flight: 11, global_queued: 4,
-      tenants: [tenant("lab", { in_flight: 11, queued: 4, expected_slots: 10 })], keys: [],
+      ...mocks.view!, global_in_flight: 20, global_queued: 4,
+      tenants: [tenant("lab", { in_flight: 11, queued: 4, expected_slots: 10 }), borrower], keys: [],
       pools: [
         { model: "a", cap: 10, in_flight: 10, queued: 0, borrowed: 0, groups: [], keys: [], tenants: [plenty] },
-        { model: "b", cap: 10, in_flight: 1, queued: 4, borrowed: 0, groups: [], keys: [], tenants: [short] },
+        { model: "b", cap: 10, in_flight: 10, queued: 4, borrowed: 0, groups: [], keys: [], tenants: [short, borrower] },
       ],
-      model_in_flight: { a: 10, b: 1 }, model_queued: { b: 4 },
+      model_in_flight: { a: 10, b: 10 }, model_queued: { b: 4 },
     };
     await render();
     expect(host.textContent).toContain("1 tenant is waiting below their fair share");

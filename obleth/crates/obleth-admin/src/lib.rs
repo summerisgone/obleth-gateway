@@ -933,7 +933,7 @@ pub struct FairshareLiveView {
     /// shares computed from them):
     ///
     /// - `cluster`: every live replica. In `shared` mode each replica
-    ///   publishes its scheduler state every couple of seconds and the
+    ///   publishes its scheduler state about twice a second and the
     ///   answering replica merges its own current state with the others'
     ///   (see `replicas_reporting` and `state_age_ms`).
     /// - `replica`: the answering replica alone. Always so outside `shared`

@@ -16,10 +16,30 @@ const view = (pools: ModelPoolView[], extra: Partial<FairshareLiveView> = {}): F
 });
 
 describe("isWaitingBelowShare", () => {
+  const borrower = { tenant_id: "b", queued: 0, in_flight: 7, expected_slots: 5 };
+  const row = (o: { queued: number; in_flight: number; expected_slots: number }) => ({ tenant_id: "t", ...o });
+
   it("needs a queue and fewer slots than the whole slots of its share", () => {
-    expect(isWaitingBelowShare({ queued: 2, in_flight: 1, expected_slots: 3.6 })).toBe(true);
-    expect(isWaitingBelowShare({ queued: 2, in_flight: 3, expected_slots: 3.6 })).toBe(false);
-    expect(isWaitingBelowShare({ queued: 0, in_flight: 0, expected_slots: 3.6 })).toBe(false);
+    const short = row({ queued: 2, in_flight: 1, expected_slots: 3.6 });
+    expect(isWaitingBelowShare(short, [short, borrower])).toBe(true);
+    const atShare = row({ queued: 2, in_flight: 3, expected_slots: 3.6 });
+    expect(isWaitingBelowShare(atShare, [atShare, borrower])).toBe(false);
+    const idle = row({ queued: 0, in_flight: 0, expected_slots: 3.6 });
+    expect(isWaitingBelowShare(idle, [idle, borrower])).toBe(false);
+  });
+
+  it("needs another tenant in the pool holding more than its share", () => {
+    const short = row({ queued: 2, in_flight: 1, expected_slots: 3.6 });
+    expect(isWaitingBelowShare(short, [short])).toBe(false);
+    const fair = { tenant_id: "f", queued: 1, in_flight: 2, expected_slots: 2.4 };
+    expect(isWaitingBelowShare(short, [short, fair])).toBe(false);
+  });
+
+  it("does not flag a lone tenant whose cluster counts read a few slots short of a full pool", () => {
+    // Counts gathered from several gateways can lag by a moment, so a tenant
+    // holding every slot can read 250 of 256 while it waits.
+    const lone = row({ queued: 500, in_flight: 250, expected_slots: 256 });
+    expect(isWaitingBelowShare(lone, [lone])).toBe(false);
   });
 });
 
@@ -43,7 +63,7 @@ describe("below share, judged per pool", () => {
   });
 
   it("falls back to the aggregated tenants for a view with no per-pool detail", () => {
-    const v = view([], { pools: undefined, tenants: [tenant("t", { in_flight: 1, queued: 2, expected_slots: 3.6 })] });
+    const v = view([], { pools: undefined, tenants: [tenant("t", { in_flight: 1, queued: 2, expected_slots: 3.6 }), tenant("b", { in_flight: 6, expected_slots: 3.6 })] });
     expect(belowShareInPools(v)).toEqual([{ model: null, tenant: v.tenants[0] }]);
   });
 

@@ -176,7 +176,7 @@ function StatusLine({ view, raw, pool, inPool, loading, poolCount }: { view?: Fa
   if (loading || !view || !raw) return <p className="text-[13.5px] text-muted-foreground">Loading scheduler…</p>;
   // Inside a pool its own rows say who is short; across pools a tenant
   // counts once if it is short in any of them.
-  const below = inPool ? view.tenants.filter(isWaitingBelowShare).length : tenantsBelowShare(raw).size;
+  const below = inPool ? view.tenants.filter((t) => isWaitingBelowShare(t, view.tenants)).length : tenantsBelowShare(raw).size;
   const queued = inPool ? pool?.queued ?? view.global_queued : view.global_queued;
   const running = inPool ? pool?.inFlight ?? view.global_in_flight : raw.mode === "shared" ? raw.cluster_in_flight ?? raw.global_in_flight : raw.global_in_flight;
   const gateways = raw.replicas ?? 1;
