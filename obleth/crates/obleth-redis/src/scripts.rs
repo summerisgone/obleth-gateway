@@ -334,6 +334,11 @@ return { tokens, cost }
 // Releases, reconciles and reclaims publish the freed pool's id on the
 // release channel, but only while a wait marker for that pool (or the global
 // ceiling) is current, so an uncontended fleet publishes nothing.
+//
+// Separately, each replica keeps its scheduler view for dashboards in a
+// string key of its own (`obleth:fairshare:view:<instance>`), rewritten every
+// couple of seconds with a short TTL. Only the admission scripts above decide
+// anything; the views are read by `PEER_VIEWS` and never by them.
 // ---------------------------------------------------------------------------
 
 /// Lua helpers shared by the slot scripts: the Redis clock in ms, a counter
@@ -420,16 +425,51 @@ return redis.call('ZCARD', key)
 );
 
 /// Deregister a replica on clean shutdown: drop it from the replica set and
-/// free anything its holdings still record (normally nothing, once drained).
+/// its scheduler view, and free anything its holdings still record (normally
+/// nothing, once drained).
 ///
-/// KEYS[1] = replica set, KEYS[2] = slot totals hash, KEYS[3] = its holdings
+/// KEYS[1] = replica set, KEYS[2] = slot totals hash, KEYS[3] = its holdings,
+/// KEYS[4] = its view
 /// ARGV[1] = instance id, ARGV[2] = release channel
 pub const REPLICA_DEREGISTER: &str = concat!(
     slot_helpers!(),
     r#"
 reclaim(KEYS[2], KEYS[3], ARGV[2], now_ms())
 redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('DEL', KEYS[4])
 return 1
+"#
+);
+
+/// The scheduler views of every other live replica, for the cluster-wide
+/// dashboard view, in one round trip.
+///
+/// KEYS[1] = replica set
+/// ARGV[1] = view key prefix (the instance id is appended)
+/// ARGV[2] = the calling replica's id, left out
+///
+/// Live is the heartbeat's rule: expiry, on the Redis clock, still ahead.
+/// The view keys are derived from the member names inside the script, as the
+/// heartbeat derives the holdings keys. Read only.
+///
+/// Returns `{live, {instance, view, ms left}, ...}`: how many replicas are
+/// live, then each other live replica that has a view, with the view and the
+/// time it has left to live.
+pub const PEER_VIEWS: &str = concat!(
+    slot_helpers!(),
+    r#"
+local live = redis.call('ZRANGEBYSCORE', KEYS[1], now_ms() + 1, '+inf')
+local out = { #live }
+for _, instance in ipairs(live) do
+  if instance ~= ARGV[2] then
+    local key = ARGV[1] .. instance
+    local view = redis.call('GET', key)
+    if view then
+      table.insert(out, { instance, view, redis.call('PTTL', key) })
+    end
+  end
+end
+return out
 "#
 );
 

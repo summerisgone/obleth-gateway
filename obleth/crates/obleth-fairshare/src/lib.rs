@@ -31,7 +31,9 @@
 //!   configured values itself, with no backend call on the request path.
 //!
 //! Weights are ratios and are never divided, and fairness (which waiter goes
-//! next) is always decided per replica. A resize never touches in-flight
+//! next) is always decided per replica. [`FairShare::snapshot`] is this
+//! replica's own state; in shared mode [`FairShare::cluster_snapshot`] merges
+//! every live replica's (see [`view`]). A resize never touches in-flight
 //! requests: shrinking just stops admitting until occupancy falls under the
 //! new size, growing dispatches waiters straight away.
 //!
@@ -54,8 +56,11 @@ mod capacity;
 pub mod history;
 mod replicas;
 pub mod shared;
+pub mod view;
 
-pub use algorithm::{group_slot_caps, weighted_caps};
+pub use algorithm::{
+    group_slot_caps, pool_shares, weighted_caps, PoolShares, ShareKey, ShareTenant,
+};
 pub use capacity::{CapacityProvider, StaticCapacity};
 pub use history::{
     FairshareHistory, FairshareSample, GroupSample, HistoryPoint, PoolSample,
@@ -66,6 +71,10 @@ pub use shared::{
     AcquireOutcome, ClusterCounts, InMemoryCluster, InMemorySlots, PoolHoldings, ReconcileOutcome,
     SharedSlots, SharedSlotsConfig, SlotClaim, SlotDenial, SlotError, SlotFuture, SlotMode,
     SlotRelease,
+};
+pub use view::{
+    merge_views, ClusterSnapshot, PeerView, PeerViews, ReplicaGroupView, ReplicaKeyView,
+    ReplicaPoolView, ReplicaTenantView, ReplicaView,
 };
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -431,6 +440,9 @@ enum Ctl {
     Sample {
         respond: oneshot::Sender<FairshareSample>,
     },
+    View {
+        respond: oneshot::Sender<LocalView>,
+    },
     SetReplicas(usize),
     SetModelCaps(HashMap<String, usize>),
     EnableShared {
@@ -451,6 +463,20 @@ enum Ctl {
     ReconcileDone {
         result: Result<ReconcileOutcome, SlotError>,
     },
+    ViewPublished {
+        result: Result<(), SlotError>,
+    },
+}
+
+/// This replica's view, with what a merge needs to know about it.
+struct LocalView {
+    view: ReplicaView,
+    /// Every pool this replica has, idle ones included: (model, configured
+    /// size).
+    pools: Vec<(String, usize)>,
+    algorithm: FairshareAlgorithm,
+    /// The configured global ceiling.
+    ceiling: usize,
 }
 
 /// Handle to the fairshare scheduler. Cheap to clone.
@@ -577,6 +603,57 @@ impl FairShare {
             Ok(Ok(totals)) => Some(totals),
             _ => None,
         }
+    }
+
+    /// Shared mode: this replica's scheduler state merged with the state
+    /// every other live replica last published, so queues, tenants, groups
+    /// and keys are counted across the fleet (see [`view`]). Each pool's
+    /// `cap` is its configured size and its `cluster_in_flight` is `None`
+    /// (read the slot counts with [`FairShare::cluster_in_flight`]).
+    ///
+    /// Fails when shared slots are not enabled or the backend does not
+    /// answer within a second; a caller then has only
+    /// [`FairShare::snapshot`], this replica's own.
+    pub async fn cluster_snapshot(&self) -> Result<ClusterSnapshot, SlotError> {
+        let backend = self
+            .shared
+            .get()
+            .cloned()
+            .ok_or_else(|| SlotError("shared slots are not enabled".into()))?;
+        let (respond, rx) = oneshot::channel();
+        let gone = || SlotError("the fairshare scheduler is not running".into());
+        self.ctl.send(Ctl::View { respond }).map_err(|_| gone())?;
+        let local = rx.await.map_err(|_| gone())?;
+        let peers = bounded(Duration::from_secs(1), backend.peer_views()).await?;
+        let mut views: Vec<&ReplicaView> = vec![&local.view];
+        views.extend(peers.views.iter().map(|p| &p.view));
+        let reporting = views.len();
+        let mut pools = merge_views(local.algorithm, &views, local.ceiling);
+        // Pools idle everywhere are in no view; keep this replica's, so the
+        // pools it knows of are listed whichever way the view was built.
+        for (model, cap) in local.pools {
+            if !pools.iter().any(|p| p.model == model) {
+                pools.push(ModelPoolFairshare {
+                    model,
+                    cap,
+                    configured_cap: cap,
+                    in_flight: 0,
+                    cluster_in_flight: None,
+                    queued: 0,
+                    borrowed: 0,
+                    groups: Vec::new(),
+                    tenants: Vec::new(),
+                    keys: Vec::new(),
+                });
+            }
+        }
+        pools.sort_by(|a, b| a.model.cmp(&b.model));
+        Ok(ClusterSnapshot {
+            pools,
+            replicas_live: peers.live.max(reporting),
+            replicas_reporting: reporting,
+            max_age_ms: peers.views.iter().map(|p| p.age_ms).max().unwrap_or(0),
+        })
     }
 
     /// Replace the per-model pool-size overrides: each named model's pool is
@@ -1540,6 +1617,141 @@ impl Pool {
         groups
     }
 
+    /// The share split of this pool (see [`pool_shares`]), over `ids` (every
+    /// tenant with state) and `key_ids`.
+    fn shares(&self, ids: &HashSet<Uuid>, key_ids: &HashSet<Uuid>) -> PoolShares {
+        let default_group = "default".to_string();
+        let tenants: Vec<ShareTenant<'_>> = ids
+            .iter()
+            .map(|id| ShareTenant {
+                id: *id,
+                group: self.tenant_group.get(id).unwrap_or(&default_group),
+                weight: self.tenant_weight.get(id).copied().unwrap_or(1),
+                active: self.tenant_is_active(id),
+            })
+            .collect();
+        let keys: Vec<ShareKey> = key_ids
+            .iter()
+            .filter_map(|id| {
+                let (in_flight, queued) = self.key_state(id);
+                Some(ShareKey {
+                    id: *id,
+                    tenant: self.key_tenant.get(id).copied()?,
+                    weight: self.key_weight.get(id).copied().unwrap_or(1),
+                    active: in_flight > 0 || queued > 0,
+                })
+            })
+            .collect();
+        pool_shares(self.algorithm, &self.group_weight, &tenants, &keys)
+    }
+
+    /// A key's in-flight and queued requests here.
+    fn key_state(&self, key: &Uuid) -> (usize, usize) {
+        let queued = self
+            .key_tenant
+            .get(key)
+            .and_then(|t| self.queues.get(t))
+            .map(|q| q.key_len(key))
+            .unwrap_or(0);
+        (self.key_in_flight.get(key).copied().unwrap_or(0), queued)
+    }
+
+    /// This pool in a [`ReplicaView`]: its totals, and the groups, tenants
+    /// and keys with a request running or waiting, the busiest first within
+    /// the pool's bounds and what is left of `budget`.
+    fn view(&self, budget: &mut view::ViewBudget) -> ReplicaPoolView {
+        let active: HashSet<Uuid> = self
+            .tenant_in_flight
+            .keys()
+            .chain(self.queues.keys())
+            .filter(|t| self.tenant_is_active(t))
+            .copied()
+            .collect();
+        let mut tenants: Vec<ReplicaTenantView> = active
+            .iter()
+            .map(|id| {
+                let served = self.served.get(id).copied().unwrap_or(0.0);
+                let base = self.served_base.get(id).copied().unwrap_or(0.0);
+                ReplicaTenantView {
+                    id: *id,
+                    group: self
+                        .tenant_group
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| "default".into()),
+                    weight: self.tenant_weight.get(id).copied().unwrap_or(1).max(1),
+                    cap: self.tenant_cap.get(id).copied(),
+                    in_flight: self.tenant_in_flight.get(id).copied().unwrap_or(0),
+                    queued: self.queues.get(id).map(|q| q.len).unwrap_or(0),
+                    served: (served - base).max(0.0),
+                }
+            })
+            .collect();
+        let limit = view::VIEW_MAX_TENANTS_PER_POOL.min(budget.tenants);
+        let omitted_tenants =
+            view::keep_busiest(&mut tenants, limit, |t| (t.in_flight + t.queued, t.id));
+        budget.tenants -= tenants.len();
+
+        let active_keys: HashSet<Uuid> = self
+            .key_in_flight
+            .keys()
+            .copied()
+            .chain(self.queues.values().flat_map(|q| q.keys.keys().copied()))
+            .collect();
+        let mut keys: Vec<ReplicaKeyView> = active_keys
+            .iter()
+            .filter_map(|id| {
+                let (in_flight, queued) = self.key_state(id);
+                if in_flight == 0 && queued == 0 {
+                    return None;
+                }
+                Some(ReplicaKeyView {
+                    id: *id,
+                    tenant: self.key_tenant.get(id).copied()?,
+                    weight: self.key_weight.get(id).copied().unwrap_or(1).max(1),
+                    cap: self.key_cap.get(id).copied(),
+                    in_flight,
+                    queued,
+                    served: self.key_served.get(id).copied().unwrap_or(0.0),
+                    end_user: self.key_end_user.get(id).cloned(),
+                })
+            })
+            .collect();
+        let limit = view::VIEW_MAX_KEYS_PER_POOL.min(budget.keys);
+        let omitted_keys = view::keep_busiest(&mut keys, limit, |k| (k.in_flight + k.queued, k.id));
+        budget.keys -= keys.len();
+
+        let service = self.group_service();
+        let groups = self
+            .group_totals()
+            .into_iter()
+            .map(|g| ReplicaGroupView {
+                weight: self
+                    .group_weight
+                    .get(&g.name)
+                    .copied()
+                    .unwrap_or(100)
+                    .max(1),
+                served: service.get(g.name.as_str()).copied().unwrap_or(0.0),
+                name: g.name,
+                in_flight: g.in_flight,
+                queued: g.queued,
+            })
+            .collect();
+
+        ReplicaPoolView {
+            pool: self.key.slot_id(),
+            configured_cap: self.configured_cap,
+            in_flight: self.in_flight,
+            queued: self.queued_total,
+            groups,
+            tenants,
+            keys,
+            omitted_tenants,
+            omitted_keys,
+        }
+    }
+
     /// `headroom` is the global ceiling's free slots, so group caps and
     /// borrowing are reported against the capacity actually enforced.
     fn snapshot(&self, headroom: usize) -> ModelPoolFairshare {
@@ -1550,12 +1762,19 @@ impl Pool {
             .chain(self.tenant_in_flight.keys().copied())
             .chain(self.served.keys().copied())
             .collect();
-        let active = self.active_groups();
+        // Keys: every key with state.
+        let key_ids: HashSet<Uuid> = self
+            .key_tenant
+            .keys()
+            .copied()
+            .chain(self.key_in_flight.keys().copied())
+            .chain(self.queues.values().flat_map(|q| q.keys.keys().copied()))
+            .collect();
+        let shares = self.shares(&ids, &key_ids);
         let group_caps = self.compute_group_caps(self.effective_cap(headroom));
         let group_service = self.group_service();
-        let total_group_weight: i64 = active.iter().map(|(_, w)| (*w).max(1)).sum();
 
-        let mut names: HashSet<String> = active.iter().map(|(n, _)| n.clone()).collect();
+        let mut names: HashSet<String> = shares.groups.keys().cloned().collect();
         for tenant in &ids {
             if let Some(g) = self.tenant_group.get(tenant) {
                 names.insert(g.clone());
@@ -1581,15 +1800,10 @@ impl Pool {
                 let (in_flight, queued) =
                     group_totals.get(name.as_str()).copied().unwrap_or((0, 0));
                 let served_tokens = group_service.get(name.as_str()).copied().unwrap_or(0.0);
-                let weight_share =
-                    if total_group_weight > 0 && active.iter().any(|(n, _)| n == &name) {
-                        weight as f64 / total_group_weight as f64
-                    } else {
-                        0.0
-                    };
                 let slot_cap = group_caps.get(&name).copied().unwrap_or(0);
                 GroupFairshare {
-                    name: name.clone(),
+                    weight_share: shares.group(&name),
+                    name,
                     weight,
                     in_flight,
                     queued,
@@ -1597,31 +1811,10 @@ impl Pool {
                     borrowed: in_flight.saturating_sub(slot_cap),
                     served_tokens,
                     share_score: served_tokens / weight as f64,
-                    weight_share,
                 }
             })
             .collect();
         groups.sort_by(|a, b| a.name.cmp(&b.name));
-        let group_weight_share: HashMap<String, f64> = groups
-            .iter()
-            .map(|g| (g.name.clone(), g.weight_share))
-            .collect();
-
-        let total_weight: i64 = ids
-            .iter()
-            .map(|id| self.tenant_weight.get(id).copied().unwrap_or(1).max(1))
-            .sum();
-        let group_weight_sum: HashMap<String, i64> =
-            ids.iter().fold(HashMap::new(), |mut acc, id| {
-                let g = self
-                    .tenant_group
-                    .get(id)
-                    .cloned()
-                    .unwrap_or_else(|| "default".into());
-                let w = self.tenant_weight.get(id).copied().unwrap_or(1).max(1);
-                *acc.entry(g).or_insert(0) += w;
-                acc
-            });
 
         let mut tenants: Vec<TenantFairshare> = ids
             .iter()
@@ -1638,26 +1831,6 @@ impl Pool {
                     .cloned()
                     .unwrap_or_else(|| "default".into());
                 let served_tokens = self.served.get(&tenant_id).copied().unwrap_or(0.0);
-                let weight_share = match self.algorithm {
-                    FairshareAlgorithm::Weighted => {
-                        if total_weight > 0 {
-                            weight as f64 / total_weight as f64
-                        } else {
-                            0.0
-                        }
-                    }
-                    FairshareAlgorithm::Hierarchical => {
-                        let group_w = group_weight_sum
-                            .get(&fairshare_group)
-                            .copied()
-                            .unwrap_or(weight)
-                            .max(1);
-                        group_weight_share
-                            .get(&fairshare_group)
-                            .map(|share| share * (weight as f64 / group_w as f64))
-                            .unwrap_or(0.0)
-                    }
-                };
                 TenantFairshare {
                     tenant_id,
                     fairshare_group,
@@ -1667,7 +1840,7 @@ impl Pool {
                     queued: self.queues.get(&tenant_id).map(|q| q.len).unwrap_or(0),
                     served_tokens,
                     share_score: served_tokens / weight as f64,
-                    weight_share,
+                    weight_share: shares.tenant(&tenant_id),
                 }
             })
             .collect();
@@ -1676,52 +1849,14 @@ impl Pool {
                 .partial_cmp(&b.share_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let tenant_weight_share: HashMap<Uuid, f64> = tenants
-            .iter()
-            .map(|t| (t.tenant_id, t.weight_share))
-            .collect();
 
-        // Keys: every key with state, entitled to a slice of its tenant's share
-        // in proportion to key weight among the tenant's *active* keys.
-        let key_ids: HashSet<Uuid> = self
-            .key_tenant
-            .keys()
-            .copied()
-            .chain(self.key_in_flight.keys().copied())
-            .chain(self.queues.values().flat_map(|q| q.keys.keys().copied()))
-            .collect();
-        let key_state = |k: &Uuid| -> (usize, usize) {
-            let tenant = self.key_tenant.get(k).copied();
-            let queued = tenant
-                .and_then(|t| self.queues.get(&t))
-                .map(|q| q.key_len(k))
-                .unwrap_or(0);
-            (self.key_in_flight.get(k).copied().unwrap_or(0), queued)
-        };
-        let mut active_key_weight_by_tenant: HashMap<Uuid, i64> = HashMap::new();
-        for k in &key_ids {
-            let (inf, q) = key_state(k);
-            if inf > 0 || q > 0 {
-                if let Some(t) = self.key_tenant.get(k) {
-                    *active_key_weight_by_tenant.entry(*t).or_insert(0) +=
-                        self.key_weight.get(k).copied().unwrap_or(1).max(1);
-                }
-            }
-        }
         let mut keys: Vec<KeyFairshare> = key_ids
             .iter()
             .filter_map(|&key_id| {
                 let tenant_id = self.key_tenant.get(&key_id).copied()?;
                 let weight = self.key_weight.get(&key_id).copied().unwrap_or(1).max(1);
-                let (in_flight, queued) = key_state(&key_id);
+                let (in_flight, queued) = self.key_state(&key_id);
                 let served_tokens = self.key_served.get(&key_id).copied().unwrap_or(0.0);
-                let tenant_share = tenant_weight_share.get(&tenant_id).copied().unwrap_or(0.0);
-                let weight_share = match active_key_weight_by_tenant.get(&tenant_id) {
-                    Some(total) if *total > 0 && (in_flight > 0 || queued > 0) => {
-                        tenant_share * weight as f64 / *total as f64
-                    }
-                    _ => 0.0,
-                };
                 Some(KeyFairshare {
                     key_id,
                     tenant_id,
@@ -1731,7 +1866,7 @@ impl Pool {
                     queued,
                     served_tokens,
                     share_score: served_tokens / weight as f64,
-                    weight_share,
+                    weight_share: shares.key(&key_id),
                     end_user: self.key_end_user.get(&key_id).cloned(),
                 })
             })
@@ -1783,6 +1918,13 @@ struct SharedCtl {
     retry_at: Option<Instant>,
     next_reconcile: Instant,
     cluster_in_flight: Option<usize>,
+    /// When this replica next publishes its view, while more than one
+    /// replica is live.
+    next_view: Instant,
+    /// A view publish is outstanding.
+    publishing_view: bool,
+    /// The last view publish failed; logged once until one works.
+    view_failing: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1988,6 +2130,18 @@ impl Scheduler {
             Ctl::Sample { respond } => {
                 let _ = respond.send(self.build_sample());
             }
+            Ctl::View { respond } => {
+                let _ = respond.send(LocalView {
+                    view: self.build_view(),
+                    pools: self
+                        .pools
+                        .values()
+                        .map(|p| (p.model.clone(), p.configured_cap))
+                        .collect(),
+                    algorithm: self.algorithm,
+                    ceiling: self.capacity.max_in_flight(),
+                });
+            }
             Ctl::SetReplicas(replicas) => {
                 if replicas == self.replicas {
                     return;
@@ -2049,6 +2203,9 @@ impl Scheduler {
                     retry_at: None,
                     next_reconcile: Instant::now(),
                     cluster_in_flight: None,
+                    next_view: Instant::now(),
+                    publishing_view: false,
+                    view_failing: false,
                 });
                 self.apply_mode();
                 self.maybe_start_reconcile();
@@ -2085,6 +2242,7 @@ impl Scheduler {
                 self.reconcile_done(result);
                 self.publish_stats();
             }
+            Ctl::ViewPublished { result } => self.view_published(result),
         }
     }
 
@@ -2121,19 +2279,18 @@ impl Scheduler {
         }
     }
 
-    /// When the shared-slot timer next needs to run: a refused pool's retry
-    /// or the next reconcile.
+    /// When the shared-slot timer next needs to run: a refused pool's retry,
+    /// the next reconcile or the next view publish.
     fn shared_deadline(&self) -> Option<Instant> {
         let s = self.shared.as_ref()?;
         let reconcile = (s.reconciling.is_none() && !s.want_reconcile).then_some(s.next_reconcile);
-        match (s.retry_at, reconcile) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let view = (self.replicas > 1 && !s.publishing_view).then_some(s.next_view);
+        [s.retry_at, reconcile, view].into_iter().flatten().min()
     }
 
     fn shared_timer(&mut self) {
         let now = Instant::now();
+        let multi = self.replicas > 1;
         let Some(s) = self.shared.as_mut() else {
             return;
         };
@@ -2146,13 +2303,59 @@ impl Scheduler {
             s.want_reconcile = true;
             s.next_reconcile = now + s.config.reconcile_interval;
         }
+        let view_due = multi && !s.publishing_view && s.next_view <= now;
         if retry {
             // Correctness never depends on a wakeup arriving: retry anyway.
             self.unblock_all();
         }
         self.maybe_start_reconcile();
         self.dispatch_all();
+        if view_due {
+            self.publish_view();
+        }
         self.publish_stats();
+    }
+
+    /// Publish this replica's view for the cluster-wide dashboard. Off the
+    /// request path: it never holds up admission, and a failure only leaves
+    /// this replica out of the cluster view until the next one works.
+    fn publish_view(&mut self) {
+        let view = self.build_view();
+        let Some(s) = self.shared.as_mut() else {
+            return;
+        };
+        s.publishing_view = true;
+        s.next_view = Instant::now() + s.config.view_interval;
+        let fut = s.backend.publish_view(view, s.config.view_ttl());
+        let timeout = s.config.op_timeout;
+        let tx = self.ctl_tx.clone();
+        tokio::spawn(async move {
+            let result = bounded(timeout, fut).await;
+            let _ = tx.send(Ctl::ViewPublished { result });
+        });
+    }
+
+    fn view_published(&mut self, result: Result<(), SlotError>) {
+        let Some(s) = self.shared.as_mut() else {
+            return;
+        };
+        s.publishing_view = false;
+        match result {
+            Ok(()) if s.view_failing => {
+                s.view_failing = false;
+                tracing::info!("fairshare cluster view published again");
+            }
+            Ok(()) => {}
+            Err(e) if !s.view_failing => {
+                s.view_failing = true;
+                tracing::warn!(
+                    error = %e,
+                    "could not publish this replica's fairshare state; dashboards leave it out \
+                     of the cluster-wide view until a publish works"
+                );
+            }
+            Err(_) => {}
+        }
     }
 
     /// Arm the jittered retry for refused pools, if it is not armed yet.
@@ -2672,6 +2875,23 @@ impl Scheduler {
             ts_ms,
             global_in_flight: self.in_flight,
             global_queued: self.queued_total,
+            pools,
+        }
+    }
+
+    /// This replica's [`ReplicaView`]: every pool with a request running or
+    /// waiting, in pool order.
+    fn build_view(&self) -> ReplicaView {
+        let mut budget = view::ViewBudget::default();
+        let pools = self
+            .pool_order
+            .iter()
+            .filter_map(|key| self.pools.get(key))
+            .filter(|pool| !pool.is_idle())
+            .map(|pool| pool.view(&mut budget))
+            .collect();
+        ReplicaView {
+            version: view::VIEW_VERSION,
             pools,
         }
     }
