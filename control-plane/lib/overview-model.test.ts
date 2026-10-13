@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AuditEntry, FairshareLiveView, ModelHealthSummary, ModelRoute, UsageModelAgg } from "@/lib/obleth";
+import type { AuditEntry, FairshareLiveView, ModelHealthSummary, ModelRoute, TenantFairshareView, UsageModelAgg } from "@/lib/obleth";
 import { EMPTY_OVERVIEW_SUMMARY } from "@/lib/overview-summary";
 import { buildAttention, buildFleet, buildSeries, changeLabel, describeAudit, previousTotals } from "./overview-model";
 
@@ -99,16 +99,20 @@ describe("buildAttention", () => {
       fairshare({ model_in_flight: { kimi: 4 }, model_queued: { kimi: 2 }, global_queued: 2 }),
       [],
     );
+    const short = { tenant_id: "t1", name: "cs-teaching", fairshare_group: "", weight: 1, in_flight: 1, queued: 2, served_tokens: 0, share_score: 0, weight_share: 0, expected_slots: 3.6 };
     const { items, watching } = buildAttention(fleet, fairshare({
       global_queued: 2,
-      tenants: [{ tenant_id: "t1", name: "cs-teaching", fairshare_group: "", weight: 1, in_flight: 1, queued: 2, served_tokens: 0, share_score: 0, weight_share: 0, expected_slots: 3.6 }],
+      tenants: [short],
+      pools: [{ model: "kimi", cap: 4, in_flight: 4, queued: 2, borrowed: 0, groups: [], tenants: [short], keys: [] }],
     }));
-    expect(items.map((i) => i.key)).toEqual(["down:flux", "full:kimi", "share:t1"]);
+    expect(items.map((i) => i.key)).toEqual(["down:flux", "full:kimi", "share:kimi:t1"]);
     expect(items[0]).toMatchObject({ badge: "Down", urgent: true });
     expect(items[0].detail).toContain("5 failed checks in a row");
     expect(items[0].detail).toContain("HTTP 503");
     expect(items[1].detail).toBe("4 of 4 slots in use · 2 queued");
-    expect(items[2].detail).toContain("against an expected 3");
+    expect(items[2]).toMatchObject({ badge: "Below share", title: "cs-teaching is waiting below its fair share on kimi" });
+    expect(items[2].detail).toBe("2 requests queued while it holds 1 slot against a fair share of 3");
+    expect(items[2].actions).toEqual([{ label: "Open the pool", href: "/fairshare?pool=kimi", primary: true }]);
     expect(watching[0]).toBe("new has no health data yet");
     expect(watching[1]).toMatch(/^maint is in maintenance until /);
   });
@@ -116,6 +120,45 @@ describe("buildAttention", () => {
   it("reports a queue with no full pool on its own", () => {
     const { items } = buildAttention([], fairshare({ global_queued: 3, tenants: [] }));
     expect(items).toEqual([expect.objectContaining({ key: "queued", title: "3 requests waiting for admission" })]);
+  });
+
+  it("says a queue is one gateway's when the view could not count the others", () => {
+    const { items } = buildAttention([], fairshare({ global_queued: 3, tenants: [], mode: "shared", replicas: 3, scope: "replica" }));
+    expect(items[0].title).toBe("3 requests waiting for admission on this gateway");
+    const cluster = buildAttention([], fairshare({ global_queued: 3, tenants: [], mode: "shared", replicas: 3, scope: "cluster" }));
+    expect(cluster.items[0].title).toBe("3 requests waiting for admission");
+  });
+
+  // The case behind the cluster-wide view: one tenant held all 256 slots
+  // of a pool across three gateways with 767 requests queued, and the
+  // Overview said it was "waiting below its fair share" because it compared
+  // one gateway's 92 slots with the whole pool's 256.
+  it("reads a single tenant holding a whole full pool as full, not below share", () => {
+    const acme = { tenant_id: "b", name: "acme", fairshare_group: "default", weight: 100, in_flight: 256, queued: 767, served_tokens: 0, share_score: 0, weight_share: 1, expected_slots: 256 };
+    const view = fairshare({
+      mode: "shared", scope: "cluster", replicas: 3, replicas_reporting: 3,
+      global_in_flight: 256, global_queued: 767, replica_in_flight: 92, replica_queued: 245,
+      tenants: [acme],
+      pools: [{ model: "chat-large", cap: 256, configured_cap: 256, in_flight: 256, cluster_in_flight: 256, queued: 767, replica_in_flight: 92, replica_queued: 245, borrowed: 0, groups: [], tenants: [acme], keys: [] }],
+    });
+    const fleet = buildFleet([model("chat-large", { max_in_flight: 256 })], [health("chat-large", "healthy")], view, []);
+    const { items } = buildAttention(fleet, view);
+    expect(items.map((i) => i.key)).toEqual(["full:chat-large"]);
+    expect(items[0].detail).toBe("256 of 256 slots in use · 767 queued");
+  });
+
+  it("names each pool a tenant is short in, even when it is over its share in another", () => {
+    const row = (o: Pick<TenantFairshareView, "in_flight" | "queued" | "expected_slots">): TenantFairshareView => ({ tenant_id: "t", name: "lab", fairshare_group: "default", weight: 100, served_tokens: 0, share_score: 0, weight_share: 0.5, ...o });
+    const view = fairshare({
+      global_queued: 4,
+      tenants: [row({ in_flight: 11, queued: 4, expected_slots: 10 })],
+      pools: [
+        { model: "a", cap: 10, in_flight: 10, queued: 0, borrowed: 0, groups: [], keys: [], tenants: [row({ in_flight: 10, queued: 0, expected_slots: 5 })] },
+        { model: "b", cap: 10, in_flight: 10, queued: 4, borrowed: 0, groups: [], keys: [], tenants: [row({ in_flight: 1, queued: 4, expected_slots: 5 })] },
+      ],
+    });
+    const { items } = buildAttention([], view);
+    expect(items.filter((i) => i.badge === "Below share").map((i) => i.title)).toEqual(["lab is waiting below its fair share on b"]);
   });
 
   it("is empty on a quiet day", () => {

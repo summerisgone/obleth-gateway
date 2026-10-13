@@ -74,12 +74,16 @@ export function slotModeBadge(view: FairshareLiveView): string {
 /** One line saying whose numbers the page shows and how the limits hold across gateways. */
 export function limitsNote(view: FairshareLiveView): string {
   const n = Math.max(view.replicas ?? 1, 1);
-  const here = `this gateway ${formatNumber(view.global_in_flight)}`;
+  const here = `this gateway ${formatNumber(view.replica_in_flight ?? view.global_in_flight)}`;
   switch (view.mode) {
     case "shared": {
       const configured = view.configured_max_in_flight ?? view.max_in_flight;
       const cluster = view.cluster_in_flight == null ? "—" : formatNumber(view.cluster_in_flight);
-      return `In flight ${cluster} of ${formatNumber(configured)} (cluster-wide, ${formatNumber(n)} gateways) · ${here}. Any gateway can use a model's whole pool; pool sizes, tenant and key caps and the ceiling hold across all of them. Queues and fairness below are this gateway's.`;
+      const reporting = view.replicas_reporting ?? n;
+      const counts = view.scope === "cluster"
+        ? `Waiting, tenants and fair shares below count every gateway${reporting < n ? ` that has reported so far (${formatNumber(reporting)} of ${formatNumber(n)})` : ""}; each gateway still picks who goes next from its own queue.`
+        : "Waiting, tenants and fair shares below are this gateway's own: the other gateways' queues could not be read.";
+      return `In flight ${cluster} of ${formatNumber(configured)} (cluster-wide, ${formatNumber(n)} gateways) · ${here}. Any gateway can use a model's whole pool; pool sizes, tenant and key caps and the ceiling hold across all of them. ${counts}`;
     }
     case "fallback":
       return view.replica_aware === false
@@ -218,7 +222,7 @@ export interface PoolRow {
   inFlight: number;
   cap: number;
   queued: number;
-  /** Tenants with work running or waiting in the pool, per the answering gateway's snapshot. */
+  /** Tenants with work running or waiting in the pool, in the view's scope. */
   tenants: number;
   state: PoolState;
 }
@@ -230,9 +234,9 @@ export function poolState(inFlight: number, cap: number, queued: number): PoolSt
 }
 
 /**
- * Every enabled model's pool, fullest first. Occupancy comes from the
- * snapshot's pool where the answering gateway has one, else capacity
- * discovery, else the configured size — the same reading as the Overview.
+ * Every enabled model's pool, fullest first. Occupancy comes from the view's
+ * pool where it has one, else capacity discovery, else the configured size —
+ * the same reading as the Overview.
  */
 export function buildPoolRows(models: ModelRoute[], view: FairshareLiveView | undefined, discovery?: CapacityDiscoveryView): PoolRow[] {
   const byName = new Map((view?.pools ?? []).map((p) => [p.model, p]));
