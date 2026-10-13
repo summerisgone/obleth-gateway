@@ -56,7 +56,10 @@ export interface GatewayImagesBody {
 
 export interface GatewayVerdictsBody {
   model: string;
-  state: unknown;
+  /** Optional when `images` are sent. */
+  state?: unknown;
+  /** `data:image/...` URLs evaluated together with the state. */
+  images?: string[];
   questions: Record<string, unknown>;
   [k: string]: unknown;
 }

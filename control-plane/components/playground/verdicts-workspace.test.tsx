@@ -10,9 +10,22 @@ let host: HTMLDivElement;
 let bodies: unknown[];
 
 const models = [
-  { id: "1", model_name: "glm-5-3", model_type: "chat", enabled: true },
-  { id: "2", model_name: "sdxl", model_type: "image", enabled: true },
+  { id: "1", model_name: "glm-5-3", model_type: "chat", enabled: true, supports_vision: false },
+  { id: "2", model_name: "sdxl", model_type: "image", enabled: true, supports_vision: false },
+  { id: "3", model_name: "gemma-4", model_type: "chat", enabled: true, supports_vision: true },
 ] as unknown as ModelRoute[];
+
+/** Attach files through the hidden picker and wait for FileReader. */
+async function attach(...files: File[]) {
+  const input = host.querySelector<HTMLInputElement>("input[type='file']")!;
+  Object.defineProperty(input, "files", { value: files, configurable: true });
+  await act(async () => {
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 20));
+  });
+}
+
+const png = () => new File([new Uint8Array([137, 80, 78, 71])], "photo.png", { type: "image/png" });
 
 function session(patch: Partial<PlaygroundSession> = {}): PlaygroundSession {
   return {
@@ -158,6 +171,34 @@ describe("VerdictsWorkspace", () => {
     expect(host.querySelector<HTMLButtonElement>("[aria-label='Run verdicts']")!.disabled).toBe(true);
     render(session({ verdictQuestions: [{ id: "q1", type: "boolean", instructions: "" }] }));
     expect(host.querySelector<HTMLButtonElement>("[aria-label='Run verdicts']")!.disabled).toBe(true);
+  });
+
+  it("sends attached images, and leaves out an empty state", async () => {
+    render(session({ verdictState: "", verdictModel: "gemma-4" }));
+    expect(host.querySelector<HTMLButtonElement>("[aria-label='Run verdicts']")!.disabled).toBe(true);
+    await attach(png());
+    expect(host.querySelectorAll("img[alt^='Image ']")).toHaveLength(1);
+    await clickRun();
+    const body = bodies[0] as { state?: unknown; images?: string[] };
+    expect(body.state).toBeUndefined();
+    expect(body.images).toHaveLength(1);
+    expect(body.images![0]).toMatch(/^data:image\/png;base64,/);
+  });
+
+  it("refuses non-images and blocks a model without vision once images are attached", async () => {
+    render(session({ verdictModel: "glm-5-3" }));
+    await attach(new File(["x"], "notes.txt", { type: "text/plain" }));
+    expect(host.querySelector("[role='alert']")?.textContent).toContain("up to 6 MB");
+    expect(host.querySelectorAll("img[alt^='Image ']")).toHaveLength(0);
+
+    await attach(png());
+    expect(host.textContent).toContain("glm-5-3 can't see images");
+    expect(host.querySelector<HTMLButtonElement>("[aria-label='Run verdicts']")!.disabled).toBe(true);
+
+    await act(async () => {
+      host.querySelector<HTMLButtonElement>("[aria-label='Remove image 1']")!.click();
+    });
+    expect(host.querySelector<HTMLButtonElement>("[aria-label='Run verdicts']")!.disabled).toBe(false);
   });
 
   it("offers only chat models plus auto in the model picker", () => {

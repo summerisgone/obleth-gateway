@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { Copy, Loader2, Plus, Trash2 } from "lucide-react";
+import { useRef, useState } from "react";
+import { Copy, ImagePlus, Loader2, Plus, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -82,6 +82,10 @@ export function parseState(raw: string): unknown {
   }
   return raw;
 }
+
+/** The gateway takes up to 8 images; each file is held to the chat composer's 6 MB. */
+const MAX_IMAGES = 8;
+const MAX_IMAGE_FILE_BYTES = 6 * 1024 * 1024;
 
 const TYPE_LABELS: Record<QuestionDraft["type"], string> = { boolean: "Yes / No", choice: "Choice", score: "Score" };
 
@@ -240,9 +244,9 @@ function PaneHeader({ step, title, children }: { step: number; title: React.Reac
 }
 
 /**
- * The Verdicts mode of the Playground: paste a state (text or JSON), define
- * typed questions, and get typed verdicts with probability distributions and
- * confidence — the gateway's /v1/verdicts endpoint driven as the reserved
+ * The Verdicts mode of the Playground: paste a state (text or JSON) and/or add
+ * images, define typed questions, and get typed verdicts with probability
+ * distributions and confidence — the gateway's /v1/verdicts endpoint driven as the reserved
  * internal tenant via /api/live/playground/verdicts. Laid out left to right in
  * the order the work happens: state, questions, results.
  */
@@ -260,10 +264,38 @@ export function VerdictsWorkspace({ session, update, models, loading }: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<RunResult | null>(null);
+  // Not saved with the session: base64 images would fill localStorage, as in
+  // the Image mode.
+  const [images, setImages] = useState<string[]>([]);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  const filePicker = useRef<HTMLInputElement>(null);
+
+  const attachFiles = (files: FileList | null | undefined) => {
+    setAttachError(null);
+    for (const file of Array.from(files ?? [])) {
+      if (!file.type.startsWith("image/") || file.size > MAX_IMAGE_FILE_BYTES) {
+        setAttachError("Choose images up to 6 MB each.");
+        continue;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const url = reader.result;
+        if (typeof url === "string") setImages((prev) => (prev.length >= MAX_IMAGES ? prev : [...prev, url]));
+      };
+      reader.onerror = () => setAttachError("Could not read this image.");
+      reader.readAsDataURL(file);
+    }
+  };
+
+  // Verdicts sends images to the model itself (the vision boon does not
+  // apply), so with images only models with vision are offered.
+  const pickable = images.length > 0 ? chatModels.filter((m) => m.supports_vision) : chatModels;
+  const blind = images.length > 0 && model !== "auto" && !pickable.some((m) => m.model_name === model);
 
   const canRun =
     !busy &&
-    stateText.trim().length > 0 &&
+    (stateText.trim().length > 0 || images.length > 0) &&
+    !blind &&
     questions.length > 0 &&
     questions.every((q) => q.instructions.trim().length > 0);
 
@@ -277,7 +309,9 @@ export function VerdictsWorkspace({ session, update, models, loading }: {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model,
-          state: parseState(stateText),
+          // With images, the state is optional.
+          ...(stateText.trim() || images.length === 0 ? { state: parseState(stateText) } : {}),
+          ...(images.length > 0 ? { images } : {}),
           questions: buildQuestions(questions),
         }),
       });
@@ -305,14 +339,36 @@ export function VerdictsWorkspace({ session, update, models, loading }: {
       className="flex h-full min-h-0 flex-col overflow-y-auto lg:flex-row lg:overflow-hidden"
       onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); void run(); } }}
     >
-      <section aria-label="State" className="flex min-h-[20rem] flex-col border-b border-border lg:w-[340px] lg:shrink-0 lg:border-b-0 lg:border-r">
+      <section aria-label="State" className="flex min-h-[20rem] flex-col border-b border-border lg:w-[340px] lg:shrink-0 lg:border-b-0 lg:border-r"
+        onDragOver={(e) => { if (e.dataTransfer.types.includes("Files")) e.preventDefault(); }}
+        onDrop={(e) => { if (e.dataTransfer.files.length) { e.preventDefault(); attachFiles(e.dataTransfer.files); } }}>
         <PaneHeader step={1} title="State to judge" />
         <div className="flex min-h-0 flex-1 flex-col gap-2 p-4">
           <textarea aria-label="State" value={stateText} maxLength={100_000}
-            placeholder={'My card was charged twice for order A-104.\n\n…or paste JSON: {"ticket": {...}, "order": {...}}'}
+            placeholder={'My card was charged twice for order A-104.\n\n…or paste JSON: {"ticket": {...}, "order": {...}}\n\n…or add photos below.'}
             className={cn(fieldCls, "min-h-48 flex-1 resize-none p-3 font-mono text-xs leading-relaxed")}
             onChange={(e) => update({ verdictState: e.target.value })} />
           <div className="flex justify-between text-[11.5px] text-muted-foreground"><span>{stateKind}</span><span className="font-mono">{stateText.length.toLocaleString()} chars</span></div>
+          <div className="flex flex-wrap items-center gap-2">
+            {images.map((src, i) => (
+              <div key={i} className="relative">
+                <img src={src} alt={`Image ${i + 1}`} className="h-14 w-14 rounded-md border border-border object-cover" />
+                <button type="button" title="Remove image" aria-label={`Remove image ${i + 1}`}
+                  className="absolute -right-1.5 -top-1.5 rounded-full border border-border bg-background p-0.5 text-muted-foreground hover:text-foreground"
+                  onClick={() => setImages(images.filter((_, j) => j !== i))}>
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            ))}
+            {images.length < MAX_IMAGES && (
+              <Button variant="outline" size="sm" aria-label="Add images" onClick={() => filePicker.current?.click()}>
+                <ImagePlus className="h-3.5 w-3.5" />Image
+              </Button>
+            )}
+            <input ref={filePicker} type="file" accept="image/*" multiple className="hidden" aria-hidden="true" tabIndex={-1}
+              onChange={(e) => { attachFiles(e.target.files); e.target.value = ""; }} />
+          </div>
+          {attachError && <p role="alert" className="text-xs text-destructive">{attachError}</p>}
         </div>
       </section>
 
@@ -339,10 +395,12 @@ export function VerdictsWorkspace({ session, update, models, loading }: {
             onValueChange={(value) => update({ verdictModel: value })}
             options={[
               { value: "auto", label: "auto (router picks)" },
-              ...chatModels.map((m) => ({ value: m.model_name, label: m.model_name })),
+              ...pickable.map((m) => ({ value: m.model_name, label: m.model_name })),
             ]} />
           {loading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" aria-label="Loading models" />}
-          <span className="ml-auto hidden text-xs text-muted-foreground sm:inline">Ctrl + Enter</span>
+          {blind
+            ? <span className="ml-auto text-xs text-muted-foreground">{model} can't see images. Pick a model with vision, or auto.</span>
+            : <span className="ml-auto hidden text-xs text-muted-foreground sm:inline">Ctrl + Enter</span>}
           <Button disabled={!canRun} onClick={() => void run()} aria-label="Run verdicts">
             {busy && <Loader2 className="h-4 w-4 animate-spin" />}
             Run verdicts
