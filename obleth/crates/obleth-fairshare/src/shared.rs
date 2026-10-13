@@ -20,16 +20,23 @@
 //! whichever replica acquires it first; releases wake the others promptly
 //! (see [`crate::FairShare::wake`]) and a short jittered retry covers a lost
 //! wakeup.
+//!
+//! The backend also carries each replica's [`ReplicaView`], a compact copy
+//! of its scheduler state published every [`SharedSlotsConfig::view_interval`]
+//! while more than one replica is live, so dashboards can show the queues and
+//! shares of the whole fleet (see [`crate::view`]). That is off the request
+//! path and never affects admission.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
+use crate::view::{PeerView, PeerViews, ReplicaView};
 use crate::FairShare;
 
 /// A boxed, sendable future returned by [`SharedSlots`] operations.
@@ -130,6 +137,13 @@ pub trait SharedSlots: Send + Sync + 'static {
     fn reconcile(&self, holdings: Vec<PoolHoldings>) -> SlotFuture<ReconcileOutcome>;
     /// Cluster-wide occupancy: every pool together, then each of `pools`.
     fn totals(&self, pools: Vec<String>) -> SlotFuture<(usize, Vec<usize>)>;
+    /// Record `view` as this replica's scheduler state, replacing the last
+    /// one; it expires after `ttl` unless published again.
+    fn publish_view(&self, view: ReplicaView, ttl: Duration) -> SlotFuture<()>;
+    /// The views every other live replica last published, and how many
+    /// replicas are live. A replica that is no longer live is left out even
+    /// while its view has not expired.
+    fn peer_views(&self) -> SlotFuture<PeerViews>;
 }
 
 /// Tuning for shared slots. [`Default`] is what the gateway runs with, apart
@@ -154,6 +168,17 @@ pub struct SharedSlotsConfig {
     /// In fallback mode, divide the limits across the live replicas (the
     /// split); otherwise each replica enforces them in full.
     pub split_on_fallback: bool,
+    /// How often this replica publishes its [`ReplicaView`] while more than
+    /// one replica is live. Each view lives for [`Self::view_ttl`].
+    pub view_interval: Duration,
+}
+
+impl SharedSlotsConfig {
+    /// How long a published view lives: three intervals, the heartbeat's
+    /// own ratio, so one slow publish does not drop a replica from the view.
+    pub fn view_ttl(&self) -> Duration {
+        self.view_interval.max(Duration::from_millis(100)) * 3
+    }
 }
 
 impl Default for SharedSlotsConfig {
@@ -166,6 +191,7 @@ impl Default for SharedSlotsConfig {
             op_timeout: Duration::from_secs(1),
             max_pending_per_pool: 8,
             split_on_fallback: true,
+            view_interval: Duration::from_secs(2),
         }
     }
 }
@@ -237,11 +263,19 @@ fn key_field(pool: &str, key: &Uuid) -> String {
 }
 const GLOBAL_FIELD: &str = "g";
 
+/// A published view, with when it was published and how long it lives.
+struct MemView {
+    view: ReplicaView,
+    at: Instant,
+    ttl: Duration,
+}
+
 #[derive(Default)]
 struct MemState {
     totals: HashMap<String, usize>,
     held: HashMap<String, HashMap<String, usize>>,
     live: HashSet<String>,
+    views: HashMap<String, MemView>,
     subscribers: Vec<FairShare>,
     failing: bool,
 }
@@ -289,6 +323,7 @@ pub struct SlotCalls {
     pub acquire: AtomicUsize,
     pub release: AtomicUsize,
     pub reconcile: AtomicUsize,
+    pub publish_view: AtomicUsize,
 }
 
 /// An in-process cluster of [`InMemorySlots`] handles with the same
@@ -381,6 +416,28 @@ impl InMemoryCluster {
 
     pub fn calls(&self) -> &SlotCalls {
         &self.calls
+    }
+
+    /// The view `instance` last published, if it has not expired.
+    pub fn view(&self, instance: &str) -> Option<ReplicaView> {
+        let s = self.state.lock().unwrap();
+        s.views
+            .get(instance)
+            .filter(|v| v.at.elapsed() < v.ttl)
+            .map(|v| v.view.clone())
+    }
+
+    /// Record a view for `instance` as if it had published it, e.g. for a
+    /// replica that is not running a scheduler in the test.
+    pub fn put_view(&self, instance: &str, view: ReplicaView, ttl: Duration) {
+        self.state.lock().unwrap().views.insert(
+            instance.to_string(),
+            MemView {
+                view,
+                at: Instant::now(),
+                ttl,
+            },
+        );
     }
 }
 
@@ -513,5 +570,44 @@ impl SharedSlots for InMemorySlots {
         let global = s.count(GLOBAL_FIELD);
         let per = pools.iter().map(|p| s.count(&pool_field(p))).collect();
         Box::pin(async move { Ok((global, per)) })
+    }
+
+    fn publish_view(&self, view: ReplicaView, ttl: Duration) -> SlotFuture<()> {
+        self.cluster
+            .calls
+            .publish_view
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(f) = self.fail() {
+            return f;
+        }
+        self.cluster.put_view(&self.instance, view, ttl);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn peer_views(&self) -> SlotFuture<PeerViews> {
+        if let Some(f) = self.fail() {
+            return f;
+        }
+        let s = self.cluster.state.lock().unwrap();
+        let mut views: Vec<PeerView> = s
+            .live
+            .iter()
+            .filter(|instance| **instance != self.instance)
+            .filter_map(|instance| {
+                let v = s.views.get(instance)?;
+                let age = v.at.elapsed();
+                (age < v.ttl).then(|| PeerView {
+                    instance: instance.clone(),
+                    view: v.view.clone(),
+                    age_ms: age.as_millis() as u64,
+                })
+            })
+            .collect();
+        views.sort_by(|a, b| a.instance.cmp(&b.instance));
+        let peers = PeerViews {
+            live: s.live.len(),
+            views,
+        };
+        Box::pin(async move { Ok(peers) })
     }
 }

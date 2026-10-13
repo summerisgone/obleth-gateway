@@ -9,13 +9,20 @@ import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { Dialog, DialogClose, DialogDescription, DialogOverlay, DialogPortal, DialogTitle } from "@/components/ui/dialog";
 import { setTenantMaxInFlightAction, setWeightAction } from "@/app/actions";
 import type { FairshareLiveView, KeyFairshareView, TenantFairshareView } from "@/lib/obleth";
-import { isWaitingBelowShare } from "@/lib/fairshare";
+import { belowShareInPools } from "@/lib/fairshare";
 import { keyRowLabel, previewTenantWeight, tenantKeys, tenantPools } from "@/lib/fairshare-model";
 import { Pill, SectionLabel, Sparkline } from "@/components/overview/ui";
 import { cn } from "@/lib/utils";
 import type { TenantSeriesRow } from "./hooks";
 
 const slots = (n: number) => (n >= 10 ? Math.round(n) : Math.round(n * 10) / 10).toLocaleString();
+
+/** "Below share on chat-large", or "Below share in 3 pools". */
+export function belowShareLabel(models: (string | null)[]): string {
+  const named = models.filter((m): m is string => !!m);
+  if (named.length === 0) return "Below share";
+  return named.length === 1 ? `Below share on ${named[0]}` : `Below share in ${named.length} pools`;
+}
 
 /**
  * One tenant's fairshare: its weight (with what a change would do in every
@@ -59,6 +66,8 @@ function Body({ tenant, view, keys, series }: { tenant: TenantFairshareView; vie
   const changed = validWeight && weight !== tenant.weight;
   const preview = useMemo(() => (validWeight ? previewTenantWeight(view, tenant.tenant_id, weight) : []), [view, tenant.tenant_id, weight, validWeight]);
   const pools = tenantPools(view, tenant.tenant_id);
+  // Judged per pool: short in one pool can hide behind plenty in another.
+  const shortIn = belowShareInPools(view).filter((b) => b.tenant.tenant_id === tenant.tenant_id).map((b) => b.model);
   const myKeys = tenantKeys(keys, tenant.tenant_id);
   const trend = useMemo(() => (series ?? []).filter((r) => r.tenant_id === tenant.tenant_id).sort((a, b) => a.bucket_ms - b.bucket_ms), [series, tenant.tenant_id]);
   const requests = trend.reduce((n, r) => n + Number(r.requests), 0);
@@ -97,7 +106,8 @@ function Body({ tenant, view, keys, series }: { tenant: TenantFairshareView; vie
           <DialogClose className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground" aria-label="Close"><X className="h-4 w-4" /></DialogClose>
         </div>
         <div className="flex flex-wrap gap-2">
-          {isWaitingBelowShare(tenant) ? <Pill inverted>{tenant.queued.toLocaleString()} waiting below share</Pill> : tenant.queued > 0 ? <Pill>{tenant.queued.toLocaleString()} waiting</Pill> : null}
+          {tenant.queued > 0 && <Pill>{tenant.queued.toLocaleString()} waiting</Pill>}
+          {shortIn.length > 0 && <Pill inverted>{belowShareLabel(shortIn)}</Pill>}
           {!tenant.queued && <Pill>No queued requests</Pill>}
           <Pill>{tenant.in_flight.toLocaleString()} running</Pill>
           <Link href="/tenants" className="inline-flex h-[22px] items-center rounded-full border border-border px-2 text-[11.5px] font-medium hover:bg-accent">Open tenant ›</Link>

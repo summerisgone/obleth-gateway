@@ -109,8 +109,19 @@ export interface LiveCapacity {
   queued: number;
   replicas: number;
   shared: boolean;
+  /** Queued, tenants and fair shares are the answering gateway's alone, one of several. */
+  queuesHere: boolean;
   activeTenants: number;
   belowShare: number;
+}
+
+/** Whose numbers the Right now panel shows, in a few words. */
+export function rightNowScope(capacity: LiveCapacity): string {
+  if (capacity.replicas <= 1) return "This gateway";
+  if (!capacity.shared) return `This gateway, one of ${capacity.replicas} gateways`;
+  return capacity.queuesHere
+    ? `Cluster-wide across ${capacity.replicas} gateways · waiting is this gateway's`
+    : `Cluster-wide across ${capacity.replicas} gateways`;
 }
 
 export function RightNow({ capacity, fleet, onOpen }: { capacity: LiveCapacity; fleet: FleetTile[]; onOpen: (name: string) => void }) {
@@ -119,7 +130,7 @@ export function RightNow({ capacity, fleet, onOpen }: { capacity: LiveCapacity; 
   return (
     <Panel
       title="Right now"
-      subtitle={capacity.replicas > 1 ? `${capacity.shared ? "Cluster-wide across" : "This gateway, one of"} ${capacity.replicas} gateways` : "This gateway"}
+      subtitle={rightNowScope(capacity)}
       action={<Pill><HealthGlyph state="healthy" className="h-1.5 w-1.5" />Live</Pill>}
     >
       <div className="flex flex-col gap-2.5 px-[18px] pt-4">

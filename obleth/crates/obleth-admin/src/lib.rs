@@ -47,7 +47,8 @@ use obleth_config::{
     TOOL_LOOP_MAX_DEADLINE_SECS, TOOL_LOOP_MAX_TURNS,
 };
 use obleth_fairshare::{
-    replica_share, FairShare, FairshareHistory, PoolKey, SlotMode, StaticCapacity, Stats,
+    replica_share, FairShare, FairshareHistory, ModelPoolFairshare, PoolKey, SlotMode,
+    StaticCapacity, Stats,
 };
 use obleth_redis::RedisStore;
 use obleth_store::{AuditEntry, Store};
@@ -774,6 +775,8 @@ pub struct OverviewSummaryView {
     pub co2_g: f64,
 }
 
+/// A fairshare group in one pool, or across pools in the aggregated lists.
+/// Counts are in the view's `scope` (see [`FairshareLiveView::scope`]).
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct GroupFairshareView {
     pub name: String,
@@ -790,6 +793,8 @@ pub struct GroupFairshareView {
     pub expected_slots: f64,
 }
 
+/// A tenant in one pool, or across pools in the aggregated lists. Counts are
+/// in the view's `scope` (see [`FairshareLiveView::scope`]).
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TenantFairshareView {
     #[schema(value_type = String)]
@@ -800,13 +805,25 @@ pub struct TenantFairshareView {
     pub max_in_flight: Option<usize>,
     pub in_flight: usize,
     pub queued: usize,
+    /// Service received. In `cluster` scope, summed over the replicas and
+    /// excluding the virtual time a tenant is placed at when it joins.
     pub served_tokens: f64,
+    /// `served_tokens` over weight: the lower, the sooner a freed slot goes
+    /// to the tenant. Each replica still orders its own queue.
     pub share_score: f64,
+    /// Share of the pool while every active tenant is busy (0 to 1), from
+    /// the tenants active in the view's scope; 0 for an idle tenant.
     pub weight_share: f64,
-    /// Steady-state slot share under sustained contention.
+    /// Steady-state slot share under sustained contention:
+    /// `weight_share × cap`. A tenant with `queued > 0` and `in_flight`
+    /// below `floor(expected_slots)` is waiting below its fair share; judge
+    /// that per pool, since a tenant can be above its share in one pool and
+    /// short in another.
     pub expected_slots: f64,
 }
 
+/// A key in one pool, or across pools in the aggregated lists. Counts are in
+/// the view's `scope` (see [`FairshareLiveView::scope`]).
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct KeyFairshareView {
     #[schema(value_type = String)]
@@ -841,17 +858,28 @@ pub struct ModelPoolView {
     /// return, but the capacity totals leave it out.
     pub no_servers: bool,
     /// Slots this replica enforces: `configured_cap` in `shared` and `local`
-    /// mode, its share of it in `split` and `fallback` mode.
+    /// mode, its share of it in `split` and `fallback` mode. Fair shares
+    /// (`expected_slots`) are taken from it.
     pub cap: usize,
     /// The pool size as configured: the cluster-wide size.
     pub configured_cap: usize,
-    /// This replica's in-flight requests in the pool.
+    /// In-flight requests in the pool, in the view's `scope`: every
+    /// replica's in `cluster` scope, the answering replica's in `replica`
+    /// scope.
     pub in_flight: usize,
-    /// In-flight requests in the pool across every replica, from the shared
-    /// slots. `null` outside `shared` mode.
+    /// In-flight requests in the pool across every replica, read from the
+    /// shared slot counts at the time of the request. `null` outside
+    /// `shared` mode.
     pub cluster_in_flight: Option<usize>,
+    /// Requests waiting for a slot in the pool, in the view's `scope`.
     pub queued: usize,
     pub borrowed: usize,
+    /// The answering replica's own in-flight requests in the pool, whatever
+    /// the scope.
+    pub replica_in_flight: usize,
+    /// The answering replica's own queued requests in the pool, whatever
+    /// the scope.
+    pub replica_queued: usize,
     pub groups: Vec<GroupFairshareView>,
     pub tenants: Vec<TenantFairshareView>,
     pub keys: Vec<KeyFairshareView>,
@@ -897,23 +925,53 @@ pub struct FairshareLiveView {
     /// Whether the split applies when shared slots are off or unavailable
     /// (`OBLETH_FAIRSHARE_REPLICA_AWARE`).
     pub replica_aware: bool,
-    /// In-flight requests across every replica, from the shared slots.
-    /// `null` outside `shared` mode. Every other count in this view is the
-    /// answering replica's own.
+    /// In-flight requests across every replica, read from the shared slot
+    /// counts at the time of the request. `null` outside `shared` mode.
     pub cluster_in_flight: Option<usize>,
+    /// Which replicas the counts in this view cover (in-flight, queued and
+    /// borrowed totals, every pool, group, tenant and key, and the fair
+    /// shares computed from them):
+    ///
+    /// - `cluster`: every live replica. In `shared` mode each replica
+    ///   publishes its scheduler state every couple of seconds and the
+    ///   answering replica merges its own current state with the others'
+    ///   (see `replicas_reporting` and `state_age_ms`).
+    /// - `replica`: the answering replica alone. Always so outside `shared`
+    ///   mode, and in `shared` mode when the other replicas' state could not
+    ///   be read (see `scope_reason`).
+    ///
+    /// `replica_in_flight` and `replica_queued`, here and on each pool, are
+    /// always the answering replica's own.
+    pub scope: String,
+    /// `cluster` scope: how many replicas' state the counts include. Fewer
+    /// than `replicas` while a replica has not published yet (it does so
+    /// within a couple of seconds of starting). `null` in `replica` scope.
+    pub replicas_reporting: Option<usize>,
+    /// `cluster` scope: age of the oldest replica state included, in ms.
+    /// `null` in `replica` scope.
+    pub state_age_ms: Option<u64>,
+    /// `shared` mode in `replica` scope: why the other replicas' state is
+    /// missing. `null` otherwise.
+    pub scope_reason: Option<String>,
+    /// In-flight requests in the view's `scope`.
     pub global_in_flight: usize,
+    /// Queued requests in the view's `scope`.
     pub global_queued: i64,
     /// Total occupancy above the apportioned group caps.
     pub global_borrowed: usize,
+    /// The answering replica's own in-flight requests, whatever the scope.
+    pub replica_in_flight: usize,
+    /// The answering replica's own queued requests, whatever the scope.
+    pub replica_queued: i64,
     /// Aggregated across pools (see `aggregate_pools`).
     pub groups: Vec<GroupFairshareView>,
     pub tenants: Vec<TenantFairshareView>,
     pub keys: Vec<KeyFairshareView>,
     pub pools: Vec<ModelPoolView>,
-    /// Live in-flight request count per model name.
+    /// In-flight request count per model name, in the view's `scope`.
     #[serde(default)]
     pub model_in_flight: std::collections::HashMap<String, usize>,
-    /// Live queued request count per model name.
+    /// Queued request count per model name, in the view's `scope`.
     #[serde(default)]
     pub model_queued: std::collections::HashMap<String, usize>,
 }
@@ -5822,6 +5880,181 @@ async fn get_capacity_services(
     }))
 }
 
+/// The health prober's load in a scheduler pool: (in flight, queued). The
+/// prober admits like real traffic under its own group, which the live view
+/// leaves out.
+fn health_load(p: &ModelPoolFairshare) -> (usize, usize) {
+    p.groups
+        .iter()
+        .find(|g| g.name == model_health::HEALTH_GROUP)
+        .map(|g| (g.in_flight, g.queued))
+        .unwrap_or((0, 0))
+}
+
+/// Names the live view resolves scheduler ids to, and what it needs to mark
+/// a pool as having no servers.
+pub(crate) struct LiveNames<'a> {
+    pub tenants: &'a std::collections::HashMap<Uuid, String>,
+    pub keys: &'a std::collections::HashMap<Uuid, String>,
+    /// Enabled models.
+    pub enabled: &'a std::collections::HashSet<&'a str>,
+    /// Enabled models with somewhere to send a request.
+    pub serving: &'a std::collections::HashSet<String>,
+}
+
+/// One pool of the live view: `p` is the scheduler's pool in the view's
+/// scope (merged across replicas in `cluster` scope), `local` the answering
+/// replica's own pool when it has one, `cluster_in_flight` the shared slot
+/// count. The health prober is left out of every level and every count.
+pub(crate) fn live_pool_view(
+    p: &ModelPoolFairshare,
+    local: Option<&ModelPoolFairshare>,
+    cluster_in_flight: Option<usize>,
+    names: &LiveNames<'_>,
+) -> ModelPoolView {
+    let cap = p.cap;
+    let (h_in, h_q) = health_load(p);
+    let (local_in, local_q) = local
+        .map(|l| {
+            let (h_in, h_q) = health_load(l);
+            (
+                l.in_flight.saturating_sub(h_in),
+                l.queued.saturating_sub(h_q),
+            )
+        })
+        .unwrap_or((0, 0));
+    let health_tenant = model_health::health_tenant_id();
+    ModelPoolView {
+        model: p.model.clone(),
+        no_servers: names.enabled.contains(p.model.as_str()) && !names.serving.contains(&p.model),
+        cap,
+        configured_cap: p.configured_cap,
+        in_flight: p.in_flight.saturating_sub(h_in),
+        // Cluster-wide slot counts include every replica's health probes,
+        // which are not told apart from traffic there. Without a fresh read,
+        // the count the replica last heard stands in.
+        cluster_in_flight: cluster_in_flight
+            .or(p.cluster_in_flight)
+            .or(local.and_then(|l| l.cluster_in_flight)),
+        queued: p.queued.saturating_sub(h_q),
+        borrowed: p.borrowed,
+        replica_in_flight: local_in,
+        replica_queued: local_q,
+        groups: p
+            .groups
+            .iter()
+            .filter(|g| g.name != model_health::HEALTH_GROUP)
+            .map(|g| GroupFairshareView {
+                name: g.name.clone(),
+                weight: g.weight,
+                in_flight: g.in_flight,
+                queued: g.queued,
+                slot_cap: g.slot_cap,
+                borrowed: g.borrowed,
+                served_tokens: g.served_tokens,
+                share_score: g.share_score,
+                weight_share: g.weight_share,
+                expected_slots: g.weight_share * cap as f64,
+            })
+            .collect(),
+        tenants: p
+            .tenants
+            .iter()
+            .filter(|t| {
+                t.tenant_id != health_tenant && t.fairshare_group != model_health::HEALTH_GROUP
+            })
+            .map(|t| TenantFairshareView {
+                tenant_id: t.tenant_id,
+                name: names
+                    .tenants
+                    .get(&t.tenant_id)
+                    .cloned()
+                    .unwrap_or_else(|| t.tenant_id.to_string()),
+                fairshare_group: t.fairshare_group.clone(),
+                weight: t.weight,
+                max_in_flight: t.max_in_flight,
+                in_flight: t.in_flight,
+                queued: t.queued,
+                served_tokens: t.served_tokens,
+                share_score: t.share_score,
+                weight_share: t.weight_share,
+                expected_slots: t.weight_share * cap as f64,
+            })
+            .collect(),
+        keys: p
+            .keys
+            .iter()
+            .filter(|k| k.tenant_id != health_tenant)
+            .map(|k| KeyFairshareView {
+                key_id: k.key_id,
+                tenant_id: k.tenant_id,
+                name: {
+                    let real = k.end_user.as_ref().map_or(k.key_id, |e| e.parent_key);
+                    names
+                        .keys
+                        .get(&real)
+                        .cloned()
+                        .unwrap_or_else(|| real.to_string())
+                },
+                weight: k.weight,
+                max_in_flight: k.max_in_flight,
+                in_flight: k.in_flight,
+                queued: k.queued,
+                served_tokens: k.served_tokens,
+                share_score: k.share_score,
+                weight_share: k.weight_share,
+                expected_slots: k.weight_share * cap as f64,
+                end_user: k.end_user.as_ref().map(|e| e.name.clone()),
+                parent_key_id: k.end_user.as_ref().map(|e| e.parent_key),
+            })
+            .collect(),
+    }
+}
+
+/// Which replicas the live view covers, and the pools to build it from.
+struct LiveScope {
+    scope: &'static str,
+    reason: Option<String>,
+    cluster: Option<obleth_fairshare::ClusterSnapshot>,
+}
+
+/// In `shared` mode, every live replica's scheduler state merged; when the
+/// shared backend cannot give it, or outside `shared` mode, the answering
+/// replica's own, with why when the cluster view was wanted.
+async fn live_scope(state: &AdminState, mode: SlotMode) -> LiveScope {
+    if mode != SlotMode::Shared {
+        return LiveScope {
+            scope: "replica",
+            reason: None,
+            cluster: None,
+        };
+    }
+    match state.fairshare.cluster_snapshot().await {
+        Ok(cluster) => LiveScope {
+            scope: "cluster",
+            reason: None,
+            cluster: Some(cluster),
+        },
+        Err(e) => LiveScope {
+            scope: "replica",
+            reason: Some(format!(
+                "the other replicas' scheduler state could not be read from the shared \
+                 backend ({e}); queues, tenants and fair shares are this replica's own"
+            )),
+            cluster: None,
+        },
+    }
+}
+
+/// Live fairshare state
+///
+/// Every model pool with its groups, tenants and keys, and the same
+/// aggregated across pools. In `shared` mode the counts cover every live
+/// gateway replica (`scope: cluster`); otherwise, or when the other
+/// replicas' state cannot be read, the answering replica's own
+/// (`scope: replica`, with `scope_reason` in `shared` mode).
+/// `replica_in_flight` and `replica_queued` are always the answering
+/// replica's.
 #[utoipa::path(
     get, path = "/api/v1/fairshare/live", tag = "fairshare",
     responses((status = 200, body = FairshareLiveView))
@@ -5832,11 +6065,16 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         .snapshot()
         .await
         .ok_or(AdminError::Internal("fairshare unavailable".into()))?;
+    let (mode, _, divisor) = enforcement(&state);
+    let scope = live_scope(&state, mode).await;
+    let source: &[ModelPoolFairshare] = match &scope.cluster {
+        Some(c) => &c.pools,
+        None => &snap.pools,
+    };
     let tenants = state.store.list_tenants().await?;
     let tenant_names: std::collections::HashMap<Uuid, String> =
         tenants.into_iter().map(|t| (t.id, t.name)).collect();
-    let key_ids: Vec<Uuid> = snap
-        .pools
+    let key_ids: Vec<Uuid> = source
         .iter()
         .flat_map(|p| {
             p.keys
@@ -5856,7 +6094,6 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
     let models = state.store.list_models().await?;
     let endpoints = state.store.all_model_endpoints().await?;
     let discovered = state.capacity_discovery.effective_caps();
-    let (mode, _, divisor) = enforcement(&state);
     let (counted, serving) = served_models(&state, models.clone(), &endpoints);
     let configured_capacity =
         enabled_pool_share_with(&counted, state.default_model_max_in_flight, 1, &discovered);
@@ -5871,8 +6108,7 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         .filter(|m| m.enabled)
         .map(|m| m.model_name.as_str())
         .collect();
-    let pool_keys: Vec<PoolKey> = snap
-        .pools
+    let pool_keys: Vec<PoolKey> = source
         .iter()
         .map(|p| {
             if p.model == obleth_fairshare::UNROUTED_POOL {
@@ -5897,106 +6133,66 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         .flat_map(|m| m.addressable_names())
         .collect();
 
-    let health_tenant = model_health::health_tenant_id();
-    let mut hidden_in_flight = 0usize;
-    let mut hidden_queued = 0usize;
-    let mut pools: Vec<ModelPoolView> = snap
+    let names = LiveNames {
+        tenants: &tenant_names,
+        keys: &key_names,
+        enabled: &enabled_names,
+        serving: &serving,
+    };
+    let (hidden_in_flight, hidden_queued) = source
+        .iter()
+        .map(health_load)
+        .fold((0, 0), |(a, b), (c, d)| (a + c, b + d));
+    let (local_hidden_in_flight, local_hidden_queued) = snap
         .pools
+        .iter()
+        .map(health_load)
+        .fold((0, 0), |(a, b), (c, d)| (a + c, b + d));
+    let mut pools: Vec<ModelPoolView> = source
         .iter()
         .zip(cluster_pools)
         .map(|(p, cluster_pool)| {
-            let cap = p.cap;
-            let hidden = p
-                .groups
-                .iter()
-                .find(|g| g.name == model_health::HEALTH_GROUP);
-            let h_in = hidden.map(|g| g.in_flight).unwrap_or(0);
-            let h_q = hidden.map(|g| g.queued).unwrap_or(0);
-            hidden_in_flight += h_in;
-            hidden_queued += h_q;
-            ModelPoolView {
-                model: p.model.clone(),
-                no_servers: enabled_names.contains(p.model.as_str()) && !serving.contains(&p.model),
-                cap,
-                configured_cap: p.configured_cap,
-                in_flight: p.in_flight.saturating_sub(h_in),
-                // Cluster-wide counts include every replica's health probes,
-                // which are not told apart from traffic there.
-                cluster_in_flight: cluster_pool.or(p.cluster_in_flight),
-                queued: p.queued.saturating_sub(h_q),
-                borrowed: p.borrowed,
-                groups: p
-                    .groups
-                    .iter()
-                    .filter(|g| g.name != model_health::HEALTH_GROUP)
-                    .map(|g| GroupFairshareView {
-                        name: g.name.clone(),
-                        weight: g.weight,
-                        in_flight: g.in_flight,
-                        queued: g.queued,
-                        slot_cap: g.slot_cap,
-                        borrowed: g.borrowed,
-                        served_tokens: g.served_tokens,
-                        share_score: g.share_score,
-                        weight_share: g.weight_share,
-                        expected_slots: g.weight_share * cap as f64,
-                    })
-                    .collect(),
-                tenants: p
-                    .tenants
-                    .iter()
-                    .filter(|t| {
-                        t.tenant_id != health_tenant
-                            && t.fairshare_group != model_health::HEALTH_GROUP
-                    })
-                    .map(|t| TenantFairshareView {
-                        tenant_id: t.tenant_id,
-                        name: tenant_names
-                            .get(&t.tenant_id)
-                            .cloned()
-                            .unwrap_or_else(|| t.tenant_id.to_string()),
-                        fairshare_group: t.fairshare_group.clone(),
-                        weight: t.weight,
-                        max_in_flight: t.max_in_flight,
-                        in_flight: t.in_flight,
-                        queued: t.queued,
-                        served_tokens: t.served_tokens,
-                        share_score: t.share_score,
-                        weight_share: t.weight_share,
-                        expected_slots: t.weight_share * cap as f64,
-                    })
-                    .collect(),
-                keys: p
-                    .keys
-                    .iter()
-                    .filter(|k| k.tenant_id != health_tenant)
-                    .map(|k| KeyFairshareView {
-                        key_id: k.key_id,
-                        tenant_id: k.tenant_id,
-                        name: {
-                            let real = k.end_user.as_ref().map_or(k.key_id, |e| e.parent_key);
-                            key_names
-                                .get(&real)
-                                .cloned()
-                                .unwrap_or_else(|| real.to_string())
-                        },
-                        weight: k.weight,
-                        max_in_flight: k.max_in_flight,
-                        in_flight: k.in_flight,
-                        queued: k.queued,
-                        served_tokens: k.served_tokens,
-                        share_score: k.share_score,
-                        weight_share: k.weight_share,
-                        expected_slots: k.weight_share * cap as f64,
-                        end_user: k.end_user.as_ref().map(|e| e.name.clone()),
-                        parent_key_id: k.end_user.as_ref().map(|e| e.parent_key),
-                    })
-                    .collect(),
-            }
+            let local = snap.pools.iter().find(|l| l.model == p.model);
+            live_pool_view(p, local, cluster_pool, &names)
         })
         .collect();
     pools.retain(|p| p.in_flight > 0 || p.queued > 0 || live_names.contains(p.model.as_str()));
     let (groups, tenants, keys) = aggregate_pools(&pools);
+    let replica_in_flight = snap.global_in_flight.saturating_sub(local_hidden_in_flight);
+    let replica_queued = snap.global_queued.saturating_sub(local_hidden_queued) as i64;
+    let (global_in_flight, global_queued, global_borrowed, model_in_flight, model_queued) =
+        match &scope.cluster {
+            Some(c) => (
+                c.pools
+                    .iter()
+                    .map(|p| p.in_flight)
+                    .sum::<usize>()
+                    .saturating_sub(hidden_in_flight),
+                c.pools
+                    .iter()
+                    .map(|p| p.queued)
+                    .sum::<usize>()
+                    .saturating_sub(hidden_queued) as i64,
+                c.pools.iter().map(|p| p.borrowed).sum(),
+                c.pools
+                    .iter()
+                    .filter(|p| p.in_flight > 0)
+                    .map(|p| (p.model.clone(), p.in_flight))
+                    .collect(),
+                c.pools
+                    .iter()
+                    .filter(|p| p.queued > 0)
+                    .map(|p| (p.model.clone(), p.queued))
+                    .collect(),
+            ),
+            None => (
+                replica_in_flight,
+                replica_queued,
+                snap.global_borrowed,
+                snap.model_in_flight.clone(),
+                snap.model_queued.clone(),
+            ),
+        };
     Ok(Json(FairshareLiveView {
         algorithm: snap.algorithm,
         max_in_flight: if capacity > 0 {
@@ -6027,15 +6223,21 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         shared_slots: state.fairshare_shared_slots,
         replica_aware: state.fairshare_replica_aware,
         cluster_in_flight: cluster_global,
-        global_in_flight: snap.global_in_flight.saturating_sub(hidden_in_flight),
-        global_queued: snap.global_queued.saturating_sub(hidden_queued) as i64,
-        global_borrowed: snap.global_borrowed,
+        scope: scope.scope.into(),
+        replicas_reporting: scope.cluster.as_ref().map(|c| c.replicas_reporting),
+        state_age_ms: scope.cluster.as_ref().map(|c| c.max_age_ms),
+        scope_reason: scope.reason,
+        global_in_flight,
+        global_queued,
+        global_borrowed,
+        replica_in_flight,
+        replica_queued,
         groups,
         tenants,
         keys,
         pools,
-        model_in_flight: snap.model_in_flight,
-        model_queued: snap.model_queued,
+        model_in_flight,
+        model_queued,
     }))
 }
 
@@ -10700,7 +10902,8 @@ mod tests {
     }
 
     /// With shared slots, the view reports the configured sizes as this
-    /// replica's caps and the cluster-wide occupancy next to its own.
+    /// replica's caps and, in `cluster` scope, the other replicas' queues
+    /// and tenants merged with its own, which stay alongside.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fairshare_live_reports_cluster_wide_counts_in_shared_mode() {
         let Some(t) = test_admin_app().await else {
@@ -10736,9 +10939,41 @@ mod tests {
             use obleth_fairshare::SharedSlots;
             other.acquire(claim).await.expect("claimed");
         }
+        // ...and has published what is running and waiting there.
+        let (theirs, ours) = (Uuid::new_v4(), Uuid::new_v4());
+        cluster.put_view(
+            "other",
+            obleth_fairshare::ReplicaView {
+                version: obleth_fairshare::view::VIEW_VERSION,
+                pools: vec![obleth_fairshare::ReplicaPoolView {
+                    pool: PoolKey::Model("shared".into()).slot_id(),
+                    configured_cap: 9,
+                    in_flight: 2,
+                    queued: 5,
+                    groups: vec![obleth_fairshare::ReplicaGroupView {
+                        name: "default".into(),
+                        weight: 100,
+                        in_flight: 2,
+                        queued: 5,
+                        served: 2.0,
+                    }],
+                    tenants: vec![obleth_fairshare::ReplicaTenantView {
+                        id: theirs,
+                        group: "default".into(),
+                        weight: 100,
+                        cap: None,
+                        in_flight: 2,
+                        queued: 5,
+                        served: 2.0,
+                    }],
+                    ..Default::default()
+                }],
+            },
+            std::time::Duration::from_secs(60),
+        );
         let admitted = t
             .fairshare
-            .admit(obleth_fairshare::AdmitRequest::new(Uuid::new_v4(), "shared", 1).model_cap(9))
+            .admit(obleth_fairshare::AdmitRequest::new(ours, "shared", 1).model_cap(9))
             .await
             .expect("admitted");
         let get = |path: &str| {
@@ -10765,11 +11000,118 @@ mod tests {
             .expect("the pool is reported");
         assert_eq!(pool["cap"], 9, "the whole pool is usable here");
         assert_eq!(pool["configured_cap"], 9);
-        assert_eq!(pool["in_flight"], 1);
         assert_eq!(pool["cluster_in_flight"], 3);
+        assert_eq!(body["scope"], "cluster");
+        assert_eq!(body["replicas_reporting"], 2);
+        assert!(body["scope_reason"].is_null());
+        assert_eq!(
+            (pool["in_flight"].clone(), pool["queued"].clone()),
+            (3.into(), 5.into())
+        );
+        assert_eq!(
+            (
+                pool["replica_in_flight"].clone(),
+                pool["replica_queued"].clone()
+            ),
+            (1.into(), 0.into())
+        );
+        assert_eq!(
+            (
+                body["global_in_flight"].clone(),
+                body["global_queued"].clone()
+            ),
+            (3.into(), 5.into())
+        );
+        assert_eq!(
+            (
+                body["replica_in_flight"].clone(),
+                body["replica_queued"].clone()
+            ),
+            (1.into(), 0.into())
+        );
+        assert_eq!(body["model_queued"]["shared"], 5);
+        let tenant = |id: Uuid| {
+            pool["tenants"]
+                .as_array()
+                .expect("tenants")
+                .iter()
+                .find(|t| t["tenant_id"] == serde_json::json!(id.to_string()))
+                .cloned()
+                .unwrap_or_else(|| panic!("tenant {id} in {pool}"))
+        };
+        assert_eq!(
+            (
+                tenant(theirs)["in_flight"].clone(),
+                tenant(theirs)["queued"].clone()
+            ),
+            (2.into(), 5.into())
+        );
+        assert_eq!(tenant(ours)["in_flight"], 1);
+        // Two active tenants split the 9 slots evenly, cluster-wide.
+        assert_eq!(tenant(theirs)["expected_slots"], 4.5);
+        assert_eq!(tenant(ours)["expected_slots"], 4.5);
         assert_eq!(stats["mode"], "shared");
         assert_eq!(stats["cluster_in_flight"], 3);
         assert_eq!(stats["in_flight"], 1);
+    }
+
+    /// Shared mode with the backend not answering: the view falls back to
+    /// the answering replica's own counts and says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fairshare_live_falls_back_to_the_replica_when_the_backend_is_down() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let cluster = obleth_fairshare::InMemoryCluster::new();
+        t.fairshare.enable_shared_slots(
+            Arc::new(cluster.gateway("this")),
+            obleth_fairshare::SharedSlotsConfig::default(),
+        );
+        t.fairshare.set_replicas(2);
+        let stats = t.fairshare.stats();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while stats.mode() != SlotMode::Shared {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("shared mode");
+        let admitted = t
+            .fairshare
+            .admit(obleth_fairshare::AdmitRequest::new(Uuid::new_v4(), "down", 1).model_cap(4))
+            .await
+            .expect("admitted");
+        // Down after the admission: the next reconcile is seconds away, so
+        // the replica is still in shared mode when the view is read.
+        cluster.set_failing(true);
+        let req = axum::http::Request::get("/api/v1/fairshare/live")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (status, body) = send(&t.app, req).await;
+        drop(admitted);
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["mode"], "shared");
+        assert_eq!(body["scope"], "replica");
+        assert!(body["replicas_reporting"].is_null());
+        assert!(
+            body["scope_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("this replica's own")),
+            "{body}"
+        );
+        let pool = body["pools"]
+            .as_array()
+            .expect("pools")
+            .iter()
+            .find(|p| p["model"] == serde_json::json!("down"))
+            .cloned()
+            .expect("the pool is reported");
+        assert_eq!(pool["in_flight"], 1);
+        assert_eq!(pool["replica_in_flight"], 1);
+        assert_eq!(body["global_in_flight"], body["replica_in_flight"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -11981,6 +12323,8 @@ mod tests {
             cluster_in_flight: None,
             queued: 0,
             borrowed: 0,
+            replica_in_flight: in_flight,
+            replica_queued: 0,
             groups: vec![GroupFairshareView {
                 name: "g".into(),
                 weight: 100,
@@ -12034,6 +12378,199 @@ mod tests {
         assert!((tenants[0].weight_share - 0.6).abs() < 1e-9); // 6 of 10 slots
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].slot_cap, 10);
+    }
+
+    /// One replica's published state for a pool held by one tenant on one
+    /// key.
+    fn replica_view(
+        tenant: Uuid,
+        key: Uuid,
+        in_flight: usize,
+        queued: usize,
+    ) -> obleth_fairshare::ReplicaView {
+        use obleth_fairshare::{
+            ReplicaGroupView, ReplicaKeyView, ReplicaPoolView, ReplicaTenantView,
+        };
+        obleth_fairshare::ReplicaView {
+            version: obleth_fairshare::view::VIEW_VERSION,
+            pools: vec![ReplicaPoolView {
+                pool: PoolKey::Model("big".into()).slot_id(),
+                configured_cap: 256,
+                in_flight,
+                queued,
+                groups: vec![ReplicaGroupView {
+                    name: "default".into(),
+                    weight: 100,
+                    in_flight,
+                    queued,
+                    served: in_flight as f64,
+                }],
+                tenants: vec![ReplicaTenantView {
+                    id: tenant,
+                    group: "default".into(),
+                    weight: 100,
+                    cap: None,
+                    in_flight,
+                    queued,
+                    served: in_flight as f64,
+                }],
+                keys: vec![ReplicaKeyView {
+                    id: key,
+                    tenant,
+                    weight: 100,
+                    cap: None,
+                    in_flight,
+                    queued,
+                    served: in_flight as f64,
+                    end_user: None,
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// The case behind the cluster view: one tenant holds all 256 slots of a
+    /// pool across three replicas (42 + 96 + 118) with 767 requests queued
+    /// (350 + 209 + 208). The answering replica's own state alone read as
+    /// "waiting below its fair share, holding 96 against 256"; merged, the
+    /// pool, its tenant and its key are counted across the fleet, the fair
+    /// share is the whole pool, and the replica's own counts stay alongside.
+    #[test]
+    fn live_pool_view_counts_a_merged_pool_across_the_fleet() {
+        let (tenant, key) = (Uuid::new_v4(), Uuid::new_v4());
+        let views = [
+            replica_view(tenant, key, 96, 209),
+            replica_view(tenant, key, 42, 350),
+            replica_view(tenant, key, 118, 208),
+        ];
+        let algorithm = obleth_config::FairshareAlgorithm::Hierarchical;
+        let merged =
+            obleth_fairshare::merge_views(algorithm, &views.iter().collect::<Vec<_>>(), 4096);
+        let local = obleth_fairshare::merge_views(algorithm, &[&views[0]], 4096);
+        let tenant_names = std::collections::HashMap::from([(tenant, "acme".to_string())]);
+        let key_names = std::collections::HashMap::from([(key, "app".to_string())]);
+        let enabled = std::collections::HashSet::from(["big"]);
+        let serving = std::collections::HashSet::from(["big".to_string()]);
+        let names = LiveNames {
+            tenants: &tenant_names,
+            keys: &key_names,
+            enabled: &enabled,
+            serving: &serving,
+        };
+        let view = live_pool_view(&merged[0], local.first(), Some(256), &names);
+
+        assert_eq!((view.cap, view.configured_cap), (256, 256));
+        assert_eq!((view.in_flight, view.queued), (256, 767));
+        assert_eq!((view.replica_in_flight, view.replica_queued), (96, 209));
+        assert_eq!(view.cluster_in_flight, Some(256));
+        assert!(!view.no_servers);
+        assert_eq!(view.tenants.len(), 1);
+        let t = &view.tenants[0];
+        assert_eq!((t.name.as_str(), t.in_flight, t.queued), ("acme", 256, 767));
+        assert!(
+            (t.expected_slots - 256.0).abs() < 1e-9,
+            "{}",
+            t.expected_slots
+        );
+        assert!(
+            !(t.queued > 0 && (t.in_flight as f64) < t.expected_slots.floor()),
+            "holding every slot it can, the tenant is not waiting below its share"
+        );
+        assert_eq!(view.groups.len(), 1);
+        assert_eq!(
+            (view.groups[0].in_flight, view.groups[0].queued),
+            (256, 767)
+        );
+        assert_eq!(view.keys.len(), 1);
+        assert_eq!(
+            (view.keys[0].name.as_str(), view.keys[0].in_flight),
+            ("app", 256)
+        );
+
+        // The answering replica's own pool, as `replica` scope reports it.
+        let own = live_pool_view(&local[0], local.first(), None, &names);
+        assert_eq!((own.in_flight, own.queued), (96, 209));
+        assert_eq!((own.replica_in_flight, own.replica_queued), (96, 209));
+    }
+
+    /// The health prober is left out of every level of a merged pool and of
+    /// its counts, on the merged side and on the replica's own.
+    #[test]
+    fn live_pool_view_hides_the_prober_in_a_merged_pool() {
+        use obleth_fairshare::{ReplicaGroupView, ReplicaTenantView};
+        let (tenant, key) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut probed = replica_view(tenant, key, 4, 2);
+        let pool = &mut probed.pools[0];
+        pool.in_flight += 1;
+        pool.groups.push(ReplicaGroupView {
+            name: model_health::HEALTH_GROUP.into(),
+            weight: 100,
+            in_flight: 1,
+            queued: 0,
+            served: 1.0,
+        });
+        pool.tenants.push(ReplicaTenantView {
+            id: model_health::health_tenant_id(),
+            group: model_health::HEALTH_GROUP.into(),
+            weight: 100,
+            cap: None,
+            in_flight: 1,
+            queued: 0,
+            served: 1.0,
+        });
+        let other = replica_view(tenant, key, 3, 0);
+        let algorithm = obleth_config::FairshareAlgorithm::Hierarchical;
+        let merged = obleth_fairshare::merge_views(algorithm, &[&probed, &other], 4096);
+        let local = obleth_fairshare::merge_views(algorithm, &[&probed], 4096);
+        let empty = std::collections::HashMap::new();
+        let none = std::collections::HashSet::new();
+        let names = LiveNames {
+            tenants: &empty,
+            keys: &empty,
+            enabled: &none,
+            serving: &std::collections::HashSet::new(),
+        };
+        let view = live_pool_view(&merged[0], local.first(), None, &names);
+        assert_eq!((view.in_flight, view.queued), (7, 2));
+        assert_eq!((view.replica_in_flight, view.replica_queued), (4, 2));
+        assert!(view
+            .groups
+            .iter()
+            .all(|g| g.name != model_health::HEALTH_GROUP));
+        assert!(view
+            .tenants
+            .iter()
+            .all(|t| t.tenant_id != model_health::health_tenant_id()));
+    }
+
+    /// A pool the answering replica does not have reports zero for its own
+    /// counts, and one with no servers says so.
+    #[test]
+    fn live_pool_view_without_a_local_pool() {
+        let (tenant, key) = (Uuid::new_v4(), Uuid::new_v4());
+        let merged = obleth_fairshare::merge_views(
+            obleth_config::FairshareAlgorithm::Weighted,
+            &[&replica_view(tenant, key, 3, 1)],
+            4096,
+        );
+        let empty = std::collections::HashMap::new();
+        let enabled = std::collections::HashSet::from(["big"]);
+        let serving = std::collections::HashSet::new();
+        let names = LiveNames {
+            tenants: &empty,
+            keys: &empty,
+            enabled: &enabled,
+            serving: &serving,
+        };
+        let view = live_pool_view(&merged[0], None, None, &names);
+        assert_eq!((view.in_flight, view.queued), (3, 1));
+        assert_eq!((view.replica_in_flight, view.replica_queued), (0, 0));
+        assert!(view.no_servers);
+        assert_eq!(
+            view.tenants[0].name,
+            tenant.to_string(),
+            "unknown names fall back to ids"
+        );
     }
 
     #[test]

@@ -6,11 +6,19 @@
 //! call on admission and one on release, each touching the totals hash, this
 //! replica's holdings hash and (for admission) a `ZSCORE` on the replica set.
 //! Reconciles run once per heartbeat interval, off the request path.
+//!
+//! Off the request path too, each replica rewrites its scheduler view (a few
+//! KB of JSON, bounded by the view's own limits) every view interval with
+//! `SET ... PX`, and a dashboard read fetches the other live replicas' views
+//! with one read-only script (`scripts::PEER_VIEWS`).
+
+use std::time::Duration;
 
 use obleth_fairshare::{
-    AcquireOutcome, ClusterCounts, PoolHoldings, ReconcileOutcome, SharedSlots, SlotClaim,
-    SlotDenial, SlotError, SlotFuture, SlotRelease,
+    AcquireOutcome, ClusterCounts, PeerView, PeerViews, PoolHoldings, ReconcileOutcome,
+    ReplicaView, SharedSlots, SlotClaim, SlotDenial, SlotError, SlotFuture, SlotRelease,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{RedisError, RedisStore};
 
@@ -24,6 +32,9 @@ pub const SLOT_HELD_PREFIX: &str = "obleth:fairshare:held:";
 /// Pub/sub channel carrying the id of a pool where a slot was freed while
 /// someone was waiting for one.
 pub const SLOT_RELEASE_CHANNEL: &str = "obleth:fairshare:released";
+/// Prefix of each replica's scheduler view (a JSON string with a TTL); the
+/// instance id is appended.
+pub const SLOT_VIEW_PREFIX: &str = "obleth:fairshare:view:";
 
 /// How long a refused claim marks its pool as waited on. Every refusal
 /// renews it, and a waiter retries well inside it, so releases keep
@@ -39,6 +50,7 @@ pub struct SlotKeys {
     pub totals: String,
     pub held_prefix: String,
     pub channel: String,
+    pub view_prefix: String,
 }
 
 impl Default for SlotKeys {
@@ -48,6 +60,7 @@ impl Default for SlotKeys {
             totals: SLOT_TOTALS_KEY.into(),
             held_prefix: SLOT_HELD_PREFIX.into(),
             channel: SLOT_RELEASE_CHANNEL.into(),
+            view_prefix: SLOT_VIEW_PREFIX.into(),
         }
     }
 }
@@ -60,12 +73,66 @@ impl SlotKeys {
             totals: format!("{prefix}:slots"),
             held_prefix: format!("{prefix}:held:"),
             channel: format!("{prefix}:released"),
+            view_prefix: format!("{prefix}:view:"),
         }
     }
 
     pub fn held(&self, instance: &str) -> String {
         format!("{}{instance}", self.held_prefix)
     }
+
+    pub fn view(&self, instance: &str) -> String {
+        format!("{}{instance}", self.view_prefix)
+    }
+}
+
+/// A view as stored: with the TTL it was written with, so a reader can tell
+/// its age from the time it has left.
+#[derive(Serialize, Deserialize)]
+struct StoredView {
+    ttl_ms: u64,
+    view: ReplicaView,
+}
+
+/// Turn a `scripts::PEER_VIEWS` reply into [`PeerViews`]. A view that does
+/// not parse (another version's, say) is left out, so the replica counts as
+/// not reporting rather than failing the read.
+fn parse_peer_views(reply: redis::Value) -> Result<PeerViews, SlotError> {
+    let bad = || SlotError("unexpected reply to the peer views script".into());
+    let redis::Value::Array(items) = reply else {
+        return Err(bad());
+    };
+    let mut items = items.into_iter();
+    let live: i64 = items
+        .next()
+        .and_then(|v| redis::from_redis_value(&v).ok())
+        .ok_or_else(bad)?;
+    let mut views = Vec::new();
+    for item in items {
+        let Ok((instance, raw, left)) = redis::from_redis_value::<(String, String, i64)>(&item)
+        else {
+            continue;
+        };
+        let Ok(stored) = serde_json::from_str::<StoredView>(&raw) else {
+            continue;
+        };
+        // PTTL is -1 with no expiry and -2 once gone: age unknown, say 0.
+        let age_ms = if left >= 0 {
+            stored.ttl_ms.saturating_sub(left as u64)
+        } else {
+            0
+        };
+        views.push(PeerView {
+            instance,
+            view: stored.view,
+            age_ms,
+        });
+    }
+    views.sort_by(|a, b| a.instance.cmp(&b.instance));
+    Ok(PeerViews {
+        live: live.max(0) as usize,
+        views,
+    })
 }
 
 /// The totals-hash fields a pool's holdings occupy: every pool together, the
@@ -190,6 +257,46 @@ impl RedisStore {
         })
     }
 
+    /// Record `view` as `instance`'s scheduler view for `ttl`.
+    pub async fn slot_publish_view(
+        &self,
+        keys: &SlotKeys,
+        instance: &str,
+        view: &ReplicaView,
+        ttl: Duration,
+    ) -> crate::Result<()> {
+        let ttl_ms = ttl.as_millis().max(1) as u64;
+        let json = serde_json::to_string(&StoredView {
+            ttl_ms,
+            view: view.clone(),
+        })?;
+        let mut conn = self.conn.clone();
+        let _: () = redis::cmd("SET")
+            .arg(keys.view(instance))
+            .arg(json)
+            .arg("PX")
+            .arg(ttl_ms)
+            .query_async(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    /// The views of every live replica but `instance`, and the live count.
+    pub async fn slot_peer_views(
+        &self,
+        keys: &SlotKeys,
+        instance: &str,
+    ) -> crate::Result<Result<PeerViews, SlotError>> {
+        let mut conn = self.conn.clone();
+        let reply: redis::Value = crate::peer_views_script()
+            .key(&keys.replicas)
+            .arg(&keys.view_prefix)
+            .arg(instance)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(parse_peer_views(reply))
+    }
+
     /// Cluster-wide occupancy: every pool together, then each of `pools`.
     pub async fn slot_totals(
         &self,
@@ -274,5 +381,100 @@ impl SharedSlots for RedisSlots {
                 .await
                 .map_err(slot_error)
         })
+    }
+
+    fn publish_view(&self, view: ReplicaView, ttl: Duration) -> SlotFuture<()> {
+        let this = self.clone();
+        Box::pin(async move {
+            this.store
+                .slot_publish_view(&this.keys, &this.instance, &view, ttl)
+                .await
+                .map_err(slot_error)
+        })
+    }
+
+    fn peer_views(&self) -> SlotFuture<PeerViews> {
+        let this = self.clone();
+        Box::pin(async move {
+            this.store
+                .slot_peer_views(&this.keys, &this.instance)
+                .await
+                .map_err(slot_error)?
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use redis::Value;
+
+    fn bulk(s: &str) -> Value {
+        Value::BulkString(s.as_bytes().to_vec())
+    }
+
+    fn stored(ttl_ms: u64) -> String {
+        serde_json::to_string(&StoredView {
+            ttl_ms,
+            view: ReplicaView {
+                version: 1,
+                pools: Vec::new(),
+            },
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn peer_views_reply_parses_with_ages_from_the_ttl_left() {
+        let reply = Value::Array(vec![
+            Value::Int(3),
+            Value::Array(vec![bulk("b"), bulk(&stored(6000)), Value::Int(4500)]),
+            Value::Array(vec![bulk("a"), bulk(&stored(6000)), Value::Int(6000)]),
+        ]);
+        let peers = parse_peer_views(reply).unwrap();
+        assert_eq!(peers.live, 3);
+        let got: Vec<(&str, u64)> = peers
+            .views
+            .iter()
+            .map(|p| (p.instance.as_str(), p.age_ms))
+            .collect();
+        assert_eq!(got, vec![("a", 0), ("b", 1500)]);
+    }
+
+    /// A view this build cannot read leaves its replica out instead of
+    /// failing the whole read.
+    #[test]
+    fn an_unreadable_view_is_left_out() {
+        let reply = Value::Array(vec![
+            Value::Int(2),
+            Value::Array(vec![
+                bulk("x"),
+                bulk("{\"not\":\"a view\"}"),
+                Value::Int(10),
+            ]),
+            Value::Array(vec![bulk("y"), bulk(&stored(100)), Value::Int(-1)]),
+        ]);
+        let peers = parse_peer_views(reply).unwrap();
+        assert_eq!(peers.live, 2);
+        assert_eq!(peers.views.len(), 1);
+        assert_eq!(
+            (peers.views[0].instance.as_str(), peers.views[0].age_ms),
+            ("y", 0)
+        );
+    }
+
+    #[test]
+    fn a_reply_of_the_wrong_shape_is_an_error() {
+        assert!(parse_peer_views(Value::Int(1)).is_err());
+        assert!(parse_peer_views(Value::Array(vec![])).is_err());
+    }
+
+    #[test]
+    fn view_keys_follow_the_prefix() {
+        assert_eq!(
+            SlotKeys::default().view("gw-1"),
+            "obleth:fairshare:view:gw-1"
+        );
+        assert_eq!(SlotKeys::with_prefix("t").view("gw-1"), "t:view:gw-1");
     }
 }

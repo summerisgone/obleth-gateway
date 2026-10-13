@@ -8,7 +8,7 @@ import type {
   UsageTimePoint,
 } from "@/lib/obleth";
 import type { OverviewSummary } from "@/lib/overview-summary";
-import { isWaitingBelowShare } from "@/lib/fairshare";
+import { belowShareInPools, countsScope } from "@/lib/fairshare";
 import { modelHref } from "@/lib/model-links";
 
 /** The Overview's one time control. Every tile, chart and table follows it. */
@@ -120,10 +120,11 @@ export interface FleetTile {
 
 /**
  * Live pool occupancy for one model: cluster-wide in shared mode, else this
- * gateway's own. The fairshare snapshot lists only the pools the answering
- * gateway has served since it started, so a model it has not seen falls back
- * to capacity discovery (its enforced size and cluster-wide count), then to
- * the configured size.
+ * gateway's own. Waiting follows the view's scope: every gateway's when the
+ * view is cluster-wide. The view lists only the pools with traffic somewhere
+ * or that the answering gateway has served since it started, so a model it
+ * does not list falls back to capacity discovery (its enforced size and
+ * cluster-wide count), then to the configured size.
  */
 export function poolOccupancy(name: string, model: ModelRoute, fairshare?: FairshareLiveView, discovery?: CapacityDiscoveryView) {
   const shared = fairshare?.mode === "shared";
@@ -230,8 +231,9 @@ function ago(iso: string | null | undefined, now: number): string | null {
 
 /**
  * What the Overview says needs a person, most urgent first: failing models,
- * full pools that are queuing, then tenants waiting below their fair share.
- * `watching` holds the quieter conditions shown on one line underneath.
+ * full pools that are queuing, then tenants waiting below their fair share,
+ * one item per pool they are short in. `watching` holds the quieter
+ * conditions shown on one line underneath.
  */
 export function buildAttention(fleet: FleetTile[], fairshare: FairshareLiveView | undefined, now = Date.now()) {
   const items: AttentionItem[] = [];
@@ -262,6 +264,9 @@ export function buildAttention(fleet: FleetTile[], fairshare: FairshareLiveView 
       actions: [{ label: "Open the pool", href: `/fairshare?pool=${encodeURIComponent(t.name)}`, primary: true }, { label: "Capacity", href: modelHref(t.name, "capacity") }],
     });
   }
+  // Outside a cluster-wide view with several gateways, queues are the
+  // answering gateway's alone; say so rather than let them read as the fleet's.
+  const here = countsScope(fairshare) === "gateway" ? " on this gateway" : "";
   const queued = fairshare?.global_queued ?? 0;
   if (queued > 0 && full.length === 0) {
     const waiting = fairshare?.tenants.filter((t) => t.queued > 0).length ?? 0;
@@ -269,19 +274,21 @@ export function buildAttention(fleet: FleetTile[], fairshare: FairshareLiveView 
       key: "queued",
       badge: "Queued",
       urgent: false,
-      title: `${plural(queued, "request")} waiting for admission`,
+      title: `${plural(queued, "request")} waiting for admission${here}`,
       detail: `${plural(waiting, "tenant")} waiting`,
       actions: [{ label: "Open Fairshare", href: "/fairshare", primary: true }],
     });
   }
-  for (const t of (fairshare?.tenants ?? []).filter(isWaitingBelowShare)) {
+  for (const { model, tenant: t } of belowShareInPools(fairshare)) {
     items.push({
-      key: `share:${t.tenant_id}`,
+      key: model === null ? `share:${t.tenant_id}` : `share:${model}:${t.tenant_id}`,
       badge: "Below share",
       urgent: false,
-      title: `${t.name || "A tenant"} is waiting below its fair share`,
-      detail: `${plural(t.queued, "request")} queued while it holds ${plural(t.in_flight, "slot")} against an expected ${Math.floor(t.expected_slots)}`,
-      actions: [{ label: "Open Fairshare", href: "/fairshare" }],
+      title: `${t.name || "A tenant"} is waiting below its fair share${model === null ? "" : ` on ${model}`}`,
+      detail: `${plural(t.queued, "request")} queued${here} while it holds ${plural(t.in_flight, "slot")} against a fair share of ${Math.floor(t.expected_slots).toLocaleString()}`,
+      actions: model === null
+        ? [{ label: "Open Fairshare", href: "/fairshare" }]
+        : [{ label: "Open the pool", href: `/fairshare?pool=${encodeURIComponent(model)}`, primary: true }],
     });
   }
   const watching = [

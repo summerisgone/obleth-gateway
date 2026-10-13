@@ -1037,6 +1037,8 @@ export interface FairshareGroup {
   updated_at: string;
 }
 
+/** A tenant in one pool, or across pools in the aggregated list. Counts
+ *  follow the view's `scope`. */
 export interface TenantFairshareView {
   tenant_id: string;
   name: string;
@@ -1047,6 +1049,7 @@ export interface TenantFairshareView {
   served_tokens: number;
   share_score: number;
   weight_share: number;
+  /** Fair share in slots: `weight_share × cap`. Judge it per pool. */
   expected_slots: number;
   max_in_flight?: number | null;
 }
@@ -1090,12 +1093,19 @@ export interface ModelPoolView {
   cap: number;
   /** Pool size as configured: the cluster-wide size. */
   configured_cap?: number;
-  /** The answering gateway's own in-flight requests. */
+  /** In-flight requests in the view's `scope`: every gateway's in cluster
+   *  scope, the answering gateway's otherwise. */
   in_flight: number;
-  /** In-flight requests across every gateway (shared mode only). */
+  /** In-flight requests across every gateway from the shared slot counts
+   *  (shared mode only). */
   cluster_in_flight?: number | null;
+  /** Queued requests in the view's `scope`. */
   queued: number;
   borrowed: number;
+  /** The answering gateway's own in-flight requests, whatever the scope. */
+  replica_in_flight?: number;
+  /** The answering gateway's own queued requests, whatever the scope. */
+  replica_queued?: number;
   groups: GroupFairshareView[];
   tenants: TenantFairshareView[];
   keys: KeyFairshareView[];
@@ -1104,7 +1114,9 @@ export interface ModelPoolView {
 export interface FairshareLiveView {
   algorithm: string;
   max_in_flight: number;
+  /** In-flight requests in the view's `scope`. */
   global_in_flight: number;
+  /** Queued requests in the view's `scope`. */
   global_queued: number;
   /** Global in-flight above apportioned caps, borrowed from idle capacity. */
   global_borrowed?: number;
@@ -1137,12 +1149,30 @@ export interface FairshareLiveView {
   /** Whether the split applies when shared slots are off or unavailable
    *  (OBLETH_FAIRSHARE_REPLICA_AWARE). */
   replica_aware?: boolean;
-  /** In-flight requests across every gateway (shared mode only). Every other
-   *  count in the view is the answering gateway's own. */
+  /** In-flight requests across every gateway from the shared slot counts
+   *  (shared mode only). */
   cluster_in_flight?: number | null;
+  /** Which gateways the counts cover. `cluster`: every live gateway, merged
+   *  (shared mode). `replica`: the answering gateway alone (always outside
+   *  shared mode, and in shared mode when the others could not be read; see
+   *  `scope_reason`). Absent from older gateways, which mean `replica`. */
+  scope?: FairshareScope;
+  /** Cluster scope: how many gateways the counts include (fewer than
+   *  `replicas` while one has not reported yet). */
+  replicas_reporting?: number | null;
+  /** Cluster scope: age of the oldest gateway state included, in ms. */
+  state_age_ms?: number | null;
+  /** Shared mode in replica scope: why the other gateways are missing. */
+  scope_reason?: string | null;
+  /** The answering gateway's own in-flight requests, whatever the scope. */
+  replica_in_flight?: number;
+  /** The answering gateway's own queued requests, whatever the scope. */
+  replica_queued?: number;
   keys?: KeyFairshareView[];
   pools?: ModelPoolView[];
 }
+
+export type FairshareScope = "cluster" | "replica";
 
 export interface FairshareHistoryPoint {
   ts_ms: number;
