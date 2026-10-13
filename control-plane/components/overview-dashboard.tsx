@@ -15,7 +15,7 @@ import {
   formatMs,
   type OverviewRange,
 } from "@/lib/overview-model";
-import { isWaitingBelowShare } from "@/lib/fairshare";
+import { countsScope, tenantsBelowShare } from "@/lib/fairshare";
 import { cn, getJson } from "@/lib/utils";
 import { Fleet, RightNow, type LiveCapacity } from "@/components/overview/fleet";
 import { FooterTiles, NeedsAttention, RecentChanges, TopTenants } from "@/components/overview/panels";
@@ -29,18 +29,24 @@ const HEALTH_POLL_MS = 30_000;
 const SLOW_POLL_MS = 60_000;
 const WINDOW_POLL_MS: Record<OverviewRange, number> = { "1h": 15_000, "24h": 30_000, "7d": 120_000 };
 
-/** Live capacity: cluster-wide with shared slots, otherwise the answering gateway's own. */
+/**
+ * Live capacity: cluster-wide with shared slots, otherwise the answering
+ * gateway's own. Queues and tenants follow the fairshare view's scope, which
+ * is cluster-wide too unless the other gateways could not be read.
+ */
 function liveCapacity(view?: FairshareLiveView, stats?: LiveStats): LiveCapacity {
   const shared = (view?.mode ?? stats?.mode) === "shared";
   const cluster = shared ? view?.cluster_in_flight ?? stats?.cluster_in_flight ?? null : null;
+  const replicas = view?.replicas ?? stats?.replicas ?? 1;
   return {
     inFlight: cluster ?? view?.global_in_flight ?? stats?.in_flight ?? 0,
     slots: (shared ? view?.configured_max_in_flight : undefined) ?? view?.max_in_flight ?? stats?.max_in_flight ?? 0,
     queued: view?.global_queued ?? stats?.queued ?? 0,
-    replicas: view?.replicas ?? stats?.replicas ?? 1,
+    replicas,
     shared,
+    queuesHere: view ? countsScope(view) === "gateway" : replicas > 1,
     activeTenants: view?.tenants.filter((t) => t.in_flight > 0 || t.queued > 0).length ?? 0,
-    belowShare: view?.tenants.filter(isWaitingBelowShare).length ?? 0,
+    belowShare: tenantsBelowShare(view).size,
   };
 }
 

@@ -1014,9 +1014,12 @@ fn only_discovered_models_become_targets() {
 
 fn resolved(name: &str) -> ResolvedModel {
     ResolvedModel {
+        description: String::new(),
         model_name: name.to_string(),
         aliases: Vec::new(),
         lifecycle: Default::default(),
+        reasoning: Default::default(),
+        listed: true,
         variants: Vec::new(),
         quantization: "unknown".into(),
         upstream_model: name.to_string(),

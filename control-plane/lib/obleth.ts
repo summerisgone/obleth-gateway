@@ -132,6 +132,59 @@ export interface SetModelStatus {
   redirect?: boolean;
 }
 
+/** A reasoning-effort level, as callers name it. */
+export type ReasoningLevel = "none" | "low" | "medium" | "high";
+
+/**
+ * How a model takes reasoning effort: `passthrough` leaves requests as the
+ * caller sent them, `mapped` translates the four levels with `levels`, and
+ * `unsupported` removes the caller's effort before the request goes out.
+ */
+export type ReasoningMode = "passthrough" | "mapped" | "unsupported";
+
+/**
+ * What one level becomes: fields merged into the request body (`{}` sends
+ * nothing, so the server's own default applies), or another level that sends.
+ */
+export type ReasoningAction = { send: Record<string, unknown> } | { use: ReasoningLevel };
+
+/** A model's reasoning-effort map. Absent or `{mode: "passthrough"}` changes nothing. */
+export interface ModelReasoning {
+  mode: ReasoningMode;
+  /** The level served when a caller names none (`mapped` only). Unset sends nothing. */
+  default_level?: ReasoningLevel | null;
+  /** One action per level. `mapped` needs all four; the other modes keep them for later. */
+  levels?: Partial<Record<ReasoningLevel, ReasoningAction>>;
+}
+
+/** The chat model that answers a family's name at each level. */
+export interface FamilyMembers {
+  none: string;
+  low: string;
+  medium: string;
+  high: string;
+}
+
+/** One name for several models, with the reasoning level choosing which one answers. */
+export interface ModelFamily {
+  id: string;
+  name: string;
+  description: string;
+  /** The level a request that names none is served at. */
+  default_level: ReasoningLevel;
+  members: FamilyMembers;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `POST /model-families` and `PUT /model-families/{id}`: the family written whole. */
+export interface ModelFamilyWrite {
+  name: string;
+  description?: string;
+  default_level: ReasoningLevel;
+  members: FamilyMembers;
+}
+
 export interface ModelRoute {
   id: string;
   model_name: string;
@@ -157,6 +210,14 @@ export interface ModelRoute {
   lifecycle?: ModelLifecycle;
   /** The status in force now: a deprecated model past its date reads `retired`. */
   effective_status?: LifecycleStatus;
+  /**
+   * How the model takes reasoning effort. Set on its own with
+   * `PUT /models/{id}/reasoning`. Absent from gateways older than the field,
+   * which read as pass-through.
+   */
+  reasoning?: ModelReasoning;
+  /** Whether /v1/models and /model/info offer the model; it is served by name either way. Missing on older gateways (listed). */
+  listed?: boolean;
   description: string;
   upstream_model: string;
   api_base: string;
@@ -254,7 +315,7 @@ export interface ModelRoute {
  * `upstream_header_names`.
  */
 export type ModelWriteFields = Partial<
-  Omit<ModelRoute, "api_key_set" | "upstream_header_names" | "variants" | "lifecycle" | "effective_status">
+  Omit<ModelRoute, "api_key_set" | "upstream_header_names" | "variants" | "lifecycle" | "effective_status" | "reasoning" | "listed">
 > & {
   api_key?: string | null;
   upstream_headers?: Record<string, string | null>;
@@ -803,6 +864,12 @@ export interface UsageLogEntry {
   parent_request_id?: string;
   /** The variant the client named, when it called the model through one; `model` is still the model's own name. Absent from older gateways. */
   model_variant?: string;
+  /** The model family the client named; `model` is the member that answered. Absent from older gateways. */
+  model_family?: string;
+  /** The reasoning effort served (none, low, medium, high), "unsupported" when it was removed, or empty when it went through as sent. Absent from older gateways. */
+  reasoning_effort?: string;
+  /** The reasoning effort the caller asked for, or empty. Absent from older gateways. */
+  reasoning_effort_requested?: string;
 }
 
 /// One recorded span from the flight-recorder tracer for a single request.
@@ -970,6 +1037,8 @@ export interface FairshareGroup {
   updated_at: string;
 }
 
+/** A tenant in one pool, or across pools in the aggregated list. Counts
+ *  follow the view's `scope`. */
 export interface TenantFairshareView {
   tenant_id: string;
   name: string;
@@ -980,6 +1049,7 @@ export interface TenantFairshareView {
   served_tokens: number;
   share_score: number;
   weight_share: number;
+  /** Fair share in slots: `weight_share × cap`. Judge it per pool. */
   expected_slots: number;
   max_in_flight?: number | null;
 }
@@ -1023,12 +1093,19 @@ export interface ModelPoolView {
   cap: number;
   /** Pool size as configured: the cluster-wide size. */
   configured_cap?: number;
-  /** The answering gateway's own in-flight requests. */
+  /** In-flight requests in the view's `scope`: every gateway's in cluster
+   *  scope, the answering gateway's otherwise. */
   in_flight: number;
-  /** In-flight requests across every gateway (shared mode only). */
+  /** In-flight requests across every gateway from the shared slot counts
+   *  (shared mode only). */
   cluster_in_flight?: number | null;
+  /** Queued requests in the view's `scope`. */
   queued: number;
   borrowed: number;
+  /** The answering gateway's own in-flight requests, whatever the scope. */
+  replica_in_flight?: number;
+  /** The answering gateway's own queued requests, whatever the scope. */
+  replica_queued?: number;
   groups: GroupFairshareView[];
   tenants: TenantFairshareView[];
   keys: KeyFairshareView[];
@@ -1037,7 +1114,9 @@ export interface ModelPoolView {
 export interface FairshareLiveView {
   algorithm: string;
   max_in_flight: number;
+  /** In-flight requests in the view's `scope`. */
   global_in_flight: number;
+  /** Queued requests in the view's `scope`. */
   global_queued: number;
   /** Global in-flight above apportioned caps, borrowed from idle capacity. */
   global_borrowed?: number;
@@ -1070,12 +1149,30 @@ export interface FairshareLiveView {
   /** Whether the split applies when shared slots are off or unavailable
    *  (OBLETH_FAIRSHARE_REPLICA_AWARE). */
   replica_aware?: boolean;
-  /** In-flight requests across every gateway (shared mode only). Every other
-   *  count in the view is the answering gateway's own. */
+  /** In-flight requests across every gateway from the shared slot counts
+   *  (shared mode only). */
   cluster_in_flight?: number | null;
+  /** Which gateways the counts cover. `cluster`: every live gateway, merged
+   *  (shared mode). `replica`: the answering gateway alone (always outside
+   *  shared mode, and in shared mode when the others could not be read; see
+   *  `scope_reason`). Absent from older gateways, which mean `replica`. */
+  scope?: FairshareScope;
+  /** Cluster scope: how many gateways the counts include (fewer than
+   *  `replicas` while one has not reported yet). */
+  replicas_reporting?: number | null;
+  /** Cluster scope: age of the oldest gateway state included, in ms. */
+  state_age_ms?: number | null;
+  /** Shared mode in replica scope: why the other gateways are missing. */
+  scope_reason?: string | null;
+  /** The answering gateway's own in-flight requests, whatever the scope. */
+  replica_in_flight?: number;
+  /** The answering gateway's own queued requests, whatever the scope. */
+  replica_queued?: number;
   keys?: KeyFairshareView[];
   pools?: ModelPoolView[];
 }
+
+export type FairshareScope = "cluster" | "replica";
 
 export interface FairshareHistoryPoint {
   ts_ms: number;
@@ -2205,6 +2302,37 @@ export const obleth = {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
+    }),
+  /** Replace a model's reasoning-effort map whole. */
+  setModelReasoning: (id: string, body: ModelReasoning, options?: AuditOptions) =>
+    api<ModelRoute>(`/models/${id}/reasoning`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  setModelListing: (id: string, listed: boolean, options?: AuditOptions) =>
+    api<ModelRoute>(`/models/${id}/listing`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ listed }),
+    }),
+  listModelFamilies: () => api<ModelFamily[]>("/model-families"),
+  createModelFamily: (body: ModelFamilyWrite, options?: AuditOptions) =>
+    api<ModelFamily>("/model-families", {
+      method: "POST",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  updateModelFamily: (id: string, body: ModelFamilyWrite, options?: AuditOptions) =>
+    api<ModelFamily>(`/model-families/${id}`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  deleteModelFamily: (id: string, options?: AuditOptions) =>
+    api<void>(`/model-families/${id}`, {
+      method: "DELETE",
+      headers: auditActorHeaders(options),
     }),
   setModelCapacity: (
     id: string,

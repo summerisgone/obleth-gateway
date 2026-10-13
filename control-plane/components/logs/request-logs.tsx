@@ -118,7 +118,12 @@ function Row({ row, selected, onOpen, now }: { row: UsageLogEntry; selected: boo
       </td>
       <td className="max-w-[16rem] py-2 pr-3">
         <span className="block truncate font-mono text-[12.5px]">{row.model}</span>
-        <span className="block truncate text-[11.5px] text-muted-foreground">{row.request_type || "other"}{row.cache_status === "hit" ? " · cached" : ""}</span>
+        <span className="block truncate text-[11.5px] text-muted-foreground">
+          {row.request_type || "other"}
+          {row.model_family ? ` · via ${row.model_family}` : ""}
+          {row.reasoning_effort && row.reasoning_effort !== "unsupported" ? ` · ${row.reasoning_effort} effort` : ""}
+          {row.cache_status === "hit" ? " · cached" : ""}
+        </span>
       </td>
       <td className="max-w-[16rem] py-2 pr-3">
         <span className="block truncate">{row.tenant_name || row.tenant_id.slice(0, 8)}</span>

@@ -9,6 +9,7 @@ pub mod config;
 pub mod jwt;
 pub mod keys;
 pub mod manifest;
+pub mod reasoning;
 pub mod routing;
 pub mod types;
 
@@ -27,5 +28,9 @@ pub use manifest::{
     ModelImportReport, ModelManifest, ResolvedManifestEndpoint, ResolvedManifestModel,
     IMPORT_ACTION_CREATED, IMPORT_ACTION_UNCHANGED, IMPORT_ACTION_UPDATED, MODEL_MANIFEST_FORMAT,
     MODEL_MANIFEST_VERSION,
+};
+pub use reasoning::{
+    FamilyMembers, ModelFamily, ModelReasoning, ReasoningAction, ReasoningLevel, ReasoningMode,
+    ReasoningPlan,
 };
 pub use types::*;

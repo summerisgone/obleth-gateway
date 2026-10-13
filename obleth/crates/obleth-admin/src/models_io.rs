@@ -278,6 +278,14 @@ pub(crate) async fn import_models(
 
     // ---- alias and variant uniqueness, judged against the post-import state ----
     errors.extend(name_conflicts(&existing, &writes));
+    let families: HashSet<String> = state
+        .store
+        .list_model_families()
+        .await?
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    errors.extend(family_conflicts(&families, &writes));
 
     if !errors.is_empty() {
         return Err(AdminError::BadRequest(format!(
@@ -359,6 +367,29 @@ pub(crate) async fn import_models(
 
     report.dry_run = false;
     Ok(Json(report))
+}
+
+/// Every name in `writes` (model name, alias or variant) that a model family
+/// already answers to, as one message each.
+pub(crate) fn family_conflicts(
+    families: &HashSet<String>,
+    writes: &[ModelImportWrite],
+) -> Vec<String> {
+    let mut errors: Vec<String> = Vec::new();
+    for w in writes {
+        let names = std::iter::once(&w.model_name)
+            .chain(w.config.aliases.iter())
+            .chain(w.config.variants.iter().map(|v| &v.name));
+        for name in names {
+            if families.contains(name) {
+                errors.push(format!(
+                    "model '{}': '{name}' is already the name of a model family",
+                    w.model_name
+                ));
+            }
+        }
+    }
+    errors
 }
 
 /// Every alias or variant in `writes` that would make a client-facing name

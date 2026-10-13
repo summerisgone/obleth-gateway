@@ -128,7 +128,7 @@ impl Store {
         .collect::<Result<Vec<_>>>()?;
 
         let models = sqlx::query(
-            "select id, model_name, aliases, variants, lifecycle, description, upstream_model, api_base, api_key,
+            "select id, model_name, aliases, variants, lifecycle, reasoning, listed, description, upstream_model, api_base, api_key,
                     upstream_headers, model_type, quantization,
                     input_cost_per_token, output_cost_per_token, cost_per_image,
                     cost_per_audio_second, cost_per_character, cost_per_video, context_window,
@@ -205,6 +205,8 @@ impl Store {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let model_families = self.list_model_families().await?;
+
         Ok(BackupData {
             fairshare_groups,
             tenants,
@@ -213,6 +215,7 @@ impl Store {
             model_endpoints,
             mcp_servers,
             app_settings,
+            model_families,
         })
     }
 
@@ -404,11 +407,11 @@ impl Store {
                         debug_diagnostics, energy_slots_per_node, aliases, quantization,
                         upstream_headers, cost_per_video, capacity_namespace, capacity_service,
                         per_replica_max_in_flight, capacity_source, capacity_headroom, variants,
-                        lifecycle)
+                        lifecycle, reasoning, listed)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
                         $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46,
-                        $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57)
+                        $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59)
                  on conflict (id) do update set
                         model_name = excluded.model_name,
                         description = excluded.description,
@@ -465,6 +468,8 @@ impl Store {
                         capacity_headroom = excluded.capacity_headroom,
                         variants = excluded.variants,
                         lifecycle = excluded.lifecycle,
+                        reasoning = excluded.reasoning,
+                        listed = excluded.listed,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -556,6 +561,8 @@ impl Store {
                 &m.variants,
             )))
             .bind(sqlx::types::Json(&m.lifecycle))
+            .bind(sqlx::types::Json(&m.reasoning))
+            .bind(m.listed)
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -635,6 +642,31 @@ impl Store {
             tally(&mut report.app_settings, &row)?;
         }
 
+        for f in &data.model_families {
+            let row = sqlx::query(
+                "insert into model_families (id, name, description, default_level, members,
+                        created_at)
+                 values ($1, $2, $3, $4, $5, $6)
+                 on conflict (id) do update set
+                        name = excluded.name,
+                        description = excluded.description,
+                        default_level = excluded.default_level,
+                        members = excluded.members,
+                        updated_at = now()
+                 returning (xmax = 0) as inserted",
+            )
+            .bind(f.id)
+            .bind(&f.name)
+            .bind(&f.description)
+            .bind(f.default_level.as_str())
+            .bind(sqlx::types::Json(&f.members))
+            .bind(f.created_at)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(restore_db_error)?;
+            tally(&mut report.model_families, &row)?;
+        }
+
         tx.commit().await?;
         Ok(report)
     }
@@ -675,6 +707,7 @@ fn restore_db_error(e: sqlx::Error) -> StoreError {
                 "models_model_name_key" => "a model with the same name but a different id",
                 "api_keys_key_hash_key" => "an API key with the same hash but a different id",
                 "mcp_servers_name_key" => "an MCP server with the same name but a different id",
+                "model_families_name_key" => "a model family with the same name but a different id",
                 "model_endpoints_model_id_name_key" => {
                     "a model endpoint with the same name but a different id"
                 }
@@ -738,6 +771,11 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
             .try_get::<sqlx::types::Json<obleth_config::ModelLifecycle>, _>("lifecycle")
             .map(|j| j.0)
             .unwrap_or_default(),
+        reasoning: row
+            .try_get::<sqlx::types::Json<obleth_config::ModelReasoning>, _>("reasoning")
+            .map(|j| j.0)
+            .unwrap_or_default(),
+        listed: row.try_get::<bool, _>("listed").unwrap_or(true),
         description: row.try_get("description")?,
         upstream_model: row.try_get("upstream_model")?,
         api_base: row.try_get("api_base")?,

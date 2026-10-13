@@ -14,6 +14,7 @@ mod messages;
 mod metrics;
 mod output_monitor;
 mod proxy;
+mod reasoning;
 mod replicas;
 mod responses;
 mod router;
@@ -126,6 +127,13 @@ async fn main() -> anyhow::Result<()> {
             obleth_fairshare::SharedSlotsConfig {
                 reconcile_interval: cfg.fairshare_replica_heartbeat,
                 split_on_fallback: cfg.fairshare_replica_aware,
+                // The cluster-wide counts add up views published at
+                // different moments; requests that finish or start between
+                // them blur the sum, so publish often enough that the
+                // blur stays a slot or two.
+                view_interval: cfg
+                    .fairshare_replica_heartbeat
+                    .min(Duration::from_millis(500)),
                 ..Default::default()
             },
         );
@@ -228,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
         .build();
 
     let model_registry = router::ModelRegistry::new();
+    let families = reasoning::FamilyRegistry::new();
     // Rolling completion-length averages, shared with the admin state below so
     // simulate scores with the live numbers.
     let output_stats = router::OutputStats::default();
@@ -414,6 +423,7 @@ async fn main() -> anyhow::Result<()> {
         mcp_cache: mcp_cache.clone(),
         tool_cache,
         model_registry: model_registry.clone(),
+        families: families.clone(),
         classifier: classifier.clone(),
         output_stats: output_stats.clone(),
         boons: boons.clone(),
@@ -462,12 +472,17 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => tracing::warn!(error = %e, "failed to load models for warming"),
     }
+    match store.list_model_families().await {
+        Ok(f) => families.store(f),
+        Err(e) => tracing::warn!(error = %e, "failed to load model families"),
+    }
 
     // Keep the `auto`-router candidate list fresh: model edits, enable/disable,
     // and health/maintenance transitions are all reflected within one interval.
     spawn_model_registry_refresh(
         store.clone(),
         model_registry.clone(),
+        families.clone(),
         classifier.clone(),
         boons.clone(),
         energy.clone(),
@@ -845,6 +860,7 @@ fn overlong_request_timeouts(
 fn spawn_model_registry_refresh(
     store: Store,
     registry: router::ModelRegistry,
+    families: reasoning::FamilyRegistry,
     classifier: classifier::Classifier,
     boons: boons::BoonEngine,
     energy: energy::EnergyEngine,
@@ -883,6 +899,10 @@ fn spawn_model_registry_refresh(
                     );
                 }
                 warned = current;
+            }
+            match store.list_model_families().await {
+                Ok(f) => families.store(f),
+                Err(e) => tracing::warn!(error = %e, "model family refresh failed"),
             }
             match store.get_boon_settings().await {
                 Ok(Some(settings)) => boons.update(settings),
@@ -1558,9 +1578,12 @@ mod registry_refresh_tests {
 
     fn model(name: &str, request_timeout_secs: Option<i64>) -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
+            description: String::new(),
             model_name: name.to_string(),
             aliases: Vec::new(),
             lifecycle: Default::default(),
+            reasoning: Default::default(),
+            listed: true,
             variants: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),

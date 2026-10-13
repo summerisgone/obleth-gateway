@@ -7,7 +7,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, RefreshCw } from "lucide-react";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { isWaitingBelowShare } from "@/lib/fairshare";
+import { countsScope, isWaitingBelowShare, tenantsAboveShare, tenantsBelowShare } from "@/lib/fairshare";
 import {
   buildPoolRows,
   groupShares,
@@ -155,14 +155,17 @@ export function FairshareDashboard({ tenantNames, initialPool = "all" }: { tenan
         <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
           <Tile label="Running" value={<>{formatNumber(poolRow?.inFlight ?? 0)} <span className="text-sm font-normal text-muted-foreground">of {poolRow?.cap ? formatNumber(poolRow.cap) : "—"} slots</span></>} meter={[poolRow?.inFlight ?? 0, poolRow?.cap ?? 0]} detail={shared ? "Cluster-wide" : "This gateway"} />
           <div className="col-span-1 flex items-center rounded-xl border border-dashed border-border px-4 py-3.5 text-[13px] text-muted-foreground xl:col-span-3">
-            Nothing has run or waited in this pool on the answering gateway since it started, so there are no tenants to show. Traffic on other gateways still counts in Running when slots are shared.
+            {countsScope(raw) === "cluster"
+              ? "Nothing is running or waiting in this pool on any gateway right now, so there are no tenants to show."
+              : "Nothing has run or waited in this pool on the answering gateway since it started, so there are no tenants to show. Traffic on other gateways still counts in Running when slots are shared."}
           </div>
         </div>
       ) : (
         <AllPools raw={raw} pools={pools} expanded={allPools} onExpand={() => setAllPools(!allPools)} onScope={setScope} onOpen={setSelected} tenantTotal={Object.keys(tenantNames).length} />
       )}
 
-      {raw && <RunningHistory history={history} groups={groupKeys} oldestTs={oldestTs} retentionMs={retentionMs} scopeLabel={scoped ? scope : "all pools"} />}
+      {/* History is sampled per gateway process, so with several it is the answering one's. */}
+      {raw && <RunningHistory history={history} groups={groupKeys} oldestTs={oldestTs} retentionMs={retentionMs} scopeLabel={`${scoped ? scope : "all pools"}${(raw.replicas ?? 1) > 1 ? " · this gateway" : ""}`} />}
 
       <TenantPanel tenant={selectedTenant} view={raw} keys={view?.keys} series={series.data} onClose={() => setSelected(null)} />
     </div>
@@ -171,7 +174,9 @@ export function FairshareDashboard({ tenantNames, initialPool = "all" }: { tenan
 
 function StatusLine({ view, raw, pool, inPool, loading, poolCount }: { view?: FairshareLiveView; raw?: FairshareLiveView; pool?: PoolRow; inPool: boolean; loading: boolean; poolCount: number }) {
   if (loading || !view || !raw) return <p className="text-[13.5px] text-muted-foreground">Loading scheduler…</p>;
-  const below = view.tenants.filter(isWaitingBelowShare).length;
+  // Inside a pool its own rows say who is short; across pools a tenant
+  // counts once if it is short in any of them.
+  const below = inPool ? view.tenants.filter((t) => isWaitingBelowShare(t, view.tenants)).length : tenantsBelowShare(raw).size;
   const queued = inPool ? pool?.queued ?? view.global_queued : view.global_queued;
   const running = inPool ? pool?.inFlight ?? view.global_in_flight : raw.mode === "shared" ? raw.cluster_in_flight ?? raw.global_in_flight : raw.global_in_flight;
   const gateways = raw.replicas ?? 1;
@@ -221,7 +226,7 @@ function AllPools({ raw, pools, expanded, onExpand, onScope, onOpen, tenantTotal
   const running = raw.mode === "shared" ? raw.cluster_in_flight ?? raw.global_in_flight : raw.global_in_flight;
   const slots = (raw.mode === "shared" ? raw.configured_max_in_flight : undefined) ?? raw.max_in_flight;
   const active = raw.tenants.filter((t) => t.in_flight > 0 || t.queued > 0);
-  const borrowing = active.filter((t) => t.in_flight - t.expected_slots >= 1).length;
+  const borrowing = tenantsAboveShare(raw).size;
   const waitingTenants = raw.tenants.filter((t) => t.queued > 0);
   const busiest = pools.find((p) => p.cap > 0 && p.inFlight > 0);
   const visible = expanded ? pools : pools.slice(0, FIRST_POOLS);
@@ -299,7 +304,9 @@ function GroupsCard({ raw }: { raw: FairshareLiveView }) {
 
 function TenantsNow({ raw, onOpen }: { raw: FairshareLiveView; onOpen: (id: string) => void }) {
   const [all, setAll] = useState(false);
-  const active = raw.tenants.filter((t) => t.in_flight > 0 || t.queued > 0).sort((a, b) => Number(isWaitingBelowShare(b)) - Number(isWaitingBelowShare(a)) || b.in_flight - a.in_flight || b.queued - a.queued);
+  const short = tenantsBelowShare(raw);
+  const isShort = (t: { tenant_id: string }) => short.has(t.tenant_id);
+  const active = raw.tenants.filter((t) => t.in_flight > 0 || t.queued > 0).sort((a, b) => Number(isShort(b)) - Number(isShort(a)) || b.in_flight - a.in_flight || b.queued - a.queued);
   const top = active[0]?.in_flight ?? 0;
   const rows = all ? active : active.slice(0, 8);
   const cols = "grid-cols-[minmax(0,1.2fr)_minmax(0,6rem)_4rem_minmax(0,1.4fr)_4rem_3.5rem_minmax(0,1fr)]";
@@ -313,7 +320,7 @@ function TenantsNow({ raw, onOpen }: { raw: FairshareLiveView; onOpen: (id: stri
             const p = tenantPools(raw, t.tenant_id);
             return (
               <button key={t.tenant_id} type="button" onClick={() => onOpen(t.tenant_id)} className={cn("grid w-full items-center gap-3 border-t border-border px-[18px] py-[9px] text-left text-[13px] hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring", cols)}>
-                <span className="flex min-w-0 items-center gap-2"><span className="truncate">{t.name || "Unnamed tenant"}</span>{isWaitingBelowShare(t) && <Pill inverted>Below share</Pill>}</span>
+                <span className="flex min-w-0 items-center gap-2"><span className="truncate">{t.name || "Unnamed tenant"}</span>{isShort(t) && <Pill inverted>Below share</Pill>}</span>
                 <span className="truncate text-muted-foreground">{t.fairshare_group || "default"}</span>
                 <span className="text-right font-mono text-xs">{t.weight}</span>
                 <span className="flex items-center gap-2.5"><Meter value={t.in_flight} max={top} className="flex-1" /><span className="w-9 text-right font-mono text-xs tabular-nums">{t.in_flight}</span></span>
@@ -331,14 +338,16 @@ function TenantsNow({ raw, onOpen }: { raw: FairshareLiveView; onOpen: (id: stri
 
 function WaitingNow({ raw, onOpen }: { raw: FairshareLiveView; onOpen: (id: string) => void }) {
   const line = nextInLine(raw.tenants);
+  const short = tenantsBelowShare(raw);
+  const isShort = (t: { tenant_id: string }) => short.has(t.tenant_id);
   return (
-    <Panel title="Waiting now" subtitle="Tenants waiting below their fair share first, then everyone else in the order freed slots reach them">
+    <Panel title="Waiting now" subtitle="Tenants waiting below their fair share in a pool first, then everyone else in the order freed slots reach them">
       <ul className="mt-3 pb-2">
-        {[...line].sort((a, b) => Number(isWaitingBelowShare(b)) - Number(isWaitingBelowShare(a))).map((t) => (
+        {[...line].sort((a, b) => Number(isShort(b)) - Number(isShort(a))).map((t) => (
           <li key={t.tenant_id}>
             <button type="button" onClick={() => onOpen(t.tenant_id)} className="grid w-full grid-cols-[minmax(0,1fr)_auto_5rem] items-center gap-3 border-t border-border px-[18px] py-[9px] text-left text-[13px] hover:bg-accent/40">
               <span className="truncate">{t.name || "Unnamed tenant"}</span>
-              {isWaitingBelowShare(t) ? <Pill inverted>Below share</Pill> : <Pill>At or above share</Pill>}
+              {isShort(t) ? <Pill inverted>Below share</Pill> : <Pill>At or above share</Pill>}
               <span className="text-right font-mono text-xs">{t.queued} waiting</span>
             </button>
           </li>
@@ -394,7 +403,7 @@ function PoolView({ view, raw, poolRow, shared, onOpen }: { view: FairshareLiveV
         </ul>
         <p className="px-[18px] pb-4 pt-1 text-xs text-muted-foreground">
           Bars are drawn against the pool&apos;s {formatNumber(cap)} slots.{groupWeights ? ` Fair shares split the pool by group weight (${groupWeights}), then by tenant weight inside each group.` : ""}
-          {raw.replicas && raw.replicas > 1 && shared ? " Queues and shares are the answering gateway's view; slots are counted cluster-wide." : ""}
+          {poolScopeNote(raw, shared)}
         </p>
       </Panel>
 
@@ -419,6 +428,21 @@ function PoolView({ view, raw, poolRow, shared, onOpen }: { view: FairshareLiveV
       )}
     </>
   );
+}
+
+/** Whose rows the pool view shows, when that is not obvious. */
+function poolScopeNote(raw: FairshareLiveView, shared: boolean): string {
+  const n = raw.replicas ?? 1;
+  if (n <= 1) return "";
+  if (countsScope(raw) === "cluster") {
+    const reporting = raw.replicas_reporting ?? n;
+    return reporting < n
+      ? ` Rows count the ${reporting} of ${n} gateways that have reported so far.`
+      : ` Rows count all ${n} gateways.`;
+  }
+  return shared
+    ? " Waiting and fair shares are the answering gateway's own; slots are counted cluster-wide."
+    : " Counts are the answering gateway's own.";
 }
 
 function TenantRow({ row, rows, scale, onOpen }: { row: PoolTenantRow; rows: PoolTenantRow[]; scale: number; onOpen: (id: string) => void }) {

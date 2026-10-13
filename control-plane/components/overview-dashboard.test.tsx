@@ -31,12 +31,12 @@ const window: OverviewWindow = {
 
 const fairshare = { algorithm: "drr", max_in_flight: 16, global_in_flight: 3, global_queued: 0, groups: [], tenants: [], model_in_flight: { alpha: 3 } } as unknown as FairshareLiveView;
 
-function render(health: ModelHealthSummary[]) {
+function render(health: ModelHealthSummary[], view: FairshareLiveView = fairshare) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, refetchInterval: false, staleTime: Infinity } } });
   act(() => {
     root.render(
       <QueryClientProvider client={client}>
-        <OverviewDashboard initialModels={models} initialWindow={window} initialContext={{ audit: [], readiness: null, tenantNames: {} }} initialHealth={health} initialFairshare={fairshare} />
+        <OverviewDashboard initialModels={models} initialWindow={window} initialContext={{ audit: [], readiness: null, tenantNames: {} }} initialHealth={health} initialFairshare={view} />
       </QueryClientProvider>,
     );
   });
@@ -81,6 +81,27 @@ describe("OverviewDashboard", () => {
     render([healthy("a", "alpha"), healthy("b", "beta")]);
     expect(host.textContent).toContain("Needs a newer gateway");
     window.summary = { ...window.summary, detailed: true };
+  });
+
+  it("counts a tenant below share once, by the pool it is short in, with every gateway counted", () => {
+    const row = (o: object) => ({ tenant_id: "t1", name: "research", fairshare_group: "default", weight: 100, served_tokens: 0, share_score: 0, weight_share: 0.5, ...o });
+    const view = {
+      ...fairshare, mode: "shared", scope: "cluster", replicas: 3, replicas_reporting: 3, cluster_in_flight: 16, configured_max_in_flight: 16,
+      global_in_flight: 16, global_queued: 2, replica_in_flight: 3, replica_queued: 0,
+      tenants: [row({ in_flight: 9, queued: 2, expected_slots: 8 }), row({ tenant_id: "t2", name: "ops", in_flight: 7, queued: 0, expected_slots: 4 })],
+      pools: [
+        { model: "alpha", cap: 8, configured_cap: 8, in_flight: 8, cluster_in_flight: 8, queued: 0, borrowed: 0, groups: [], keys: [], tenants: [row({ in_flight: 8, queued: 0, expected_slots: 4 })] },
+        { model: "beta", cap: 8, configured_cap: 8, in_flight: 8, cluster_in_flight: 8, queued: 2, borrowed: 0, groups: [], keys: [], tenants: [row({ in_flight: 1, queued: 2, expected_slots: 4 }), row({ tenant_id: "t2", name: "ops", in_flight: 7, queued: 0, expected_slots: 4 })] },
+      ],
+    } as unknown as FairshareLiveView;
+    render([healthy("a", "alpha"), healthy("b", "beta")], view);
+    const text = host.textContent ?? "";
+    expect(text).toContain("research is waiting below its fair share on beta");
+    expect(text).toContain("2 requests queued while it holds 1 slot against a fair share of 4");
+    expect(text).toContain("Cluster-wide across 3 gateways");
+    expect(text).not.toContain("waiting is this gateway's");
+    const link = [...host.querySelectorAll("a")].find((a) => a.getAttribute("href") === "/fairshare?pool=beta");
+    expect(link?.textContent).toBe("Open the pool");
   });
 
   it("puts a failing model at the top, and Hide for 1 hour tucks it away in this browser", () => {

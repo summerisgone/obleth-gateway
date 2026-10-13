@@ -10,6 +10,7 @@ mod slots;
 
 pub use slots::{
     RedisSlots, SlotKeys, REPLICAS_KEY, SLOT_HELD_PREFIX, SLOT_RELEASE_CHANNEL, SLOT_TOTALS_KEY,
+    SLOT_VIEW_PREFIX,
 };
 
 use std::sync::OnceLock;
@@ -40,6 +41,7 @@ cached_script!(term_usage_add_script, scripts::TERM_USAGE_ADD);
 cached_script!(term_reconcile_script, scripts::TERM_RECONCILE);
 cached_script!(replica_heartbeat_script, scripts::REPLICA_HEARTBEAT);
 cached_script!(replica_deregister_script, scripts::REPLICA_DEREGISTER);
+cached_script!(peer_views_script, scripts::PEER_VIEWS);
 cached_script!(slot_acquire_script, scripts::SLOT_ACQUIRE);
 cached_script!(slot_release_script, scripts::SLOT_RELEASE);
 cached_script!(slot_reconcile_script, scripts::SLOT_RECONCILE);
@@ -228,9 +230,9 @@ impl RedisStore {
             .await
     }
 
-    /// Drop this replica's heartbeat, and free any shared slot it still
-    /// holds, so the survivors grow at their next heartbeat instead of one
-    /// TTL later. Called on clean shutdown.
+    /// Drop this replica's heartbeat and its scheduler view, and free any
+    /// shared slot it still holds, so the survivors grow at their next
+    /// heartbeat instead of one TTL later. Called on clean shutdown.
     pub async fn replica_deregister(&self, instance: &str) -> Result<()> {
         self.replica_deregister_in(&SlotKeys::default(), instance)
             .await
@@ -263,6 +265,7 @@ impl RedisStore {
             .key(&keys.replicas)
             .key(&keys.totals)
             .key(keys.held(instance))
+            .key(keys.view(instance))
             .arg(instance)
             .arg(&keys.channel)
             .invoke_async(&mut conn)
@@ -1844,6 +1847,7 @@ mod tests {
         let mut conn = store.conn.clone();
         let mut all = vec![keys.replicas.clone(), keys.totals.clone()];
         all.extend(instances.iter().map(|i| keys.held(i)));
+        all.extend(instances.iter().map(|i| keys.view(i)));
         let _: () = conn.del(all).await.unwrap();
     }
 
@@ -2704,5 +2708,119 @@ mod tests {
         listener.abort();
         relay.down();
         drop_test_keys(&direct, &keys, &["a", "b"]).await;
+    }
+
+    // ---- cluster view ------------------------------------------------------
+
+    fn one_pool_view(
+        model: &str,
+        in_flight: usize,
+        queued: usize,
+    ) -> obleth_fairshare::ReplicaView {
+        obleth_fairshare::ReplicaView {
+            version: obleth_fairshare::view::VIEW_VERSION,
+            pools: vec![obleth_fairshare::ReplicaPoolView {
+                pool: obleth_fairshare::PoolKey::Model(model.into()).slot_id(),
+                configured_cap: 16,
+                in_flight,
+                queued,
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// A replica reads the views of the other live replicas only: not its
+    /// own, not a dead replica's while its view lingers, and not one that
+    /// deregistered.
+    #[tokio::test]
+    async fn peer_views_are_the_other_live_replicas() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        let ttl = std::time::Duration::from_millis(400);
+        let view_ttl = std::time::Duration::from_secs(30);
+        for i in ["a", "b", "c"] {
+            store.replica_heartbeat_in(&keys, i, ttl).await.unwrap();
+        }
+        for (i, n) in [("a", 1), ("b", 2), ("c", 3)] {
+            store
+                .slot_publish_view(&keys, i, &one_pool_view("m", n, n * 10), view_ttl)
+                .await
+                .unwrap();
+        }
+
+        let peers = store.slot_peer_views(&keys, "a").await.unwrap().unwrap();
+        assert_eq!(peers.live, 3);
+        let seen: Vec<(&str, usize)> = peers
+            .views
+            .iter()
+            .map(|p| (p.instance.as_str(), p.view.pools[0].in_flight))
+            .collect();
+        assert_eq!(seen, vec![("b", 2), ("c", 3)]);
+        assert!(peers.views.iter().all(|p| p.age_ms < 5_000));
+
+        // c deregisters: its view goes with it.
+        store.replica_deregister_in(&keys, "c").await.unwrap();
+        let mut conn = store.conn.clone();
+        let gone: bool = conn.exists(keys.view("c")).await.unwrap();
+        assert!(!gone, "deregistering drops the view");
+
+        // b stops heartbeating: once it is no longer live its view is left
+        // out, though the key has not expired.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        store.replica_heartbeat_in(&keys, "a", ttl).await.unwrap();
+        let peers = store.slot_peer_views(&keys, "a").await.unwrap().unwrap();
+        assert_eq!(peers.live, 1);
+        assert!(peers.views.is_empty(), "{:?}", peers.views);
+        drop_test_keys(&store, &keys, &["a", "b", "c"]).await;
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// Two schedulers on one Redis publish their views on their own, and
+    /// either one's cluster snapshot counts both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateways_publish_views_and_merge_them_through_redis() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        let config = SharedSlotsConfig {
+            view_interval: std::time::Duration::from_millis(50),
+            ..slot_config()
+        };
+        let (a, la) = slot_gateway(&store, &keys, "a", 2, config.clone()).await;
+        let (b, lb) = slot_gateway(&store, &keys, "b", 2, config).await;
+        wait_for_slot_mode(&a, SlotMode::Shared).await;
+        wait_for_slot_mode(&b, SlotMode::Shared).await;
+        let mut permits = vec![admit_in_time(&a, 10).await];
+        for _ in 0..3 {
+            permits.push(admit_in_time(&b, 10).await);
+        }
+        let merged = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(c) = a.cluster_snapshot().await {
+                    let total: usize = c.pools.iter().map(|p| p.in_flight).sum();
+                    if c.replicas_reporting == 2 && total == 4 {
+                        return c;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both gateways' state merged");
+        let pool = merged
+            .pools
+            .iter()
+            .find(|p| p.model == "shared-model")
+            .expect("the pool");
+        assert_eq!((pool.in_flight, pool.cap), (4, 10));
+        assert_eq!(pool.tenants.len(), 4);
+        drop(permits);
+        la.abort();
+        lb.abort();
+        drop_test_keys(&store, &keys, &["a", "b"]).await;
     }
 }

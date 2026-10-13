@@ -1,7 +1,119 @@
-//! Group slot allocation helpers for hierarchical fairshare.
+//! Group slot allocation helpers for hierarchical fairshare, and the share
+//! split every view of a pool reports.
 
 use std::collections::HashMap;
 use std::hash::Hash;
+
+use obleth_config::FairshareAlgorithm;
+use uuid::Uuid;
+
+/// A tenant as [`pool_shares`] sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct ShareTenant<'a> {
+    pub id: Uuid,
+    pub group: &'a str,
+    pub weight: i64,
+    /// Has a request running or waiting in the pool.
+    pub active: bool,
+}
+
+/// A key as [`pool_shares`] sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct ShareKey {
+    pub id: Uuid,
+    pub tenant: Uuid,
+    pub weight: i64,
+    /// Has a request running or waiting in the pool.
+    pub active: bool,
+}
+
+/// Each group's, tenant's and key's share of a pool, 0 to 1. Anything not
+/// active has no share.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PoolShares {
+    pub groups: HashMap<String, f64>,
+    pub tenants: HashMap<Uuid, f64>,
+    pub keys: HashMap<Uuid, f64>,
+}
+
+impl PoolShares {
+    pub fn group(&self, name: &str) -> f64 {
+        self.groups.get(name).copied().unwrap_or(0.0)
+    }
+    pub fn tenant(&self, id: &Uuid) -> f64 {
+        self.tenants.get(id).copied().unwrap_or(0.0)
+    }
+    pub fn key(&self, id: &Uuid) -> f64 {
+        self.keys.get(id).copied().unwrap_or(0.0)
+    }
+}
+
+/// What share of a pool each active group, tenant and key is entitled to
+/// while every one of them is busy, split the way the scheduler splits slots:
+///
+/// - groups (hierarchical): a group's weight over the weights of the groups
+///   with an active tenant;
+/// - tenants: hierarchical, the group's share split across the group's
+///   active tenants by tenant weight; weighted, the tenant's weight over the
+///   weights of every active tenant;
+/// - keys: the tenant's share split across its active keys by key weight.
+///
+/// A replica's own snapshot and the cluster-wide view both use this, so the
+/// two can only differ in which requests they count. Weights below 1 count
+/// as 1; a group missing from `group_weights` weighs 100, the default.
+pub fn pool_shares(
+    algorithm: FairshareAlgorithm,
+    group_weights: &HashMap<String, i64>,
+    tenants: &[ShareTenant<'_>],
+    keys: &[ShareKey],
+) -> PoolShares {
+    let mut shares = PoolShares::default();
+    let group_weight = |g: &str| group_weights.get(g).copied().unwrap_or(100).max(1);
+
+    let mut active_groups: HashMap<&str, i64> = HashMap::new();
+    let mut active_in_group: HashMap<&str, i64> = HashMap::new();
+    let mut active_total: i64 = 0;
+    for t in tenants.iter().filter(|t| t.active) {
+        active_groups
+            .entry(t.group)
+            .or_insert_with(|| group_weight(t.group));
+        *active_in_group.entry(t.group).or_insert(0) += t.weight.max(1);
+        active_total += t.weight.max(1);
+    }
+    let group_total: i64 = active_groups.values().sum();
+    for (name, w) in &active_groups {
+        shares
+            .groups
+            .insert((*name).to_string(), *w as f64 / group_total as f64);
+    }
+
+    for t in tenants.iter().filter(|t| t.active) {
+        let w = t.weight.max(1) as f64;
+        let share = match algorithm {
+            FairshareAlgorithm::Weighted => w / active_total as f64,
+            FairshareAlgorithm::Hierarchical => {
+                let in_group = active_in_group.get(t.group).copied().unwrap_or(1).max(1);
+                shares.group(t.group) * w / in_group as f64
+            }
+        };
+        shares.tenants.insert(t.id, share);
+    }
+
+    let mut active_key_weight: HashMap<Uuid, i64> = HashMap::new();
+    for k in keys.iter().filter(|k| k.active) {
+        *active_key_weight.entry(k.tenant).or_insert(0) += k.weight.max(1);
+    }
+    for k in keys.iter().filter(|k| k.active) {
+        let total = active_key_weight
+            .get(&k.tenant)
+            .copied()
+            .unwrap_or(1)
+            .max(1);
+        let share = shares.tenant(&k.tenant) * k.weight.max(1) as f64 / total as f64;
+        shares.keys.insert(k.id, share);
+    }
+    shares
+}
 
 /// Integer slot caps per group that sum to at most `max`.
 pub fn group_slot_caps(max: usize, groups: &[(String, i64)]) -> HashMap<String, usize> {
@@ -93,6 +205,145 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn weights(groups: &[(&str, i64)]) -> HashMap<String, i64> {
+        groups.iter().map(|(n, w)| (n.to_string(), *w)).collect()
+    }
+
+    /// Hierarchical: groups split by weight, then tenants inside a group;
+    /// an idle tenant takes nothing and dilutes nobody.
+    #[test]
+    fn pool_shares_split_groups_then_tenants_over_the_active_set() {
+        let (a, b, c, idle) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let tenants = [
+            ShareTenant {
+                id: a,
+                group: "research",
+                weight: 300,
+                active: true,
+            },
+            ShareTenant {
+                id: b,
+                group: "research",
+                weight: 100,
+                active: true,
+            },
+            ShareTenant {
+                id: c,
+                group: "teaching",
+                weight: 100,
+                active: true,
+            },
+            ShareTenant {
+                id: idle,
+                group: "research",
+                weight: 1000,
+                active: false,
+            },
+        ];
+        let shares = pool_shares(
+            FairshareAlgorithm::Hierarchical,
+            &weights(&[("research", 300), ("teaching", 100)]),
+            &tenants,
+            &[],
+        );
+        assert!((shares.group("research") - 0.75).abs() < 1e-12);
+        assert!((shares.group("teaching") - 0.25).abs() < 1e-12);
+        assert!((shares.tenant(&a) - 0.75 * 0.75).abs() < 1e-12);
+        assert!((shares.tenant(&b) - 0.75 * 0.25).abs() < 1e-12);
+        assert!((shares.tenant(&c) - 0.25).abs() < 1e-12);
+        assert_eq!(shares.tenant(&idle), 0.0);
+        let total: f64 = shares.tenants.values().sum();
+        assert!((total - 1.0).abs() < 1e-12, "active shares add to the pool");
+    }
+
+    #[test]
+    fn pool_shares_weighted_ignores_groups_for_tenants() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let tenants = [
+            ShareTenant {
+                id: a,
+                group: "x",
+                weight: 300,
+                active: true,
+            },
+            ShareTenant {
+                id: b,
+                group: "y",
+                weight: 100,
+                active: true,
+            },
+        ];
+        let shares = pool_shares(FairshareAlgorithm::Weighted, &weights(&[]), &tenants, &[]);
+        assert!((shares.tenant(&a) - 0.75).abs() < 1e-12);
+        assert!((shares.tenant(&b) - 0.25).abs() < 1e-12);
+        // Missing group weights count as the default 100.
+        assert!((shares.group("x") - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pool_shares_split_a_tenant_across_its_active_keys() {
+        let t = Uuid::new_v4();
+        let (k1, k2, k3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let tenants = [ShareTenant {
+            id: t,
+            group: "default",
+            weight: 100,
+            active: true,
+        }];
+        let keys = [
+            ShareKey {
+                id: k1,
+                tenant: t,
+                weight: 100,
+                active: true,
+            },
+            ShareKey {
+                id: k2,
+                tenant: t,
+                weight: 300,
+                active: true,
+            },
+            ShareKey {
+                id: k3,
+                tenant: t,
+                weight: 500,
+                active: false,
+            },
+        ];
+        let shares = pool_shares(
+            FairshareAlgorithm::Hierarchical,
+            &weights(&[]),
+            &tenants,
+            &keys,
+        );
+        assert!((shares.key(&k1) - 0.25).abs() < 1e-12);
+        assert!((shares.key(&k2) - 0.75).abs() < 1e-12);
+        assert_eq!(shares.key(&k3), 0.0);
+    }
+
+    #[test]
+    fn pool_shares_of_an_idle_pool_are_empty() {
+        let t = Uuid::new_v4();
+        let tenants = [ShareTenant {
+            id: t,
+            group: "default",
+            weight: 100,
+            active: false,
+        }];
+        let shares = pool_shares(
+            FairshareAlgorithm::Hierarchical,
+            &weights(&[]),
+            &tenants,
+            &[],
+        );
+        assert_eq!(shares, PoolShares::default());
+    }
 
     /// The obench fixture's group weights across the capacity sweep. Largest
     /// remainder must allocate every slot at each level: an unallocated

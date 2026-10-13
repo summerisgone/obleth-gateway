@@ -29,6 +29,7 @@ spec:
   template:
     metadata: { labels: { app: {{ .Release.Name }}-postgres } }
     spec:
+      {{- include "obleth.datastorePlacement" . | nindent 6 }}
       containers:
         - name: postgres
           image: {{ .Values.postgres.image }}
@@ -103,6 +104,7 @@ spec:
         # Secret changes, in step with the gateway.
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
+      {{- include "obleth.datastorePlacement" . | nindent 6 }}
       containers:
         - name: redis
           image: {{ .Values.redis.image }}
@@ -195,6 +197,7 @@ spec:
         # ClickHouse reads its system log settings at startup.
         checksum/config: {{ include "obleth.clickhouseConfig" . | sha256sum }}
     spec:
+      {{- include "obleth.datastorePlacement" . | nindent 6 }}
       containers:
         - name: clickhouse
           image: {{ .Values.clickhouse.image }}

@@ -19,6 +19,8 @@ import type {
   GuardrailsPolicy,
   ModelImportReport,
   ModelManifest,
+  ModelFamilyWrite,
+  ModelReasoning,
   ModelRoute,
   SetModelStatus,
   ModelVariantInput,
@@ -44,6 +46,7 @@ import type { DeployForm } from "@/lib/deploy-form";
 import { lookupHfModel, type HfModel } from "@/lib/hf-model";
 import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
 import { blockedHostReason } from "@/lib/ssrf";
+import { familyWrite, MAX_FAMILY_DESCRIPTION_CHARS, reasoningProblem } from "@/lib/models-model";
 import { tagsInclude } from "@/lib/utils";
 
 export type ActionResult =
@@ -1271,9 +1274,9 @@ async function loadModel(id: string): Promise<ModelRoute | undefined> {
 // ----------------------------------------------------------------------------
 
 /** The parts of a model's settings form, each saved through its own endpoint. */
-export type ModelSettingsSection = "model" | "cache" | "reliability" | "health" | "capacity" | "knowledge";
+export type ModelSettingsSection = "model" | "cache" | "reliability" | "health" | "capacity" | "knowledge" | "listing";
 
-const MODEL_SETTINGS_SECTIONS: readonly ModelSettingsSection[] = ["model", "cache", "reliability", "health", "capacity", "knowledge"];
+const MODEL_SETTINGS_SECTIONS: readonly ModelSettingsSection[] = ["model", "cache", "reliability", "health", "capacity", "knowledge", "listing"];
 
 const SECTION_LABELS: Record<ModelSettingsSection, string> = {
   model: "Model settings",
@@ -1282,6 +1285,7 @@ const SECTION_LABELS: Record<ModelSettingsSection, string> = {
   health: "Health checks",
   capacity: "Capacity",
   knowledge: "Knowledge collections",
+  listing: "Listing",
 };
 
 export type ModelSettingsResult =
@@ -1403,6 +1407,8 @@ export async function saveModelSettingsAction(formData: FormData): Promise<Model
           refresh();
           return { ok: false, error: `${SECTION_LABELS.capacity}: ${error}`, saved };
         }
+      } else if (section === "listing") {
+        await obleth.setModelListing(id, formData.get("listed") === "on", audit);
       } else if (section === "knowledge" && formData.has("knowledge_loaded")) {
         await obleth.setModelCollections(id, formData.getAll("knowledge_collection").map(String), audit);
       }
@@ -1493,6 +1499,54 @@ export async function setModelStatusAction(id: string, body: SetModelStatus): Pr
   revalidatePath("/models");
   revalidatePath("/");
   return { ok: true };
+}
+
+/**
+ * Set how a model takes reasoning effort, from the Reasoning section: pass
+ * through, translate the four levels, or remove the caller's effort. The map
+ * is written whole; the gateway checks it again and answers 400 with a
+ * sentence when it can't take it.
+ */
+export async function setModelReasoningAction(id: string, body: ModelReasoning): Promise<ActionResult> {
+  const session = await requireAdmin();
+  const problem = reasoningProblem(body);
+  if (problem) return { ok: false, error: problem };
+  try {
+    await obleth.setModelReasoning(id, body, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  updateTag(CACHE_TAGS.models);
+  revalidatePath("/models");
+  return { ok: true };
+}
+
+/**
+ * Create a model family (no `id`) or replace one whole. The gateway checks
+ * the name against every model and family and that each level names a chat
+ * model, and stores the members by their own names.
+ */
+export async function saveModelFamilyAction(id: string | null, body: ModelFamilyWrite): Promise<ActionResult> {
+  const session = await requireAdmin();
+  const family = familyWrite({ ...body, description: body.description ?? "" });
+  if (!family.name) return { ok: false, error: "Give the family a name. Callers send it as the model." };
+  if ((family.description ?? "").length > MAX_FAMILY_DESCRIPTION_CHARS) return { ok: false, error: `Keep the description to ${MAX_FAMILY_DESCRIPTION_CHARS} characters.` };
+  try {
+    if (id) await obleth.updateModelFamily(id, family, { auditActor: session.email });
+    else await obleth.createModelFamily(family, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/models");
+  return { ok: true };
+}
+
+export async function deleteModelFamilyAction(id: string): Promise<ActionResult> {
+  const session = await requireAdmin();
+  return deleteAndRevalidate(
+    () => obleth.deleteModelFamily(id, { auditActor: session.email }),
+    () => revalidatePath("/models"),
+  );
 }
 
 export type ActivateModelResult =

@@ -206,6 +206,9 @@ async fn handle(
         device_id,
         end_user: end_user.clone().unwrap_or_default(),
         model_variant: String::new(),
+        reasoning_effort: String::new(),
+        reasoning_effort_requested: String::new(),
+        model_family: String::new(),
     };
 
     // ---- tenant input guardrails ----
@@ -1179,6 +1182,7 @@ mod pipeline_tests {
             model_cache: Cache::builder().build(),
             mcp_cache: Cache::builder().build(),
             model_registry: crate::router::ModelRegistry::new(),
+            families: crate::reasoning::FamilyRegistry::new(),
             classifier: crate::classifier::Classifier::new(Default::default()),
             output_stats: Default::default(),
             boons: crate::boons::BoonEngine::new(Default::default()),

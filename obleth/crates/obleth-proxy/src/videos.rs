@@ -1174,6 +1174,7 @@ mod pipeline_tests {
             model_cache: Cache::builder().build(),
             mcp_cache: Cache::builder().build(),
             model_registry: crate::router::ModelRegistry::new(),
+            families: crate::reasoning::FamilyRegistry::new(),
             classifier: crate::classifier::Classifier::new(Default::default()),
             output_stats: Default::default(),
             boons: crate::boons::BoonEngine::new(Default::default()),

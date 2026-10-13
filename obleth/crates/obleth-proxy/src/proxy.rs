@@ -112,6 +112,9 @@ pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Re
     // caller cannot stamp a direct chat call as Responses traffic and pollute
     // the adoption metric. The shim re-inserts it after this strip.
     req.headers_mut().remove(crate::responses::SURFACE_HEADER);
+    // Likewise the effort the Responses and Messages shims carry over: a
+    // caller sets effort in the body, never with the gateway's own header.
+    req.headers_mut().remove(crate::reasoning::EFFORT_HEADER);
     if req.method() == Method::POST {
         if let Some(canonical) = canonical_post_path(req.uri().path()) {
             let pq = match req.uri().query() {
@@ -245,6 +248,13 @@ async fn responses_shim(
     parts.headers.remove(header::CONTENT_LENGTH);
     if let Ok(v) = header::HeaderValue::from_str("responses") {
         parts.headers.insert(crate::responses::SURFACE_HEADER, v);
+    }
+    // `reasoning.effort` has no chat spelling the translation keeps; carry it
+    // for the pipeline to translate per model.
+    if let Some(v) =
+        crate::reasoning::header_value(obleth_config::reasoning::responses_effort(&incoming))
+    {
+        parts.headers.insert(crate::reasoning::EFFORT_HEADER, v);
     }
     let chat_req = Request::from_parts(parts, Body::from(chat_bytes));
 
@@ -532,7 +542,7 @@ async fn messages_front(
     req: Request<Body>,
     count_tokens: bool,
 ) -> Result<MessagesFront, Response<Body>> {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     // Authenticate before buffering (same reasoning as `responses_shim`).
     let Some(secret) = bearer(&parts.headers) else {
         return Err(anthropic_error(
@@ -586,6 +596,7 @@ async fn messages_front(
         Ok(v) => v,
         Err(e) => return Err(anthropic_error(StatusCode::BAD_REQUEST, &e.message, None)),
     };
+    let effort = obleth_config::reasoning::messages_effort(&incoming);
     let served = match resolve_messages_model(state, &requested_model).await {
         Some(name) => name,
         None => {
@@ -607,7 +618,7 @@ async fn messages_front(
     if !count_tokens {
         let text_est = state.tokenizer.estimate_request(&chat_body).input_tokens as u64;
         let input_est = messages_input_estimate(&chat_body, text_est);
-        let window = context_window_for(state, &served).await;
+        let window = context_window_for(state, &served, effort.clone().ok().flatten()).await;
         let requested_max_tokens = chat_body
             .get("max_tokens")
             .and_then(serde_json::Value::as_u64)
@@ -635,6 +646,12 @@ async fn messages_front(
         }
     }
     chat_body["model"] = serde_json::Value::String(served);
+    // `thinking` and `output_config.effort` have no chat spelling the
+    // translation keeps; carry the level for the pipeline to translate per
+    // model.
+    if let Some(v) = crate::reasoning::header_value(effort) {
+        parts.headers.insert(crate::reasoning::EFFORT_HEADER, v);
+    }
     Ok(MessagesFront {
         parts,
         chat_body,
@@ -651,7 +668,16 @@ async fn messages_front(
 /// client's `max_tokens` cannot doom every candidate before routing runs).
 /// `None` when no window is known — the caller leaves `max_tokens` alone
 /// rather than clamp on a guess.
-async fn context_window_for(state: &AppState, served: &str) -> Option<u64> {
+async fn context_window_for(
+    state: &AppState,
+    served: &str,
+    effort: Option<obleth_config::ReasoningLevel>,
+) -> Option<u64> {
+    // A family is served by the member its level picks.
+    if let Some(family) = state.families.get(served) {
+        let (_, member) = family.member_for(effort);
+        return Box::pin(context_window_for(state, member, effort)).await;
+    }
     if served == crate::router::AUTO_MODEL_NAME {
         return state
             .model_registry
@@ -777,6 +803,7 @@ fn clamp_max_tokens(
 async fn resolve_messages_model(state: &AppState, requested: &str) -> Option<String> {
     if requested == crate::router::AUTO_MODEL_NAME
         || resolve_model(state, requested).await.is_some()
+        || state.families.get(requested).is_some()
     {
         return Some(requested.to_string());
     }
@@ -916,10 +943,22 @@ async fn proxy_handler_inner(
 ) -> Response<Body> {
     let mut variant: Option<String> = None;
     let mut lifecycle: Option<crate::lifecycle::Notice> = None;
-    let resp = run_pipeline(state, req, request_id, &mut variant, &mut lifecycle).await;
+    let mut reasoning: Option<crate::reasoning::Note> = None;
+    let resp = run_pipeline(
+        state,
+        req,
+        request_id,
+        &mut variant,
+        &mut lifecycle,
+        &mut reasoning,
+    )
+    .await;
     let mut resp = with_variant_header(resp, variant.as_deref());
     if let Some(notice) = &lifecycle {
         crate::lifecycle::apply_headers(&mut resp, notice);
+    }
+    if let Some(note) = &reasoning {
+        note.apply_headers(&mut resp);
     }
     resp
 }
@@ -969,6 +1008,7 @@ async fn run_pipeline(
     request_id: Uuid,
     served_variant: &mut Option<String>,
     lifecycle_notice: &mut Option<crate::lifecycle::Notice>,
+    reasoning_note: &mut Option<crate::reasoning::Note>,
 ) -> Response<Body> {
     let request_start = Instant::now();
     let proxy_start_ms = crate::tracer::now_ms();
@@ -1097,6 +1137,13 @@ async fn run_pipeline(
             .unwrap_or("unknown")
             .to_string()
     };
+    // The effort the caller asked for, read before the name resolves: a
+    // family name needs it to pick the model that answers.
+    let requested_effort = crate::reasoning::Requested::read(&headers, &json);
+    // Set when the name was a family's: the level the member serves at, and
+    // the family, which the ledger records apart from variants.
+    let mut family_level: Option<obleth_config::ReasoningLevel> = None;
+    let mut family_name: Option<String> = None;
 
     // ---- model listing (OpenAI `GET /v1/models`) ----
     // Answer the plain list call from the gateway's own registry so every
@@ -1169,6 +1216,9 @@ async fn run_pipeline(
         end_user: end_user.clone().unwrap_or_default(),
         // Set below once the model name resolves.
         model_variant: String::new(),
+        reasoning_effort: String::new(),
+        reasoning_effort_requested: String::new(),
+        model_family: String::new(),
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -1330,7 +1380,29 @@ async fn run_pipeline(
                 let (r, variant) = serve_as(r, &model);
                 (Some(r), variant)
             }
-            None => (None, None),
+            // A family answers with the member its level picks, recorded
+            // under the family's name the way a variant is.
+            None => match state.families.get(&model) {
+                Some(family) => {
+                    let (level, member) =
+                        match crate::reasoning::family_member(&family, &requested_effort) {
+                            Ok(picked) => picked,
+                            Err(msg) => return error_json(StatusCode::BAD_REQUEST, &msg),
+                        };
+                    let Some(r) = resolve_model(&state, &member).await else {
+                        return error_json(
+                            StatusCode::NOT_FOUND,
+                            &format!(
+                                "model family '{model}' sends `{level}` to '{member}', which is not registered"
+                            ),
+                        );
+                    };
+                    family_level = Some(level);
+                    family_name = Some(family.name.clone());
+                    (Some(r), Some(family.name.clone()))
+                }
+                None => (None, None),
+            },
         };
         // An alias or a variant resolves to the same route as the canonical
         // name, so adopt the canonical name for everything downstream:
@@ -1368,7 +1440,7 @@ async fn run_pipeline(
             crate::lifecycle::Gate::Refuse(resp) => {
                 // Recorded, so the operator can see who still calls the model
                 // and tell them before the 410s do.
-                req_meta.model_variant = variant.clone().unwrap_or_default();
+                record_called_name(&mut req_meta, variant.as_deref(), family_name.as_deref());
                 let elapsed = request_start.elapsed().as_millis() as u32;
                 finalize(
                     &state,
@@ -1398,7 +1470,7 @@ async fn run_pipeline(
     }
     // The name the client used, for its usage row and response headers. The
     // ledger's `model` stays the parent's.
-    req_meta.model_variant = variant.clone().unwrap_or_default();
+    record_called_name(&mut req_meta, variant.as_deref(), family_name.as_deref());
     served_variant.clone_from(&variant);
 
     if requires_registered_model(&path) {
@@ -1453,6 +1525,53 @@ async fn run_pipeline(
             }
         }
     }
+
+    // ---- reasoning effort ----
+    // The caller's level becomes the fields the served model's server
+    // understands (or is removed, for a model without effort control). Runs
+    // before boons and the cache so both see the body the model gets. A
+    // family's level was fixed when the name resolved.
+    let mut effort_served: Option<obleth_config::ReasoningLevel> = None;
+    if is_chat_path(&path) {
+        if let Some(r) = route.as_ref() {
+            let level = match family_level {
+                Some(level) => Some(level),
+                None => match requested_effort.level() {
+                    Ok(level) => level,
+                    Err(_) if r.reasoning.is_passthrough() => None,
+                    Err(msg) => return error_json(StatusCode::BAD_REQUEST, &msg),
+                },
+            };
+            let plan = r.reasoning.plan(level);
+            plan.apply_to(&mut json);
+            if let obleth_config::ReasoningPlan::Apply { served, .. } = &plan {
+                effort_served = Some(*served);
+            }
+            *reasoning_note = match family_level {
+                // Through a family the level picked the model, so it was
+                // served even when the member has no effort control of its
+                // own; the member's map can still serve it as another.
+                Some(level) => Some(crate::reasoning::Note::for_family(
+                    level,
+                    requested_effort.level().ok().flatten(),
+                    &plan,
+                )),
+                None => crate::reasoning::Note::of(&plan),
+            };
+            req_meta.reasoning_effort = reasoning_note
+                .as_ref()
+                .map(crate::reasoning::Note::served_label)
+                .unwrap_or_default()
+                .to_string();
+        }
+    }
+    // What the caller asked for is logged whatever the model does with it,
+    // so a pass-through request still shows the level it carried.
+    req_meta.reasoning_effort_requested = match &requested_effort {
+        crate::reasoning::Requested::Nothing => String::new(),
+        crate::reasoning::Requested::Level(level) => level.as_str().to_string(),
+        crate::reasoning::Requested::Unknown(raw) => raw.clone(),
+    };
 
     // ---- model boons (gateway-granted capabilities) ----
     // e.g. the vision boon rewrites image content into text descriptions for
@@ -1607,12 +1726,14 @@ async fn run_pipeline(
     // never hit and would only cost a Redis round-trip.
     // Keyed by the variant's name when the client used one: its boons can
     // change the answer, so it must not share entries with its parent.
+    // A translated effort is keyed too: a Responses or Messages caller's
+    // level travels outside the body, and two levels must not share answers.
+    let cache_name = match effort_served {
+        Some(level) => format!("{}@{level}", variant.as_deref().unwrap_or(&model)),
+        None => variant.as_deref().unwrap_or(&model).to_string(),
+    };
     let cache_key = (cache_enabled && cache_ttl > 0).then(|| {
-        obleth_config::cache_key(
-            &resolved.tenant_id.to_string(),
-            variant.as_deref().unwrap_or(&model),
-            &body_bytes,
-        )
+        obleth_config::cache_key(&resolved.tenant_id.to_string(), &cache_name, &body_bytes)
     });
     if let Some(ck) = &cache_key {
         let cache_start = crate::tracer::now_ms();
@@ -4262,14 +4383,102 @@ fn maybe_alert_key_budget(
 /// `/model/info`: listing a model the caller would be refused advertises a 403.
 fn models_list_response(state: &AppState, resolved: &ResolvedKey) -> Response<Body> {
     let candidates = state.model_registry.load();
-    (
-        StatusCode::OK,
-        axum::Json(registry_models_list(
-            &candidates,
-            allowed_models_for(resolved),
-        )),
-    )
-        .into_response()
+    let allowed = allowed_models_for(resolved);
+    let mut list = registry_models_list(&candidates, allowed);
+    let families = family_entries(&state.families.all(), &candidates, allowed);
+    if let Some(data) = list["data"].as_array_mut() {
+        data.extend(families);
+        data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    }
+    (StatusCode::OK, axum::Json(list)).into_response()
+}
+
+/// Discovery entries for model families: each family `allowed` lets the
+/// caller see (by its own name, or because every member is allowed) whose
+/// default member is listed, so a family never advertises a name that
+/// answers 404 or 410 by default.
+fn family_entries(
+    families: &[std::sync::Arc<obleth_config::ModelFamily>],
+    candidates: &[obleth_config::routing::Candidate],
+    allowed: Option<&[String]>,
+) -> Vec<serde_json::Value> {
+    let now = chrono::Utc::now();
+    families
+        .iter()
+        .filter(|f| family_visible(f, allowed))
+        .filter_map(|f| {
+            let default_member = f.members.get(f.default_level);
+            let member = candidates.iter().find(|c| {
+                c.model.model_name == default_member
+                    && c.model.enabled
+                    && c.model.lifecycle.status_at(now).listed()
+            })?;
+            Some(family_entry(f, Some(&member.model)))
+        })
+        .collect()
+}
+
+/// Whether a caller limited to `allowed` may see a family: by its own name,
+/// or because every member is allowed.
+fn family_visible(family: &obleth_config::ModelFamily, allowed: Option<&[String]>) -> bool {
+    model_visible(allowed, &family.name)
+        || family
+            .members
+            .distinct()
+            .iter()
+            .all(|m| model_visible(allowed, m))
+}
+
+/// One family's discovery entry: which model answers at each level, and the
+/// level a request that names none gets. The catalog facts (context window,
+/// prices, capabilities) are the default member's, which serves a request
+/// that names no level; `description` falls back to it too.
+fn family_entry(
+    family: &obleth_config::ModelFamily,
+    default_member: Option<&ResolvedModel>,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "id": family.name,
+        "object": "model",
+        "owned_by": "obleth",
+        "model_type": obleth_config::DEFAULT_MODEL_TYPE,
+        "mode": obleth_config::DEFAULT_MODEL_TYPE,
+        "description": family.description,
+        "family": {
+            "default_level": family.default_level,
+            "members": family.members,
+        },
+    });
+    if let (Some(member), Some(obj)) = (default_member, entry.as_object_mut()) {
+        if family.description.is_empty() {
+            obj.remove("description");
+        }
+        ModelDetails::of(member).extend(obj);
+    }
+    entry
+}
+
+/// The `reasoning` a discovery entry carries: nothing for a model that
+/// passes effort through; `unsupported`; or, for a mapped model, the level
+/// each of the four is served at and the level a request that names none
+/// gets.
+fn reasoning_fields(reasoning: &obleth_config::ModelReasoning) -> Option<serde_json::Value> {
+    match reasoning.mode {
+        obleth_config::ReasoningMode::Passthrough => None,
+        obleth_config::ReasoningMode::Unsupported => {
+            Some(serde_json::json!({ "mode": "unsupported" }))
+        }
+        obleth_config::ReasoningMode::Mapped => {
+            let mut out = serde_json::json!({
+                "mode": "mapped",
+                "levels": reasoning.served_levels().unwrap_or_default(),
+            });
+            if let Some(level) = reasoning.default_level {
+                out["default_level"] = serde_json::json!(level);
+            }
+            Some(out)
+        }
+    }
 }
 
 /// The model allowlist that bounds what a caller is shown, or `None` when it
@@ -4309,7 +4518,8 @@ fn registry_models_list(
 ) -> serde_json::Value {
     let mut data: Vec<serde_json::Value> = candidates
         .iter()
-        .filter(|c| c.model.enabled && is_listed_model_type(&c.model.model_type))
+        // An unlisted model (and its variants) is served by name only.
+        .filter(|c| c.model.enabled && c.model.listed && is_listed_model_type(&c.model.model_type))
         .flat_map(|c| {
             std::iter::once(ModelFacts::of(&c.model)).chain(
                 c.model
@@ -4345,6 +4555,12 @@ fn model_entry(facts: &ModelFacts) -> serde_json::Value {
         obj.insert("variant_of".into(), v.parent.clone().into());
         obj.insert("description".into(), v.description.clone().into());
         obj.insert("boons".into(), v.boons.clone().into());
+    }
+    if let (Some(r), Some(obj)) = (reasoning_fields(&facts.reasoning), entry.as_object_mut()) {
+        obj.insert("reasoning".into(), r);
+    }
+    if let Some(obj) = entry.as_object_mut() {
+        facts.details.extend(obj);
     }
     // Only a model on its way out says anything about its lifecycle, so an
     // active model's entry is unchanged.
@@ -4393,6 +4609,77 @@ struct ModelFacts {
     /// status it gives.
     lifecycle: obleth_config::ModelLifecycle,
     status: obleth_config::ModelStatus,
+    /// How the model takes reasoning effort (a variant's is its model's).
+    reasoning: obleth_config::ModelReasoning,
+    /// What a catalog shows about the model (a variant's is its model's).
+    details: ModelDetails,
+}
+
+/// The facts a model catalog needs to describe a model without a second
+/// call: what it is for, how much it reads, what it costs, what it can do.
+/// Flattened into every discovery entry under the conventional `/model/info`
+/// key names.
+#[derive(Debug, Clone, PartialEq)]
+struct ModelDetails {
+    description: String,
+    context_window: i64,
+    input_cost_per_token: f64,
+    output_cost_per_token: f64,
+    supports_function_calling: bool,
+    supports_tool_choice: bool,
+    supports_response_schema: bool,
+    supports_system_messages: bool,
+    supports_vision: bool,
+}
+
+impl ModelDetails {
+    fn of(model: &ResolvedModel) -> Self {
+        ModelDetails {
+            description: model.description.clone(),
+            context_window: model.context_window,
+            input_cost_per_token: model.input_cost_per_token,
+            output_cost_per_token: model.output_cost_per_token,
+            supports_function_calling: model.supports_function_calling,
+            supports_tool_choice: model.supports_tool_choice,
+            supports_response_schema: model.supports_response_schema,
+            supports_system_messages: model.supports_system_messages,
+            supports_vision: model.supports_vision,
+        }
+    }
+
+    /// Add these facts to a discovery entry. `description` is left to an
+    /// entry that already set its own (a variant's, a family's).
+    fn extend(&self, obj: &mut serde_json::Map<String, serde_json::Value>) {
+        obj.entry("description")
+            .or_insert_with(|| self.description.clone().into());
+        obj.insert("context_window".into(), self.context_window.into());
+        obj.insert("max_input_tokens".into(), self.context_window.into());
+        obj.insert(
+            "input_cost_per_token".into(),
+            self.input_cost_per_token.into(),
+        );
+        obj.insert(
+            "output_cost_per_token".into(),
+            self.output_cost_per_token.into(),
+        );
+        obj.insert(
+            "supports_function_calling".into(),
+            self.supports_function_calling.into(),
+        );
+        obj.insert(
+            "supports_tool_choice".into(),
+            self.supports_tool_choice.into(),
+        );
+        obj.insert(
+            "supports_response_schema".into(),
+            self.supports_response_schema.into(),
+        );
+        obj.insert(
+            "supports_system_messages".into(),
+            self.supports_system_messages.into(),
+        );
+        obj.insert("supports_vision".into(), self.supports_vision.into());
+    }
 }
 
 /// The variant-only part of a discovery entry.
@@ -4416,6 +4703,8 @@ impl ModelFacts {
             tags: model.tags.clone(),
             variant: None,
             lifecycle: model.lifecycle.clone(),
+            reasoning: model.reasoning.clone(),
+            details: ModelDetails::of(model),
             status: model.lifecycle.status_at(chrono::Utc::now()),
         }
     }
@@ -4549,7 +4838,17 @@ fn registered_model_entry(
         return None;
     }
     let candidates = state.model_registry.load();
-    let facts = model_facts_index(&candidates).get(id)?.clone();
+    let Some(facts) = model_facts_index(&candidates).get(id).cloned() else {
+        let family = state.families.get(id)?;
+        if !family_visible(&family, allowed) {
+            return Some(Err(()));
+        }
+        let member = candidates
+            .iter()
+            .find(|c| c.model.model_name == family.members.get(family.default_level))
+            .map(|c| &c.model);
+        return Some(Ok(family_entry(&family, member)));
+    };
     if !facts.answers_by_id(allowed) {
         return Some(Err(()));
     }
@@ -4601,7 +4900,7 @@ fn registry_model_info(
     let now = chrono::Utc::now();
     candidates
         .iter()
-        .filter(|c| c.model.enabled && is_listed_model_type(&c.model.model_type))
+        .filter(|c| c.model.enabled && c.model.listed && is_listed_model_type(&c.model.model_type))
         .filter(|c| model_visible(allowed, &c.model.model_name))
         .filter(|c| c.model.lifecycle.status_at(now).listed())
         .map(|c| model_info_entry(&c.model, c.healthy))
@@ -4652,6 +4951,9 @@ fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
             "status": status.as_str(),
         },
     });
+    if let Some(r) = reasoning_fields(&model.reasoning) {
+        entry["model_info"]["reasoning"] = r;
+    }
     if status != obleth_config::ModelStatus::Active {
         if let Some(info) = entry["model_info"].as_object_mut() {
             let mut fields = lifecycle_fields(status, &model.lifecycle);
@@ -5295,6 +5597,26 @@ pub(crate) struct RequestMeta {
     /// The variant name the client called the model by, else empty. The
     /// ledger's `model` is the parent's either way.
     pub(crate) model_variant: String,
+    /// The reasoning effort served (see `UsageRecord::reasoning_effort`).
+    pub(crate) reasoning_effort: String,
+    /// The reasoning effort the caller asked for, or empty.
+    pub(crate) reasoning_effort_requested: String,
+    /// The model family the client called by name, else empty.
+    pub(crate) model_family: String,
+}
+
+/// Record the name the client called the model by: a family's goes in
+/// `model_family` (the family name rides the variant slot through the
+/// pipeline, for the allowlist, the cache and the response header), a real
+/// variant's in `model_variant`.
+fn record_called_name(meta: &mut RequestMeta, variant: Option<&str>, family: Option<&str>) {
+    match family {
+        Some(f) => {
+            meta.model_family = f.to_string();
+            meta.model_variant.clear();
+        }
+        None => meta.model_variant = variant.unwrap_or_default().to_string(),
+    }
 }
 
 /// Classify a request by its OpenAI-style path suffix. Matching the suffix (not
@@ -5637,6 +5959,9 @@ pub(crate) fn finalize(
         // The client request's own row; helper rows carry its id instead.
         parent_request_id: Uuid::nil(),
         model_variant: meta.model_variant.clone(),
+        reasoning_effort: meta.reasoning_effort.clone(),
+        reasoning_effort_requested: meta.reasoning_effort_requested.clone(),
+        model_family: meta.model_family.clone(),
     });
 }
 
@@ -6526,6 +6851,75 @@ mod tests {
     }
 
     #[test]
+    fn unlisted_models_are_left_out_of_the_listings_but_answer_by_id() {
+        use super::{family_entries, model_facts_index, registry_model_info, registry_models_list};
+        let mut instruct = candidate(
+            "acme-instruct",
+            "acme-i",
+            "chat",
+            "fp8",
+            &["acme-instruct-2507"],
+            &[],
+        );
+        instruct.model.listed = false;
+        let mut think = candidate("acme-think", "acme-t", "chat", "fp8", &[], &[]);
+        think.model.listed = false;
+        let other = candidate("gemma4-31b-it", "gemma", "chat", "bf16", &[], &[]);
+        let candidates = vec![instruct, think, other];
+
+        let list = registry_models_list(&candidates, None);
+        let ids: Vec<&str> = list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["gemma4-31b-it"]);
+        let info = registry_model_info(&candidates, None);
+        assert_eq!(info.len(), 1);
+        // Still a model the caller can ask about, by any of its names.
+        let index = model_facts_index(&candidates);
+        for id in ["acme-instruct", "acme-instruct-2507", "acme-think"] {
+            assert!(index[id].answers_by_id(None), "{id}");
+        }
+
+        // A family standing for unlisted members is listed itself.
+        let family = std::sync::Arc::new(obleth_config::ModelFamily {
+            id: uuid::Uuid::nil(),
+            name: "acme".into(),
+            description: String::new(),
+            default_level: obleth_config::ReasoningLevel::None,
+            members: obleth_config::FamilyMembers {
+                none: "acme-instruct".into(),
+                low: "acme-think".into(),
+                medium: "acme-think".into(),
+                high: "acme-think".into(),
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        });
+        let entries = family_entries(&[family], &candidates, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], "acme");
+        assert_eq!(entries[0]["family"]["members"]["high"], "acme-think");
+        // A catalog can describe the family from its entry alone: the facts
+        // are the default member's.
+        assert_eq!(
+            entries[0]["context_window"],
+            candidates[0].model.context_window
+        );
+        assert_eq!(
+            entries[0]["supports_function_calling"],
+            candidates[0].model.supports_function_calling
+        );
+        // Model entries carry them too.
+        let listed = &list["data"][0];
+        assert_eq!(listed["context_window"], candidates[2].model.context_window);
+        assert!(listed.get("input_cost_per_token").is_some());
+        assert!(listed.get("description").is_some());
+    }
+
+    #[test]
     fn model_info_entry_uses_obleth_params_and_keeps_the_conventional_keys() {
         use super::model_info_entry;
         let mut model = model_with(Vec::new());
@@ -6726,9 +7120,12 @@ mod tests {
 
     fn model_with(endpoints: Vec<ResolvedEndpoint>) -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
+            description: String::new(),
             model_name: "m".into(),
             aliases: Vec::new(),
             lifecycle: Default::default(),
+            reasoning: Default::default(),
+            listed: true,
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "m".into(),
@@ -7726,15 +8123,21 @@ mod tests {
             device_id: "dev-1".into(),
             end_user: String::new(),
             model_variant: String::new(),
+            reasoning_effort: String::new(),
+            reasoning_effort_requested: String::new(),
+            model_family: String::new(),
         };
         assert_eq!(meta.device_id, "dev-1");
     }
 
     fn minimal_model(name: &str) -> ResolvedModel {
         ResolvedModel {
+            description: String::new(),
             model_name: name.to_string(),
             aliases: Vec::new(),
             lifecycle: Default::default(),
+            reasoning: Default::default(),
+            listed: true,
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: name.to_string(),
@@ -8105,6 +8508,26 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn a_family_is_logged_apart_from_variants() {
+        let mut meta = super::RequestMeta {
+            session_id: String::new(),
+            session_id_source: "none",
+            request_type: "chat",
+            device_id: String::new(),
+            end_user: String::new(),
+            model_variant: String::new(),
+            reasoning_effort: String::new(),
+            reasoning_effort_requested: String::new(),
+            model_family: String::new(),
+        };
+        super::record_called_name(&mut meta, Some("acme"), Some("acme"));
+        assert_eq!(meta.model_family, "acme");
+        assert_eq!(meta.model_variant, "");
+        super::record_called_name(&mut meta, Some("glm-5-3-spec"), None);
+        assert_eq!(meta.model_variant, "glm-5-3-spec");
+    }
+
+    #[test]
     fn a_variant_is_admitted_to_its_parents_pool() {
         let h = squash(handler());
         let serve = h.find("serve_as(r,&model)").expect("variant resolution");
@@ -8118,7 +8541,7 @@ mod lifecycle_tests {
         assert!(serve < adopt && adopt < pool && pool < admit);
         // The ledger and the allowlist see the parent name; the variant rides
         // on the request's metadata for its usage row and response header.
-        assert!(h[serve..pool].contains("req_meta.model_variant="));
+        assert!(h[serve..pool].contains("record_called_name(&mutreq_meta,"));
         assert!(h[serve..pool].contains("served_variant.clone_from(&variant);"));
     }
 

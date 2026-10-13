@@ -167,6 +167,70 @@ describe("gateway modes", () => {
     expect(host.textContent).toContain("In flight 12 of 20 (cluster-wide, 3 gateways) · this gateway 5");
   });
 
+  it("counts queues and shares on every gateway in cluster scope, beside this gateway's own", async () => {
+    mocks.view = { ...mocks.view!, replicas: 3, mode: "shared", shared_slots: true, replica_aware: true, configured_max_in_flight: 20, cluster_in_flight: 13, scope: "cluster", replicas_reporting: 3, replica_in_flight: 4, replica_queued: 1 };
+    await render();
+    await act(async () => button("How limits hold across gateways", host).click());
+    const tip = host.querySelector('[role="tooltip"]')!.textContent ?? "";
+    expect(tip).toContain("In flight 13 of 20 (cluster-wide, 3 gateways) · this gateway 4");
+    expect(tip).toContain("Waiting, tenants and fair shares below count every gateway;");
+    expect(limitsNote({ ...mocks.view!, replicas_reporting: 2 })).toContain("that has reported so far (2 of 3)");
+  });
+
+  it("says so when the other gateways' queues could not be read", () => {
+    const note = limitsNote({ ...mocks.view!, replicas: 3, mode: "shared", scope: "replica", scope_reason: "backend down" });
+    expect(note).toContain("this gateway's own: the other gateways' queues could not be read");
+  });
+
+  // One tenant holding all 256 slots of a pool across three gateways, with
+  // 767 waiting. Each gateway alone held about a third and read as short of
+  // a 256-slot share; counted across the fleet, the pool is simply full.
+  it("reads a single tenant holding a whole full pool as full, not below share", async () => {
+    const acme = tenant("acme", { fairshare_group: "default", in_flight: 256, queued: 767, weight_share: 1, expected_slots: 256, share_score: 1 });
+    mocks.routes = [route("chat-large", 256)];
+    mocks.view = {
+      ...mocks.view!, replicas: 3, mode: "shared", shared_slots: true, replica_aware: true, scope: "cluster", replicas_reporting: 3,
+      configured_max_in_flight: 256, cluster_in_flight: 256, global_in_flight: 256, global_queued: 767, replica_in_flight: 92, replica_queued: 245,
+      tenants: [acme], keys: [],
+      groups: [{ name: "default", weight: 100, in_flight: 256, queued: 767, expected_slots: 256, slot_cap: 256, served_tokens: 0, share_score: 0, weight_share: 1 }],
+      pools: [{ model: "chat-large", cap: 256, configured_cap: 256, in_flight: 256, cluster_in_flight: 256, queued: 767, replica_in_flight: 92, replica_queued: 245, borrowed: 0, groups: [], tenants: [acme], keys: [] }],
+      model_in_flight: { "chat-large": 256 }, model_queued: { "chat-large": 767 },
+    };
+    await render();
+    const status = host.querySelector('[role="status"]')!.textContent ?? "";
+    expect(status).toContain("767 waiting");
+    expect(status).not.toContain("below their fair share");
+    expect(host.textContent).not.toContain("Below share");
+    await act(async () => button("chat-large", host.querySelector('[aria-label="Model pools"]')!).click());
+    expect(host.textContent).toContain("Full · 767 waiting");
+    const rows = [...host.querySelectorAll('[aria-label="Who holds the slots"] li')].map((li) => li.textContent ?? "");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toContain("256 running · fair share 256 · 767 waiting");
+    expect(rows[0]).toContain("At share");
+    expect(host.textContent).toContain("Rows count all 3 gateways.");
+  });
+
+  it("marks a tenant below share when it is short in one pool, though over its share in another", async () => {
+    const plenty = tenant("lab", { in_flight: 10, queued: 0, expected_slots: 5 });
+    const short = tenant("lab", { in_flight: 1, queued: 4, expected_slots: 5 });
+    const borrower = tenant("ops", { in_flight: 9, queued: 0, expected_slots: 5 });
+    mocks.routes = [route("a", 10), route("b", 10)];
+    mocks.view = {
+      ...mocks.view!, global_in_flight: 20, global_queued: 4,
+      tenants: [tenant("lab", { in_flight: 11, queued: 4, expected_slots: 10 }), borrower], keys: [],
+      pools: [
+        { model: "a", cap: 10, in_flight: 10, queued: 0, borrowed: 0, groups: [], keys: [], tenants: [plenty] },
+        { model: "b", cap: 10, in_flight: 10, queued: 4, borrowed: 0, groups: [], keys: [], tenants: [short, borrower] },
+      ],
+      model_in_flight: { a: 10, b: 10 }, model_queued: { b: 4 },
+    };
+    await render();
+    expect(host.textContent).toContain("1 tenant is waiting below their fair share");
+    expect(host.querySelector('[aria-label="Tenants right now"]')!.textContent).toContain("Below share");
+    await click("lab");
+    expect(panel()!.textContent).toContain("Below share on b");
+  });
+
   it("flags fallback with the one inverted badge", async () => {
     mocks.view = { ...mocks.view!, replicas: 3, mode: "fallback", shared_slots: true, replica_aware: true, configured_max_in_flight: 48 };
     await render();
@@ -226,6 +290,13 @@ describe("one pool", () => {
     expect(host.textContent).toContain("Nothing has run or waited in this pool");
   });
 
+  it("opens a pool idle on every gateway, saying so", async () => {
+    mocks.routes = [route("llama"), route("quiet", 8)];
+    mocks.view = { ...mocks.view!, replicas: 2, mode: "shared", scope: "cluster", replicas_reporting: 2 };
+    await render("quiet");
+    expect(host.textContent).toContain("Nothing is running or waiting in this pool on any gateway right now");
+  });
+
   it("asks for history scoped to the open pool", async () => {
     mocks.history = { interval_ms: 2000, retention_ms: 3_600_000, oldest_ts_ms: null, points: [] };
     await render("llama");
@@ -239,7 +310,8 @@ describe("tenant panel", () => {
   it("previews a weight change per pool, keeps the draft after a failed save, and refreshes after retry", async () => {
     await render();
     await act(async () => button("below-share", host.querySelector('[aria-label="Tenants right now"]')!).click());
-    expect(panel()!.textContent).toContain("3 waiting below share");
+    expect(panel()!.textContent).toContain("3 waiting");
+    expect(panel()!.textContent).toContain("Below share on llama");
     // Keys: least served against weight first.
     expect(panel()!.textContent!.indexOf("bob")).toBeLessThan(panel()!.textContent!.indexOf("alice"));
     const input = await type("Fairshare weight", "300");

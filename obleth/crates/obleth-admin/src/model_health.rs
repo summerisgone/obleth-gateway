@@ -1457,6 +1457,9 @@ fn build_probe_usage(
         end_user: String::new(),
         parent_request_id: Uuid::nil(),
         model_variant: String::new(),
+        reasoning_effort: String::new(),
+        reasoning_effort_requested: String::new(),
+        model_family: String::new(),
     }
 }
 

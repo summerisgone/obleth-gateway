@@ -115,6 +115,10 @@ pub fn run(
         let upstream_model = route.upstream_model.clone();
         let created = super::now_ms() / 1000;
         let mut request = base_request;
+        // The upstream's role chunk carries no content, so the content filter
+        // below drops it; the driver opens the client stream with its own role
+        // chunk instead, once, ahead of the first forwarded chunk.
+        let mut role_sent = false;
         let mut sessions = super::tool_loop::Sessions::default();
         let deadline = super::tool_loop::LoopDeadline::new(&settings);
         // Follow-up turns go to the endpoint that served turn 0 (prefix-cache
@@ -217,6 +221,10 @@ pub fn run(
                         }
                         if let Some(x) = v.get("model").and_then(|x| x.as_str()) {
                             model_name = x.to_string();
+                        }
+                        if !role_sent {
+                            role_sent = true;
+                            yield Ok(Bytes::from(role_chunk(&id, &model_name, created)));
                         }
                         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
                             let it = u
@@ -473,6 +481,10 @@ pub fn run(
                     if let Some(x) = v.get("model").and_then(|x| x.as_str()) {
                         model_name = x.to_string();
                     }
+                    if !role_sent {
+                        role_sent = true;
+                        yield Ok(Bytes::from(role_chunk(&id, &model_name, created)));
+                    }
                     if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
                         let it = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
                         let ot = u.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
@@ -725,6 +737,23 @@ fn marker_text(name: &str, arguments: &str) -> String {
     } else {
         format!("\n\n{SEARCH_GLYPH} Searching `{name}`: {query}\n\n")
     }
+}
+
+/// The opening `chat.completion.chunk` of an OpenAI stream: the assistant role
+/// with empty content.
+fn role_chunk(id: &str, model: &str, created: i64) -> String {
+    let chunk = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": "" },
+            "finish_reason": null,
+        }],
+    });
+    format!("data: {chunk}\n\n")
 }
 
 /// A `chat.completion.chunk` carrying a single content delta.
@@ -1004,6 +1033,15 @@ mod tests {
         let json_part = c.trim_start_matches("data: ").trim_end();
         let v: Value = serde_json::from_str(json_part).unwrap();
         assert_eq!(v["choices"][0]["delta"]["content"], "hello");
+    }
+
+    #[test]
+    fn role_chunk_opens_the_stream_as_the_assistant() {
+        let c = role_chunk("id1", "m", 1);
+        let v: Value = serde_json::from_str(c.trim_start_matches("data: ").trim_end()).unwrap();
+        assert_eq!(v["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(v["choices"][0]["delta"]["content"], "");
+        assert!(v["choices"][0]["finish_reason"].is_null());
     }
 
     #[test]

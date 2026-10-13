@@ -37,6 +37,7 @@ function gateway(current = model(), over: Record<string, unknown> = {}) {
     setModelCapacity: vi.fn().mockResolvedValue({}),
     setModelCapacityMode: vi.fn().mockResolvedValue({}),
     setModelCollections: vi.fn().mockResolvedValue({}),
+    setModelListing: vi.fn().mockResolvedValue({}),
     createModel: vi.fn().mockResolvedValue({ id: "new-1", model_name: "fresh" }),
     activateModel: vi.fn(),
     checkModelHealth: vi.fn().mockResolvedValue({}),
@@ -64,6 +65,17 @@ describe("saving a model's settings", () => {
     expect(obleth.setModelCache).toHaveBeenCalledWith("m-1", true, 60, { auditActor: "admin@example.com" });
     expect(obleth.updateModel).not.toHaveBeenCalled();
     expect(obleth.setModelReliability).not.toHaveBeenCalled();
+  });
+
+  it("turns listing on and off on its own write", async () => {
+    mockAdmin();
+    const obleth = gateway();
+    const { saveModelSettingsAction } = await import("./actions");
+    expect(await saveModelSettingsAction(form({ sections: "listing" }))).toEqual({ ok: true });
+    expect(obleth.setModelListing).toHaveBeenCalledWith("m-1", false, { auditActor: "admin@example.com" });
+    await saveModelSettingsAction(form({ sections: "listing", listed: "on" }));
+    expect(obleth.setModelListing).toHaveBeenLastCalledWith("m-1", true, { auditActor: "admin@example.com" });
+    expect(obleth.updateModel).not.toHaveBeenCalled();
   });
 
   it("keeps the route switch, the stored key, and every group the form leaves out", async () => {

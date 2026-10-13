@@ -258,6 +258,21 @@ const HELPER_PURPOSES: Record<string, string> = {
 };
 
 /** What a helper call was for, in a few words; any other type as recorded. */
+/**
+ * The request's reasoning effort as a sentence: what the caller asked for and
+ * what the model was sent. Null when neither side named one.
+ */
+export function effortText(row: Pick<UsageLogEntry, "reasoning_effort" | "reasoning_effort_requested">): string | null {
+  const asked = row.reasoning_effort_requested ?? "";
+  const served = row.reasoning_effort ?? "";
+  if (!asked && !served) return null;
+  if (served === "unsupported") return `Asked for ${asked}. This model has no effort control, so it was removed from the request.`;
+  if (!served) return `Asked for ${asked}. Sent to the model as asked; the gateway doesn't translate effort for this model.`;
+  if (!asked) return `None asked for, so it was served at ${served}, the default for this model.`;
+  if (asked !== served) return `Asked for ${asked}, served as ${served}: this model has no ${asked} level.`;
+  return `Asked for ${asked}, served at ${served}.`;
+}
+
 export function helperPurpose(requestType: string): string {
   return HELPER_PURPOSES[requestType] ?? (requestType || "other");
 }

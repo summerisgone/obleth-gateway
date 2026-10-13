@@ -482,6 +482,9 @@ async fn handler_inner(
         device_id,
         end_user: end_user.clone().unwrap_or_default(),
         model_variant: String::new(),
+        reasoning_effort: String::new(),
+        reasoning_effort_requested: String::new(),
+        model_family: String::new(),
     };
     if let Some(t) = tracer.as_mut() {
         t.set_conversation(&req_meta.session_id, req_meta.session_id_source);
