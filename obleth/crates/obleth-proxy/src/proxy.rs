@@ -3993,19 +3993,21 @@ pub(crate) async fn derive_intent(
         if let Some(name) = settings.classifier_model.as_deref() {
             if name != crate::router::AUTO_MODEL_NAME {
                 if let Some(brain) = resolve_model(state, name).await {
-                    let prompt = classifier_prompt(json);
-                    if !prompt.trim().is_empty() {
-                        let mut intent = state
+                    let brain = &brain;
+                    let prompts = crate::router::classifier_prompts(json);
+                    let classified = crate::router::classify_turns(prompts, |prompt| async move {
+                        state
                             .classifier
-                            .classify(&state.http, &brain, &prompt, available_tags)
-                            .await;
-                        if !intent.tags.is_empty() {
-                            if let Some(d) = forced {
-                                intent.difficulty = d;
-                                intent.source = crate::router::IntentSource::Header;
-                            }
-                            return intent;
+                            .classify(&state.http, brain, &prompt, available_tags)
+                            .await
+                    })
+                    .await;
+                    if let Some(mut intent) = classified {
+                        if let Some(d) = forced {
+                            intent.difficulty = d;
+                            intent.source = crate::router::IntentSource::Header;
                         }
+                        return intent;
                     }
                 }
             }
@@ -4019,29 +4021,6 @@ pub(crate) async fn derive_intent(
         intent.source = crate::router::IntentSource::Header;
     }
     intent
-}
-
-/// Build a compact prompt for the classifier: the system message (if any) plus
-/// the first user message's text.
-fn classifier_prompt(json: &serde_json::Value) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
-        let mut have_user = false;
-        for msg in messages {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            let text = message_text(msg.get("content"));
-            if role == "system" && !text.is_empty() {
-                parts.push(text);
-            } else if role == "user" && !have_user && !text.is_empty() {
-                parts.push(text);
-                have_user = true;
-            }
-            if have_user {
-                break;
-            }
-        }
-    }
-    parts.join("\n")
 }
 
 fn message_text(content: Option<&serde_json::Value>) -> String {

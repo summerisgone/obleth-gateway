@@ -149,8 +149,8 @@ async fn call_brain(
     // Cap the prompt we forward so the classifier stays fast and cheap,
     // floored to a char boundary (`String::truncate` panics mid-code-point).
     let mut user = prompt.trim();
-    if user.len() > 2_000 {
-        let mut end = 2_000;
+    if user.len() > crate::router::CLASSIFIER_PROMPT_MAX_BYTES {
+        let mut end = crate::router::CLASSIFIER_PROMPT_MAX_BYTES;
         while !user.is_char_boundary(end) {
             end -= 1;
         }

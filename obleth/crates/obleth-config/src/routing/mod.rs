@@ -1163,6 +1163,133 @@ pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Inte
     }
 }
 
+/// Most bytes of request text one classifier call reads.
+pub const CLASSIFIER_PROMPT_MAX_BYTES: usize = 2_000;
+
+/// How many user turns, newest first, the classifier may read for one
+/// request. See [`classify_turns`].
+pub const CLASSIFIER_LOOKBACK_TURNS: usize = 3;
+
+/// The tag every chat request touches. A classification that names nothing
+/// more specific says nothing about where the request should go.
+const GENERAL_TAG: &str = "general";
+
+/// The classifier prompts for a chat body: one per user turn, newest first,
+/// at most [`CLASSIFIER_LOOKBACK_TURNS`].
+///
+/// Each prompt is the leading system text plus a single user message, so a
+/// conversation that opens with "hello" and moves on to code is classified as
+/// code. Earlier turns are never mixed into the newest one: given both, the
+/// classifier follows the earlier topic, and a request for a script that comes
+/// after a request for a poem would route as `writing`. Tool results are not
+/// user turns, so an agent's tool loop keeps the classification of the
+/// request that started it.
+///
+/// The user message has first claim on [`CLASSIFIER_PROMPT_MAX_BYTES`] and the
+/// system text gets what is left, so a long system prompt cannot push the
+/// request itself out of view.
+pub fn classifier_prompts(json: &serde_json::Value) -> Vec<String> {
+    let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    fn role(msg: &serde_json::Value) -> &str {
+        msg.get("role").and_then(|r| r.as_str()).unwrap_or("")
+    }
+
+    let mut system: Vec<String> = Vec::new();
+    for msg in messages {
+        match role(msg) {
+            "user" => break,
+            "system" => {
+                let text = classifier_message_text(msg.get("content"));
+                if !text.trim().is_empty() {
+                    system.push(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    let system = system.join("\n");
+    let system = system.trim();
+
+    messages
+        .iter()
+        .rev()
+        .filter(|msg| role(msg) == "user")
+        .map(|msg| classifier_message_text(msg.get("content")))
+        .filter(|text| !text.trim().is_empty())
+        .take(CLASSIFIER_LOOKBACK_TURNS)
+        .map(|text| {
+            let user = head_bytes(text.trim(), CLASSIFIER_PROMPT_MAX_BYTES);
+            let room = CLASSIFIER_PROMPT_MAX_BYTES.saturating_sub(user.len() + 1);
+            let system = head_bytes(system, room).trim_end();
+            if system.is_empty() {
+                user.to_string()
+            } else {
+                format!("{system}\n{user}")
+            }
+        })
+        .collect()
+}
+
+/// Classify an `auto` request turn by turn, newest first, and return the first
+/// answer that names a topic.
+///
+/// A short follow-up such as "make it shorter" or "thanks" has no topic of its
+/// own and classifies as `general`, which on its own would move a coding
+/// conversation to a general model halfway through. So when the newest turn
+/// names nothing more specific than `general`, the turn before it decides,
+/// back to [`CLASSIFIER_LOOKBACK_TURNS`]. Those turns were classified when they
+/// were sent, so while the conversation is active this is usually a cache hit.
+/// If no turn names a topic, the newest turn's answer stands.
+///
+/// No tags at all is the classifier's failure shape. It ends the walk with
+/// `None` so the caller falls back to heuristics: a slow or broken classifier
+/// costs one timeout, never several.
+pub async fn classify_turns<F, Fut>(prompts: Vec<String>, mut classify: F) -> Option<Intent>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Intent>,
+{
+    let mut newest: Option<Intent> = None;
+    for prompt in prompts {
+        let intent = classify(prompt).await;
+        if intent.tags.is_empty() {
+            break;
+        }
+        if intent.tags.iter().any(|t| t != GENERAL_TAG) {
+            return Some(intent);
+        }
+        newest.get_or_insert(intent);
+    }
+    newest
+}
+
+/// A message's text: a string, or its text parts joined.
+fn classifier_message_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// At most `max` bytes from the start of `s`, cut on a char boundary.
+fn head_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3140,5 +3267,158 @@ mod tests {
         assert_eq!(ex.tags, vec!["coding".to_string()]);
         assert_eq!(ex.classifier_ms, 0, "only the proxy knows the real timing");
         assert!(serde_json::to_string(&ex).is_ok());
+    }
+
+    #[test]
+    fn classifier_prompts_start_from_the_newest_user_turn() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "Hi! How can I help?"},
+                {"role": "user", "content": [{"type": "text", "text": "Write a Rust function"}]}
+            ]
+        });
+        assert_eq!(
+            classifier_prompts(&body),
+            vec!["Be brief.\nWrite a Rust function", "Be brief.\nhello"]
+        );
+    }
+
+    #[test]
+    fn classifier_prompts_skip_tool_results_and_turns_without_text() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "fix the failing build"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "sh", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "error[E0308]: mismatched types"},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "http://x/y.png"}}
+                ]}
+            ]
+        });
+        assert_eq!(classifier_prompts(&body), vec!["fix the failing build"]);
+    }
+
+    #[test]
+    fn classifier_prompts_look_back_a_bounded_number_of_turns() {
+        let messages: Vec<serde_json::Value> = (0..CLASSIFIER_LOOKBACK_TURNS + 2)
+            .map(|i| serde_json::json!({"role": "user", "content": format!("turn {i}")}))
+            .collect();
+        let prompts = classifier_prompts(&serde_json::json!({ "messages": messages }));
+        assert_eq!(prompts.len(), CLASSIFIER_LOOKBACK_TURNS);
+        assert_eq!(
+            prompts[0],
+            format!("turn {}", CLASSIFIER_LOOKBACK_TURNS + 1)
+        );
+    }
+
+    #[test]
+    fn a_long_system_prompt_gives_way_to_the_request() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "You are a course assistant. ".repeat(200)},
+                {"role": "user", "content": "Write a Rust function that parses JSON"}
+            ]
+        });
+        let prompts = classifier_prompts(&body);
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].starts_with("You are a course assistant."));
+        assert!(prompts[0].ends_with("\nWrite a Rust function that parses JSON"));
+        assert!(prompts[0].len() <= CLASSIFIER_PROMPT_MAX_BYTES);
+    }
+
+    #[test]
+    fn a_long_request_fills_the_budget_on_a_char_boundary() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "é".repeat(CLASSIFIER_PROMPT_MAX_BYTES)}
+            ]
+        });
+        let prompts = classifier_prompts(&body);
+        assert!(prompts[0].len() <= CLASSIFIER_PROMPT_MAX_BYTES);
+        assert!(
+            prompts[0].starts_with('é'),
+            "no room left for the system text"
+        );
+    }
+
+    fn classified(tags: &[&str], difficulty: u8) -> Intent {
+        Intent {
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            difficulty,
+            source: IntentSource::Classifier,
+        }
+    }
+
+    /// Run `classify_turns` over canned answers, one per turn, newest first.
+    /// Returns its result and how many turns it asked about.
+    fn walk(answers: &[Intent]) -> (Option<Intent>, usize) {
+        let prompts: Vec<String> = (0..answers.len()).map(|i| i.to_string()).collect();
+        let mut asked = 0;
+        let out = {
+            let fut = classify_turns(prompts, |p| {
+                asked += 1;
+                std::future::ready(answers[p.parse::<usize>().unwrap()].clone())
+            });
+            let mut fut = std::pin::pin!(fut);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let std::task::Poll::Ready(out) = std::future::Future::poll(fut.as_mut(), &mut cx)
+            else {
+                panic!("ready answers cannot leave the walk pending");
+            };
+            out
+        };
+        (out, asked)
+    }
+
+    #[test]
+    fn a_topic_on_the_newest_turn_decides_alone() {
+        let (out, asked) = walk(&[
+            classified(&["coding", "general"], 2),
+            classified(&["writing"], 1),
+        ]);
+        assert_eq!(out.unwrap().tags, vec!["coding", "general"]);
+        assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn a_follow_up_without_a_topic_keeps_the_conversation_s_topic() {
+        let (out, asked) = walk(&[classified(&["general"], 1), classified(&["coding"], 2)]);
+        let out = out.unwrap();
+        assert_eq!(out.tags, vec!["coding"]);
+        assert_eq!(out.difficulty, 2);
+        assert_eq!(asked, 2);
+    }
+
+    #[test]
+    fn with_no_topic_anywhere_the_newest_answer_stands() {
+        let (out, asked) = walk(&[
+            classified(&["general"], 1),
+            classified(&["general"], 2),
+            classified(&["general"], 3),
+        ]);
+        assert_eq!(out.unwrap().difficulty, 1);
+        assert_eq!(asked, 3);
+    }
+
+    #[test]
+    fn a_failed_classification_ends_the_walk() {
+        // Newest turn failed: heuristics take over, older turns are not asked.
+        let (out, asked) = walk(&[classified(&[], 1), classified(&["coding"], 2)]);
+        assert!(out.is_none());
+        assert_eq!(asked, 1);
+
+        // An older turn failed: the newest answer stands.
+        let (out, asked) = walk(&[
+            classified(&["general"], 1),
+            classified(&[], 1),
+            classified(&["coding"], 2),
+        ]);
+        assert_eq!(out.unwrap().tags, vec!["general"]);
+        assert_eq!(asked, 2);
     }
 }
