@@ -541,13 +541,97 @@ mod tests {
     }
 }
 
-/// The whole pipeline against a fake upstream: how a failure reported inside
-/// a `200` is recorded, billed and kept out of the cache. Needs the test
-/// datastores (`OBLETH_TEST_DATABASE_URL`, `OBLETH_TEST_REDIS_URL`); skipped
-/// without them.
+/// Bare HTTP/1.1 upstreams, for tests that need a connection to fail in ways a
+/// framework server will not.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    /// How the upstream drops a connection it fails.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Hangup {
+        /// A TCP reset.
+        Reset,
+        /// An orderly close.
+        Close,
+    }
+
+    /// An upstream at the returned base URL (`.../v1`) whose first `failures`
+    /// connections read the whole request and then hang up before sending a
+    /// byte of response; every later one answers `200` with `body` as JSON.
+    /// The counter is the number of connections accepted.
+    pub(crate) async fn spawn_failing_upstream(
+        failures: usize,
+        hangup: Hangup,
+        body: String,
+    ) -> (Arc<AtomicUsize>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    read_request(&mut socket).await;
+                    if n < failures {
+                        if matches!(hangup, Hangup::Reset) {
+                            let _ = socket.set_zero_linger();
+                        }
+                        drop(socket);
+                        return;
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (accepted, format!("http://{addr}/v1"))
+    }
+
+    /// Read one request: its headers, then `content-length` bytes of body.
+    async fn read_request(socket: &mut TcpStream) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buf.len() >= end + 4 + length {
+                    return;
+                }
+            }
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+}
+
+/// The whole pipeline against fake upstreams: how a failure reported inside a
+/// `200` is recorded, billed and kept out of the cache, and that a connection
+/// the upstream drops before answering is retried. Needs the test datastores
+/// (`OBLETH_TEST_DATABASE_URL`, `OBLETH_TEST_REDIS_URL`); skipped without
+/// them.
 #[cfg(test)]
 mod pipeline {
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -561,6 +645,7 @@ mod pipeline {
     use serde_json::{json, Value};
     use uuid::Uuid;
 
+    use super::test_support::{spawn_failing_upstream, Hangup};
     use crate::state::AppState;
 
     /// Price of one output token; input is free, so spend counts output only.
@@ -896,5 +981,33 @@ mod pipeline {
         let (_, cache_hit, _) = gw.chat(&secret, &body).await;
         assert!(!cache_hit);
         assert_eq!(upstream.hits("errors-in-json"), 2);
+    }
+
+    #[tokio::test]
+    async fn a_connection_dropped_before_response_headers_is_retried() {
+        let Some(gw) = gateway().await else { return };
+        let answer = json!({
+            "id": "c1", "object": "chat.completion", "model": "flaky",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+        })
+        .to_string();
+        // With retries configured, and with none (the one fresh-connection
+        // retry a dropped connection always gets).
+        for (max_retries, hangup) in [(1, Hangup::Reset), (0, Hangup::Reset), (0, Hangup::Close)] {
+            let (accepted, base) = spawn_failing_upstream(1, hangup, answer.clone()).await;
+            let name = format!("flaky-{max_retries}-{hangup:?}");
+            let mut flaky = route(&name, &base);
+            flaky.cache_enabled = false;
+            flaky.max_retries = max_retries;
+            flaky.retry_backoff_ms = 0;
+            gw.register(flaky).await;
+            let (secret, _) = gw.tenant().await;
+
+            let (status, _, text) = gw.chat(&secret, &request(&name, false)).await;
+            assert_eq!(status, StatusCode::OK, "{name}: {text}");
+            assert_eq!(accepted.load(Ordering::SeqCst), 2, "{name}");
+        }
     }
 }

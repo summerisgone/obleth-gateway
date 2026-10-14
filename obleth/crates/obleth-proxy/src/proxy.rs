@@ -9633,4 +9633,25 @@ mod lifecycle_tests {
             "settles via drained_settlement"
         );
     }
+
+    #[tokio::test]
+    async fn a_connection_dropped_before_response_headers_is_a_connection_error() {
+        use crate::upstream_failure::test_support::{spawn_failing_upstream, Hangup};
+        use std::sync::atomic::Ordering;
+        for hangup in [Hangup::Reset, Hangup::Close] {
+            let (accepted, base) = spawn_failing_upstream(usize::MAX, hangup, String::new()).await;
+            let err = reqwest::Client::new()
+                .post(format!("{base}/chat/completions"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(r#"{"model":"m","messages":[]}"#)
+                .send()
+                .await
+                .expect_err("the upstream never answers");
+            // So the attempt loop retries it: on a configured retry, and on
+            // the one fresh-connection retry it always allows.
+            assert!(is_connection_error(&err), "{hangup:?}: {err:?}");
+            assert!(!err.is_timeout(), "{hangup:?}");
+            assert_eq!(accepted.load(Ordering::SeqCst), 1, "{hangup:?}");
+        }
+    }
 }
