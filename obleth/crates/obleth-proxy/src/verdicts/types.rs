@@ -54,6 +54,9 @@ pub(crate) struct VerdictsRequest {
     /// `http(s)` URLs the model's backend fetches itself.
     #[serde(default)]
     pub images: Vec<String>,
+    /// The model to ask. Left out or blank, the operator's verdicts default
+    /// answers, else `auto`.
+    #[serde(default)]
     pub model: String,
     pub questions: BTreeMap<String, Question>,
 }
@@ -184,9 +187,6 @@ pub(crate) fn validate(req: &VerdictsRequest) -> Result<(), String> {
                     .to_string(),
             )
         }
-    }
-    if req.model.trim().is_empty() {
-        return Err("`model` is required".to_string());
     }
     if req.questions.is_empty() {
         return Err("`questions` must contain at least one question".to_string());
@@ -319,6 +319,26 @@ mod tests {
         let req = parse(valid_request());
         assert!(validate(&req).is_ok());
         assert_eq!(req.questions.len(), 3);
+    }
+
+    #[test]
+    fn the_model_may_be_left_out() {
+        for body in [
+            {
+                let mut b = valid_request();
+                b.as_object_mut().unwrap().remove("model");
+                b
+            },
+            {
+                let mut b = valid_request();
+                b["model"] = serde_json::json!("  ");
+                b
+            },
+        ] {
+            let req = parse(body);
+            assert!(validate(&req).is_ok());
+            assert!(req.model.trim().is_empty());
+        }
     }
 
     #[test]

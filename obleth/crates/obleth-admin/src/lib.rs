@@ -2555,6 +2555,9 @@ pub struct AutoRouterSettingsView {
     /// Model or alias served for unknown model names on `/v1/messages`;
     /// `None` means such requests get `not_found_error`.
     pub messages_default_model: Option<String>,
+    /// Model or alias that answers a `/v1/verdicts` request naming no model;
+    /// `None` means `auto`.
+    pub verdicts_default_model: Option<String>,
 }
 
 impl AutoRouterSettingsView {
@@ -2575,6 +2578,7 @@ impl AutoRouterSettingsView {
             difficulty_enabled: s.difficulty_enabled,
             tier_source: tier_source_as_str(s.tier_source).to_string(),
             messages_default_model: s.messages_default_model.clone(),
+            verdicts_default_model: s.verdicts_default_model.clone(),
         }
     }
 }
@@ -2608,6 +2612,10 @@ pub struct UpdateAutoRouterSettings {
     /// Empty string clears it.
     #[serde(default)]
     pub messages_default_model: Option<String>,
+    /// Model or alias that answers a `/v1/verdicts` request naming no model.
+    /// Empty string clears it (back to `auto`).
+    #[serde(default)]
+    pub verdicts_default_model: Option<String>,
 }
 
 /// Merge an update over the persisted settings, clamping out-of-range values.
@@ -2628,6 +2636,11 @@ fn merge_auto_router(
         Some("") => None,
         Some(m) => Some(m.to_string()),
         None => existing.messages_default_model.clone(),
+    };
+    let verdicts_default_model = match body.verdicts_default_model.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.verdicts_default_model.clone(),
     };
     AutoRouterSettings {
         classifier_enabled: body
@@ -2658,6 +2671,7 @@ fn merge_auto_router(
             .and_then(parse_tier_source)
             .unwrap_or(existing.tier_source),
         messages_default_model,
+        verdicts_default_model,
     }
 }
 
@@ -2714,6 +2728,7 @@ async fn put_auto_router_settings(
                 "difficulty_enabled": settings.difficulty_enabled,
                 "tier_source": tier_source_as_str(settings.tier_source),
                 "messages_default_model": settings.messages_default_model,
+                "verdicts_default_model": settings.verdicts_default_model,
             }),
         )
         .await?;
@@ -11406,6 +11421,36 @@ mod tests {
         assert_eq!(cleared.messages_default_model, None);
         let kept = merge_auto_router(&set, &UpdateAutoRouterSettings::default());
         assert_eq!(kept.messages_default_model.as_deref(), Some("local-llama"));
+    }
+
+    #[test]
+    fn merge_auto_router_sets_and_clears_verdicts_default_model() {
+        use obleth_config::AutoRouterSettings;
+        let existing = AutoRouterSettings::default();
+        let set = merge_auto_router(
+            &existing,
+            &UpdateAutoRouterSettings {
+                verdicts_default_model: Some(" judge-7b ".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(set.verdicts_default_model.as_deref(), Some("judge-7b"));
+        let kept = merge_auto_router(
+            &set,
+            &UpdateAutoRouterSettings {
+                messages_default_model: Some("local-llama".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(kept.verdicts_default_model.as_deref(), Some("judge-7b"));
+        let cleared = merge_auto_router(
+            &kept,
+            &UpdateAutoRouterSettings {
+                verdicts_default_model: Some("".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cleared.verdicts_default_model, None);
     }
 
     #[test]
