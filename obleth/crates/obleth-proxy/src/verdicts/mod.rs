@@ -1,6 +1,7 @@
 //! `POST /v1/verdicts` — native typed-decision evaluation.
 //!
-//! One state, N independent typed questions (boolean / choice / score), answered
+//! One state (plus optional images), N independent typed questions (boolean /
+//! choice / score), answered
 //! by the route's own chat backend as N concurrent single-token calls whose
 //! first-token `top_logprobs` become probability distributions. No external
 //! API, no new model: any registered `chat` route (vLLM, SGLang, llama.cpp,
@@ -106,17 +107,58 @@ fn completions_url(chat_url: &str) -> String {
     }
 }
 
+/// What every question of one request shares: the upstream model name, the
+/// rendered state, and the images. Behind an `Arc`, so a request carrying
+/// photos holds one copy of them however many questions it asks.
+pub(crate) struct SharedPrompt {
+    pub upstream_model: String,
+    pub system: String,
+    pub images: Vec<String>,
+}
+
 /// One prepared upstream call: the question id, its answer labels (for the
-/// zero-label-mass retry decision), and both body variants.
+/// zero-label-mass retry decision), and the texts its bodies are built from.
 pub(crate) struct QuestionCall {
     pub id: String,
     pub labels: Vec<String>,
     pub boolean: bool,
-    pub body: serde_json::Value,
-    pub prefill_body: serde_json::Value,
-    /// The `/v1/completions` harmony-splice variant (see
-    /// [`prompt::build_body_spliced`]).
-    pub splice_body: serde_json::Value,
+    pub shared: Arc<SharedPrompt>,
+    pub user: String,
+}
+
+/// Which upstream body an attempt sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    /// [`prompt::build_body`].
+    Plain,
+    /// [`prompt::build_body_prefilled`].
+    Prefill,
+    /// [`prompt::build_body_spliced`], sent to `/v1/completions`.
+    Splice,
+}
+
+impl QuestionCall {
+    /// Bodies are built per attempt and dropped once serialized. Held for the
+    /// whole fan-out, they would keep a copy of every image per question and
+    /// per variant.
+    fn body(&self, variant: Variant) -> serde_json::Value {
+        let p = &self.shared;
+        match variant {
+            Variant::Plain => {
+                prompt::build_body(&p.upstream_model, &p.system, &self.user, &p.images)
+            }
+            Variant::Prefill => {
+                prompt::build_body_prefilled(&p.upstream_model, &p.system, &self.user, &p.images)
+            }
+            Variant::Splice => prompt::build_body_spliced(&p.upstream_model, &p.system, &self.user),
+        }
+    }
+
+    /// The harmony splice is a hand-rendered text prompt: it cannot carry
+    /// images, so a question with images never takes it.
+    fn can_splice(&self) -> bool {
+        self.shared.images.is_empty()
+    }
 }
 
 /// The outcome of one question's upstream call: parsed first-token
@@ -164,8 +206,8 @@ pub(crate) async fn fan_out(
     calls: Vec<QuestionCall>,
     timeout: Duration,
 ) -> Vec<QuestionOutcome> {
-    let splice_first = needs_harmony_splice(model);
-    let prefill_first = !splice_first && needs_think_prefill(model);
+    let splice_known = needs_harmony_splice(model);
+    let prefill_known = needs_think_prefill(model);
     let splice_url = completions_url(url);
     let splice_url = splice_url.as_str();
     let futures = calls.into_iter().map(|call| async move {
@@ -173,20 +215,22 @@ pub(crate) async fn fan_out(
         let started = Instant::now();
         let in_set_of =
             |s: &QuestionSuccess| answers::label_masses(&s.entries, &call.labels, call.boolean).1;
-        let (first_url, first_body, first_spliced) = if splice_first {
-            (splice_url, &call.splice_body, true)
+        let splice_first = splice_known && call.can_splice();
+        let prefill_first = !splice_first && prefill_known;
+        let (first_url, first_variant) = if splice_first {
+            (splice_url, Variant::Splice)
         } else if prefill_first {
-            (url, &call.prefill_body, false)
+            (url, Variant::Prefill)
         } else {
-            (url, &call.body, false)
+            (url, Variant::Plain)
         };
         let mut result = one_call(
             http,
             first_url,
             api_key,
             headers,
-            first_body,
-            first_spliced,
+            &call,
+            first_variant,
             timeout,
         )
         .await;
@@ -203,49 +247,56 @@ pub(crate) async fn fan_out(
             if no_label {
                 let plain = result.expect("checked Ok above");
                 let harmony = answers::top_entry_is_control_token(&plain.entries);
-                let (retry_url, retry_body) = if harmony {
-                    (splice_url, &call.splice_body)
+                let retry = if harmony {
+                    call.can_splice().then_some((splice_url, Variant::Splice))
                 } else {
-                    (url, &call.prefill_body)
+                    Some((url, Variant::Prefill))
                 };
-                match one_call(
-                    http, retry_url, api_key, headers, retry_body, harmony, timeout,
-                )
-                .await
-                {
-                    Ok(mut retried) => {
-                        let retried_mass = in_set_of(&retried);
-                        if retried_mass >= MIN_IN_SET_MASS {
-                            if harmony {
-                                remember_harmony_splice(model);
-                            } else {
-                                remember_think_prefill(model);
+                result = match retry {
+                    // A harmony model asked about images: there is no splice
+                    // to retry with, so the plain result (and its "no
+                    // recognizable answer label" error) stands.
+                    None => Ok(plain),
+                    Some((retry_url, variant)) => {
+                        match one_call(http, retry_url, api_key, headers, &call, variant, timeout)
+                            .await
+                        {
+                            Ok(mut retried) => {
+                                let retried_mass = in_set_of(&retried);
+                                if retried_mass >= MIN_IN_SET_MASS {
+                                    if harmony {
+                                        remember_harmony_splice(model);
+                                    } else {
+                                        remember_think_prefill(model);
+                                    }
+                                }
+                                // Keep whichever attempt actually carried
+                                // answer mass; bill both either way — both
+                                // calls really ran.
+                                if retried_mass > in_set_of(&plain) {
+                                    retried.input_tokens =
+                                        retried.input_tokens.saturating_add(plain.input_tokens);
+                                    retried.output_tokens =
+                                        retried.output_tokens.saturating_add(plain.output_tokens);
+                                    retried.used_prefill = !harmony;
+                                    retried.used_splice = harmony;
+                                    Ok(retried)
+                                } else {
+                                    let mut plain = plain;
+                                    plain.input_tokens =
+                                        plain.input_tokens.saturating_add(retried.input_tokens);
+                                    plain.output_tokens =
+                                        plain.output_tokens.saturating_add(retried.output_tokens);
+                                    Ok(plain)
+                                }
                             }
-                        }
-                        // Keep whichever attempt actually carried answer mass;
-                        // bill both either way — both calls really ran.
-                        if retried_mass > in_set_of(&plain) {
-                            retried.input_tokens =
-                                retried.input_tokens.saturating_add(plain.input_tokens);
-                            retried.output_tokens =
-                                retried.output_tokens.saturating_add(plain.output_tokens);
-                            retried.used_prefill = !harmony;
-                            retried.used_splice = harmony;
-                            result = Ok(retried);
-                        } else {
-                            let mut plain = plain;
-                            plain.input_tokens =
-                                plain.input_tokens.saturating_add(retried.input_tokens);
-                            plain.output_tokens =
-                                plain.output_tokens.saturating_add(retried.output_tokens);
-                            result = Ok(plain);
+                            // Keep the plain result: its label mass (or the
+                            // clearer "no recognizable answer label" error)
+                            // stands, and its usage is still billed.
+                            Err(_) => Ok(plain),
                         }
                     }
-                    // Keep the plain result: its label mass (or the clearer
-                    // "no recognizable answer label" error) stands, and its
-                    // usage is still billed.
-                    Err(_) => result = Ok(plain),
-                }
+                };
             }
         }
         QuestionOutcome {
@@ -267,11 +318,11 @@ async fn one_call(
     url: &str,
     api_key: Option<&str>,
     headers: &reqwest::header::HeaderMap,
-    body: &serde_json::Value,
-    spliced: bool,
+    call: &QuestionCall,
+    variant: Variant,
     timeout: Duration,
 ) -> Result<QuestionSuccess, String> {
-    let first = one_attempt(http, url, api_key, headers, body, spliced, timeout).await;
+    let first = one_attempt(http, url, api_key, headers, call, variant, timeout).await;
     // "backend returned …" covers a 200 with missing or empty logprobs —
     // observed live from a crash-looping replica behind a load balancer that
     // answers with degenerate bodies. A backend that genuinely lacks logprobs
@@ -283,7 +334,7 @@ async fn one_call(
             || e.contains("backend returned"));
     if transient {
         tokio::time::sleep(TRANSIENT_RETRY_BACKOFF).await;
-        if let Ok(success) = one_attempt(http, url, api_key, headers, body, spliced, timeout).await
+        if let Ok(success) = one_attempt(http, url, api_key, headers, call, variant, timeout).await
         {
             return Ok(success);
         }
@@ -298,12 +349,15 @@ async fn one_attempt(
     url: &str,
     api_key: Option<&str>,
     headers: &reqwest::header::HeaderMap,
-    body: &serde_json::Value,
-    spliced: bool,
+    call: &QuestionCall,
+    variant: Variant,
     timeout: Duration,
 ) -> Result<QuestionSuccess, String> {
     let fut = async {
-        let mut req = http.post(url).headers(headers.clone()).json(body);
+        let body = call.body(variant);
+        let mut req = http.post(url).headers(headers.clone()).json(&body);
+        // Serialized into the request; the value and its image copies go now.
+        drop(body);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
@@ -313,13 +367,19 @@ async fn one_attempt(
             .map_err(|e| format!("upstream unreachable: {e}"))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("upstream returned {status}"));
+            // The backend's own message says why (a 400 for too many images,
+            // a context overflow); the status alone does not.
+            let detail = upstream_error_detail(&resp.text().await.unwrap_or_default());
+            return Err(match detail {
+                Some(detail) => format!("upstream returned {status}: {detail}"),
+                None => format!("upstream returned {status}"),
+            });
         }
         let completion: serde_json::Value = resp
             .json()
             .await
             .map_err(|e| format!("upstream returned invalid JSON: {e}"))?;
-        let entries = if spliced {
+        let entries = if variant == Variant::Splice {
             answers::parse_completions_top_logprobs(&completion)?
         } else {
             answers::parse_top_logprobs(&completion)?
@@ -346,12 +406,39 @@ async fn one_attempt(
     }
 }
 
+/// The `error.message` (or a top-level `message`) of an upstream error body,
+/// trimmed to one short line. `None` when the body carries neither.
+fn upstream_error_detail(body: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let message = json
+        .pointer("/error/message")
+        .or_else(|| json.get("message"))
+        .or_else(|| json.get("error"))
+        .and_then(|m| m.as_str())?;
+    let mut line: String = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.len() > 300 {
+        let mut end = 300;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.truncate(end);
+        line.push('…');
+    }
+    (!line.is_empty()).then_some(line)
+}
+
 /// The heuristic reserve for the fan-out. Each question really does prefill
-/// the state again on a cold cache, so the honest estimate is per-question
-/// (state + question + message overhead); prefix-cache hits show up as the
-/// reserve reconciling down at settlement.
-fn estimate(tokenizer: &dyn Tokenizer, system: &str, users: &[String]) -> CostEstimate {
-    let system_tokens = tokenizer.count_text(system);
+/// the state (and the images) again on a cold cache, so the honest estimate is
+/// per-question (state + images + question + message overhead); prefix-cache
+/// hits show up as the reserve reconciling down at settlement.
+fn estimate(
+    tokenizer: &dyn Tokenizer,
+    system: &str,
+    users: &[String],
+    images: usize,
+) -> CostEstimate {
+    let image_tokens = (images as u32).saturating_mul(proxy::IMAGE_PART_TOKEN_ESTIMATE as u32);
+    let system_tokens = tokenizer.count_text(system).saturating_add(image_tokens);
     let input_tokens = users
         .iter()
         .map(|u| {
@@ -542,7 +629,8 @@ async fn handler_inner(
         }
         Ok(false) => {}
     }
-    let est = estimate(&*state.tokenizer, &system, &users);
+    let image_count = request.images.len();
+    let est = estimate(&*state.tokenizer, &system, &users, image_count);
 
     // ---- model resolution (`auto` or a named route) ----
     let mut model = request.model.clone();
@@ -550,10 +638,14 @@ async fn handler_inner(
         // The router's inputs are chat-shaped; synthesize the state + first
         // question as a pseudo chat body for feature extraction and intent
         // derivation. Candidates are already hard-filtered to chat models.
+        // Image parts make vision a hard requirement of the pick.
         let pseudo = serde_json::json!({
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": users.first().cloned().unwrap_or_default()},
+                {"role": "user", "content": prompt::user_content(
+                    users.first().map(String::as_str).unwrap_or_default(),
+                    &request.images,
+                )},
             ]
         });
         let features =
@@ -581,7 +673,10 @@ async fn handler_inner(
             false,
         )
         .await;
-        let grants = crate::router::BoonGrants::from_settings(&state.boons.settings());
+        let mut grants = crate::router::BoonGrants::from_settings(&state.boons.settings());
+        // Verdicts runs no boons: a model that sees images only through the
+        // vision boon's describer cannot answer about them here.
+        grants.vision_active = false;
         let weights = crate::router::RouterWeights::from_settings(&router_settings);
         let uniform = if weights.samples() {
             crate::router::splitmix_uniform()
@@ -668,6 +763,14 @@ async fn handler_inner(
             }
         }
     }
+    // The images go to the model itself (no vision boon here), so it has to
+    // accept them.
+    if image_count > 0 && !route.supports_vision {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            &format!("model '{model}' does not accept images; use a model with vision"),
+        );
+    }
 
     let (in_cost_rate, out_cost_rate) = (route.input_cost_per_token, route.output_cost_per_token);
     let energy_slots = route.energy_slots_per_node;
@@ -752,6 +855,7 @@ async fn handler_inner(
                 "decision": admission.as_str(),
                 "queue_wait_ms": queue_wait_ms,
                 "questions": request.questions.len(),
+                "images": image_count,
             }),
         );
     }
@@ -986,19 +1090,23 @@ async fn handler_inner(
         .map(|s| Duration::from_secs(s as u64))
         .unwrap_or(state.upstream_timeout);
 
+    let shared = Arc::new(SharedPrompt {
+        upstream_model: route.upstream_model.clone(),
+        system,
+        images: request.images,
+    });
     let calls: Vec<QuestionCall> = request
         .questions
         .iter()
-        .zip(users.iter())
+        .zip(users)
         .map(|((id, _), user)| {
             let labels = &label_sets[id];
             QuestionCall {
                 id: id.clone(),
                 labels: labels.labels.clone(),
                 boolean: matches!(labels.semantics, prompt::LabelSemantics::Boolean),
-                body: prompt::build_body(&route.upstream_model, &system, user),
-                prefill_body: prompt::build_body_prefilled(&route.upstream_model, &system, user),
-                splice_body: prompt::build_body_spliced(&route.upstream_model, &system, user),
+                shared: shared.clone(),
+                user,
             }
         })
         .collect();
@@ -1206,15 +1314,107 @@ mod tests {
     }
 
     fn call(id: &str, user: &str) -> QuestionCall {
+        call_with_images(id, user, Vec::new())
+    }
+
+    fn call_with_images(id: &str, user: &str, images: Vec<String>) -> QuestionCall {
         QuestionCall {
             id: id.to_string(),
             // The canned upstream answers ` A`/` B`, so these labels match.
             labels: vec!["A".to_string(), "B".to_string()],
             boolean: false,
-            body: prompt::build_body("upstream-model", "shared system", user),
-            prefill_body: prompt::build_body_prefilled("upstream-model", "shared system", user),
-            splice_body: prompt::build_body_spliced("upstream-model", "shared system", user),
+            shared: Arc::new(SharedPrompt {
+                upstream_model: "upstream-model".to_string(),
+                system: "shared system".to_string(),
+                images,
+            }),
+            user: user.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn images_reach_every_question_ahead_of_its_text() {
+        let (url, hits, bodies) = serve_upstream().await;
+        let http = reqwest::Client::new();
+        let images = vec!["data:image/png;base64,AAAA".to_string()];
+        let outcomes = fan_out(
+            &http,
+            &url,
+            None,
+            &reqwest::header::HeaderMap::new(),
+            "vision-model",
+            vec![
+                call_with_images("q1", "first question", images.clone()),
+                call_with_images("q2", "second question", images),
+            ],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(outcomes.iter().all(|o| o.result.is_ok()));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let bodies = bodies.lock().unwrap();
+        for body in bodies.iter() {
+            assert_eq!(body["messages"][0]["content"], "shared system");
+            let parts = body["messages"][1]["content"].as_array().expect("parts");
+            assert_eq!(parts[0]["image_url"]["url"], "data:image/png;base64,AAAA");
+            assert_eq!(parts[1]["type"], "text");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_harmony_model_asked_about_images_is_not_spliced() {
+        // The splice is text-only: with images, the plain result stands and
+        // /v1/completions is never called, even for a model known to need it.
+        let (url, chat_hits, text_hits) = serve_harmony_upstream().await;
+        let http = reqwest::Client::new();
+        let model = "harmony-model-images";
+        remember_harmony_splice(model);
+        let outcomes = fan_out(
+            &http,
+            &url,
+            None,
+            &reqwest::header::HeaderMap::new(),
+            model,
+            vec![call_with_images(
+                "q",
+                "look",
+                vec!["https://example.com/a.png".to_string()],
+            )],
+            Duration::from_secs(5),
+        )
+        .await;
+        let success = outcomes[0].result.as_ref().expect("the plain call ran");
+        assert!(!success.used_splice && !success.used_prefill);
+        let (_, in_set) = answers::label_masses(&success.entries, &call("q", "x").labels, false);
+        assert!(
+            in_set < MIN_IN_SET_MASS,
+            "no answer label, so the request fails"
+        );
+        assert_eq!(chat_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(text_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn upstream_error_detail_reads_the_backend_message() {
+        assert_eq!(
+            upstream_error_detail(
+                r#"{"error": {"message": "At most 1 image(s)\n may be provided", "type": "BadRequestError"}}"#
+            )
+            .as_deref(),
+            Some("At most 1 image(s) may be provided")
+        );
+        assert_eq!(
+            upstream_error_detail(r#"{"message": "bad"}"#).as_deref(),
+            Some("bad")
+        );
+        assert_eq!(
+            upstream_error_detail(r#"{"error": "boom"}"#).as_deref(),
+            Some("boom")
+        );
+        assert_eq!(upstream_error_detail("<html>502</html>"), None);
+        let long = format!(r#"{{"error": {{"message": "{}"}}}}"#, "é".repeat(400));
+        let detail = upstream_error_detail(&long).unwrap();
+        assert!(detail.len() <= 300 + '…'.len_utf8());
     }
 
     #[tokio::test]
@@ -1574,10 +1774,14 @@ mod tests {
         let tokenizer = obleth_tokenizer::HeuristicTokenizer;
         let system = "x".repeat(400); // ~100 tokens heuristic
         let users = vec!["y".repeat(40), "y".repeat(40)]; // ~10 tokens each
-        let est = estimate(&tokenizer, &system, &users);
+        let est = estimate(&tokenizer, &system, &users, 0);
         // Each question pays the state prefill again: 2 × (100 + 10 + 8).
         assert_eq!(est.input_tokens, 2 * (100 + 10 + 8));
         assert_eq!(est.estimated_output_tokens, 2);
+        // And the images, at the chat estimate's flat cost per image part.
+        let est = estimate(&tokenizer, &system, &users, 2);
+        let per_image = proxy::IMAGE_PART_TOKEN_ESTIMATE as u32;
+        assert_eq!(est.input_tokens, 2 * (100 + 2 * per_image + 10 + 8));
     }
 }
 
@@ -1626,7 +1830,7 @@ mod settlement_tests {
             .find(".scan_input(")
             .expect("tenant input guardrails scan");
         let estimate = h
-            .find("letest=estimate(&*state.tokenizer,&system,&users);")
+            .find("letest=estimate(&*state.tokenizer,&system,&users,image_count);")
             .expect("cost estimate");
         let admit = h.find("state.fairshare.admit(").expect("admission");
         assert!(scan < estimate && estimate < admit);

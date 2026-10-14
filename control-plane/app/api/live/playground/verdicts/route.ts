@@ -36,7 +36,9 @@ const questionSchema = z.discriminatedUnion("type", [
 
 const bodySchema = z.object({
   model: z.string().min(1).max(200),
-  state: z.union([z.string().min(1), z.record(z.unknown()), z.array(z.unknown())]),
+  // Optional when images are sent; checked below.
+  state: z.union([z.string().min(1), z.record(z.unknown()), z.array(z.unknown())]).optional(),
+  images: z.array(z.string().startsWith("data:image/")).max(8).optional(),
   questions: z.record(z.string().min(1).max(64), questionSchema),
 });
 
@@ -48,7 +50,10 @@ export async function POST(req: NextRequest) {
   if (!parsed.success) {
     return NextResponse.json({ error: "Invalid verdicts request." }, { status: 400 });
   }
-  const { model, state, questions } = parsed.data;
+  const { model, state, images, questions } = parsed.data;
+  if (state === undefined && !images?.length) {
+    return NextResponse.json({ error: "Add a state, an image, or both." }, { status: 400 });
+  }
   const ids = Object.keys(questions);
   if (ids.length === 0 || ids.length > 32) {
     return NextResponse.json(
@@ -68,7 +73,12 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  const body: GatewayVerdictsBody = { model, state, questions };
+  const body: GatewayVerdictsBody = {
+    model,
+    ...(state !== undefined ? { state } : {}),
+    ...(images?.length ? { images } : {}),
+    questions,
+  };
   const started = Date.now();
   try {
     const upstream = await gatewayVerdicts(body);
