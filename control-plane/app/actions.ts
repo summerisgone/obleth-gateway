@@ -2103,6 +2103,7 @@ export async function saveSettingsAction(formData: FormData): Promise<SettingsSa
         difficulty_enabled: g("routing", "difficulty") === "on",
         tier_source: (trimmed(g("routing", "tier_source")) || "hybrid") as "hybrid" | "derived" | "declared",
         messages_default_model: trimmed(g("routing", "messages_default_model")),
+        verdicts_default_model: trimmed(g("routing", "verdicts_default_model")),
       });
     } else if (section === "boons") {
       const parsed = boonSettingsFromForm(formData);
@@ -2168,6 +2169,7 @@ const autoRouterUpdateSchema = z.object({
   difficulty_enabled: z.boolean().optional(),
   tier_source: z.enum(["hybrid", "derived", "declared"]).optional(),
   messages_default_model: z.string().optional(),
+  verdicts_default_model: z.string().optional(),
 });
 
 export async function setAutoRouterSettingsAction(
