@@ -2291,6 +2291,10 @@ pub struct AutoRouterSettings {
     /// model ids). `None` means such requests get `not_found_error`.
     #[serde(default)]
     pub messages_default_model: Option<String>,
+    /// Model or alias a `/v1/verdicts` request is answered by when it names no
+    /// model. `None` means such requests go to `auto`.
+    #[serde(default)]
+    pub verdicts_default_model: Option<String>,
 }
 
 fn default_classifier_timeout_ms() -> u64 {
@@ -2323,6 +2327,7 @@ impl Default for AutoRouterSettings {
             difficulty_enabled: false,
             tier_source: TierSource::default(),
             messages_default_model: None,
+            verdicts_default_model: None,
         }
     }
 }
@@ -4666,5 +4671,6 @@ mod tests {
         let v: AutoRouterSettings =
             serde_json::from_str(r#"{"classifier_enabled":false}"#).unwrap();
         assert_eq!(v.messages_default_model, None);
+        assert_eq!(v.verdicts_default_model, None);
     }
 }

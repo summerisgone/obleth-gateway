@@ -1398,6 +1398,7 @@ export interface AutoRouterSettingsView {
   difficulty_enabled: boolean;
   tier_source: "hybrid" | "derived" | "declared";
   messages_default_model: string | null;
+  verdicts_default_model: string | null;
 }
 
 export interface UpdateAutoRouterSettings {
@@ -1412,6 +1413,7 @@ export interface UpdateAutoRouterSettings {
   difficulty_enabled?: boolean;
   tier_source?: "hybrid" | "derived" | "declared";
   messages_default_model?: string | null;
+  verdicts_default_model?: string | null;
 }
 
 /// Where a request's routing intent came from. `classifier` never appears in a

@@ -28,6 +28,7 @@ export function RoutingSection({ settings, models, readiness }: { settings: Auto
   const [classifierOn, setClassifierOn] = useState(settings.classifier_enabled);
   const [classifier, setClassifier] = useState(settings.classifier_model ?? "");
   const [anthropic, setAnthropic] = useState(settings.messages_default_model ?? "");
+  const [verdicts, setVerdicts] = useState(settings.verdicts_default_model ?? "");
   const [advanced, setAdvanced] = useState(false);
   const profile = routerProfileOf(v);
   const set = <K extends keyof RouterValues>(k: K, value: RouterValues[K]) => setV((x) => ({ ...x, [k]: value }));
@@ -100,6 +101,9 @@ export function RoutingSection({ settings, models, readiness }: { settings: Auto
       </Setting>
       <Setting id="set-anthropic" label="Anthropic clients" hint="The model a /v1/messages request gets when it names a Claude model obleth doesn't have." fields={["routing.messages_default_model"]} was={{ field: "routing.messages_default_model" }}>
         <div className="w-64"><SelectField name="routing.messages_default_model" label="Default for Anthropic clients" value={anthropic} onChange={setAnthropic} options={[{ value: "", label: "None: refuse the request" }, { value: "auto", label: "auto" }, ...names.map((n) => ({ value: n, label: n }))]} /></div>
+      </Setting>
+      <Setting id="set-verdicts" label="Verdicts" hint="The model a /v1/verdicts request gets when it names none. Pick an instruct model: thinking models answer verdicts with low confidence." fields={["routing.verdicts_default_model"]} was={{ field: "routing.verdicts_default_model" }}>
+        <div className="w-64"><SelectField name="routing.verdicts_default_model" label="Default for verdicts" value={verdicts} onChange={setVerdicts} options={[{ value: "", label: "auto" }, ...names.map((n) => ({ value: n, label: n }))]} /></div>
       </Setting>
       <Setting label="Advanced" hint="Randomness when scores are close, and how many requests a model takes before others are tried." fields={["routing.temperature", "routing.soft_cap"]}>
         {!advanced ? (

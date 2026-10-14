@@ -454,6 +454,41 @@ fn estimate(
     }
 }
 
+/// The model a request is for: the one it names, else the operator's verdicts
+/// default, else `auto`.
+fn requested_model(named: &str, default: Option<&str>) -> String {
+    [Some(named), default]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|m| !m.is_empty())
+        .unwrap_or(crate::router::AUTO_MODEL_NAME)
+        .to_string()
+}
+
+/// The route for a named model, and the family it was called through. A
+/// family is answered by its `none` member: a verdict is read off the first
+/// answer token, so the member that answers without thinking first is the one
+/// that can give it. The error is a family whose member is not registered.
+async fn resolve_named(
+    state: &AppState,
+    name: &str,
+) -> Result<(Option<Arc<obleth_config::ResolvedModel>>, Option<String>), String> {
+    if let Some(route) = resolve_model(state, name).await {
+        return Ok((Some(route), None));
+    }
+    let Some(family) = state.families.get(name) else {
+        return Ok((None, None));
+    };
+    let (_, member) = family.member_for(Some(obleth_config::ReasoningLevel::None));
+    match resolve_model(state, member).await {
+        Some(route) => Ok((Some(route), Some(family.name.clone()))),
+        None => Err(format!(
+            "model family '{name}' sends `none` to '{member}', which is not registered"
+        )),
+    }
+}
+
 pub async fn handler(state: State<AppState>, req: Request<Body>) -> Response<Body> {
     let request_id = Uuid::new_v4();
     let mut resp = handler_inner(state, req, request_id).await;
@@ -562,7 +597,7 @@ async fn handler_inner(
         state.session_id_derivation,
     );
     let end_user = proxy::end_user_for(&resolved, &headers, &json);
-    let req_meta = RequestMeta {
+    let mut req_meta = RequestMeta {
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
         request_type: surfaced_request_type(&resolved, VERDICTS_PATH, &headers),
@@ -633,7 +668,17 @@ async fn handler_inner(
     let est = estimate(&*state.tokenizer, &system, &users, image_count);
 
     // ---- model resolution (`auto` or a named route) ----
-    let mut model = request.model.clone();
+    let mut model = requested_model(
+        &request.model,
+        state
+            .classifier
+            .settings()
+            .verdicts_default_model
+            .as_deref(),
+    );
+    // The family a named model came through, which the tenant allowlist also
+    // accepts (as it does for chat).
+    let mut family: Option<String> = None;
     let route = if model == crate::router::AUTO_MODEL_NAME {
         // The router's inputs are chat-shaped; synthesize the state + first
         // question as a pseudo chat body for feature extraction and intent
@@ -718,7 +763,13 @@ async fn handler_inner(
             }
         }
     } else {
-        let route = resolve_model(&state, &model).await;
+        let route = match resolve_named(&state, &model).await {
+            Ok((route, via)) => {
+                family = via;
+                route
+            }
+            Err(msg) => return error_json(StatusCode::NOT_FOUND, &msg),
+        };
         if let Some(r) = route.as_ref() {
             if r.model_name != model {
                 model = r.model_name.clone();
@@ -758,10 +809,16 @@ async fn handler_inner(
     }
     if !resolved.internal {
         if let Some(allowed) = &resolved.allowed_models {
-            if !allowed.iter().any(|m| m == &model) {
+            if !allowed
+                .iter()
+                .any(|m| m == &model || family.as_deref() == Some(m.as_str()))
+            {
                 return error_json(StatusCode::FORBIDDEN, "model not permitted for tenant");
             }
         }
+    }
+    if let Some(f) = family {
+        req_meta.model_family = f;
     }
     // The images go to the model itself (no vision boon here), so it has to
     // accept them.
@@ -1770,6 +1827,15 @@ mod tests {
     }
 
     #[test]
+    fn the_model_named_wins_then_the_default_then_auto() {
+        assert_eq!(requested_model("glm-5-3", Some("judge")), "glm-5-3");
+        assert_eq!(requested_model("", Some("judge")), "judge");
+        assert_eq!(requested_model("  ", Some(" judge ")), "judge");
+        assert_eq!(requested_model("", None), "auto");
+        assert_eq!(requested_model("", Some("")), "auto");
+    }
+
+    #[test]
     fn the_estimate_reserves_the_full_no_cache_fan_out() {
         let tokenizer = obleth_tokenizer::HeuristicTokenizer;
         let system = "x".repeat(400); // ~100 tokens heuristic
@@ -1857,5 +1923,302 @@ mod settlement_tests {
         assert!(scope.contains("\"timedoutwaitingformodelcapacity\""));
         assert!(scope.contains("header::RETRY_AFTER"));
         assert!(scope.contains("proxy::ADMISSION_RETRY_AFTER_SECS"));
+    }
+}
+
+/// The handler end to end against a canned backend, for how a request's model
+/// is chosen. Needs Postgres and Redis (`OBLETH_TEST_DATABASE_URL`,
+/// `OBLETH_TEST_REDIS_URL`); skipped without them.
+#[cfg(test)]
+mod model_choice_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{header, Method, Request, StatusCode};
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use moka::future::Cache;
+    use obleth_config::{
+        AutoRouterSettings, FamilyMembers, ModelFamily, ReasoningLevel, ResolvedModel,
+    };
+    use serde_json::{json, Value};
+    use uuid::Uuid;
+
+    use crate::state::AppState;
+
+    type Seen = Arc<Mutex<Vec<Value>>>;
+
+    /// Answers every question `yes`, and keeps each body it was sent.
+    async fn spawn_upstream() -> (Seen, String) {
+        let seen: Seen = Arc::default();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|State(seen): State<Seen>, Json(body): Json<Value>| async move {
+                    seen.lock().unwrap().push(body);
+                    Json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "yes"},
+                            "logprobs": {"content": [{
+                                "token": "yes", "logprob": -0.01,
+                                "top_logprobs": [
+                                    {"token": "yes", "logprob": -0.01},
+                                    {"token": "no", "logprob": -4.6}
+                                ]
+                            }]},
+                            "finish_reason": "length"
+                        }],
+                        "usage": {"prompt_tokens": 20, "completion_tokens": 1, "total_tokens": 21}
+                    }))
+                }),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (seen, format!("http://{addr}/v1"))
+    }
+
+    struct Gateway {
+        state: AppState,
+        wal_dir: std::path::PathBuf,
+    }
+
+    impl Drop for Gateway {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.wal_dir);
+        }
+    }
+
+    impl Gateway {
+        async fn register(&self, name: &str, base: &str) {
+            let mut r: ResolvedModel = crate::boons::test_support::test_route();
+            r.model_name = name.into();
+            r.upstream_model = format!("{name}-upstream");
+            r.api_base = base.into();
+            self.state
+                .model_cache
+                .insert(r.model_name.clone(), Arc::new(r))
+                .await;
+        }
+
+        async fn key(&self) -> String {
+            let mut key = crate::boons::test_support::test_key();
+            key.key_id = Uuid::new_v4();
+            key.tenant_id = Uuid::new_v4();
+            let secret = format!("sk-verdicts-{}", Uuid::new_v4());
+            self.state
+                .key_cache
+                .insert(obleth_config::hash_api_key(&secret), Arc::new(key))
+                .await;
+            secret
+        }
+
+        async fn verdicts(&self, secret: &str, body: Value) -> (StatusCode, Value) {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(super::VERDICTS_PATH)
+                .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = super::handler(State(self.state.clone()), req).await;
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    }
+
+    async fn gateway(router: AutoRouterSettings) -> Option<Gateway> {
+        let (Ok(db), Ok(redis_url)) = (
+            std::env::var("OBLETH_TEST_DATABASE_URL"),
+            std::env::var("OBLETH_TEST_REDIS_URL"),
+        ) else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return None;
+        };
+        let store = obleth_store::Store::connect(&db).await.expect("postgres");
+        let redis = obleth_redis::RedisStore::connect(&redis_url)
+            .await
+            .expect("redis");
+        let wal_dir = std::env::temp_dir().join(format!("obleth-verdicts-wal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let telemetry = obleth_telemetry::TelemetrySink::start(
+            "http://127.0.0.1:1",
+            "obleth_test",
+            "default",
+            "",
+            wal_dir.join("usage.wal").to_str().unwrap(),
+            Duration::from_millis(100),
+            true,
+        )
+        .await
+        .expect("telemetry sink");
+        let http = reqwest::Client::new();
+        let state = AppState {
+            redis,
+            fairshare: obleth_fairshare::FairShare::start(
+                Arc::new(obleth_fairshare::StaticCapacity::new(64)),
+                obleth_config::FairshareAlgorithm::default(),
+                64,
+            ),
+            tokenizer: Arc::new(obleth_tokenizer::HeuristicTokenizer::new()),
+            telemetry,
+            http: http.clone(),
+            upstream_base: "http://127.0.0.1:1/v1".into(),
+            upstream_timeout: Duration::from_secs(30),
+            key_cache: Cache::builder().build(),
+            model_cache: Cache::builder().build(),
+            mcp_cache: Cache::builder().build(),
+            model_registry: crate::router::ModelRegistry::new(),
+            families: crate::reasoning::FamilyRegistry::new(),
+            classifier: crate::classifier::Classifier::new(router),
+            output_stats: Default::default(),
+            boons: crate::boons::BoonEngine::new(Default::default()),
+            tool_cache: Cache::builder().build(),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            fail_open: false,
+            alerts: obleth_admin::AlertDispatcher::new(http, Default::default()),
+            session_id_derivation: false,
+            compressor: None,
+            energy: crate::energy::EnergyEngine::new(Default::default()),
+            jwt: None,
+            knowledge: Arc::new(crate::knowledge::KnowledgeIndex::new()),
+            video_jobs: crate::videos::VideoJobStore::new(store, Default::default()),
+        };
+        Some(Gateway { state, wal_dir })
+    }
+
+    fn family(none: &str) -> ModelFamily {
+        ModelFamily {
+            id: Uuid::new_v4(),
+            name: "acme".into(),
+            description: String::new(),
+            // The family's chat default is a thinking level; verdicts still
+            // takes the `none` member.
+            default_level: ReasoningLevel::High,
+            members: FamilyMembers {
+                none: none.into(),
+                low: "acme-think".into(),
+                medium: "acme-think".into(),
+                high: "acme-think".into(),
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn question() -> Value {
+        json!({"q": {"type": "boolean", "instructions": "Is it?"}})
+    }
+
+    #[tokio::test]
+    async fn a_family_name_is_answered_by_its_none_member() {
+        let Some(gw) = gateway(AutoRouterSettings::default()).await else {
+            return;
+        };
+        let (seen, base) = spawn_upstream().await;
+        gw.register("acme-instruct", &base).await;
+        gw.register("acme-think", &base).await;
+        gw.state.families.store(vec![family("acme-instruct")]);
+        let secret = gw.key().await;
+
+        let (status, body) = gw
+            .verdicts(
+                &secret,
+                json!({"model": "acme", "state": "x", "questions": question()}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["model"], "acme-instruct");
+        assert_eq!(body["verdicts"]["q"]["value"], true);
+        assert_eq!(
+            seen.lock().unwrap().pop().unwrap()["model"],
+            "acme-instruct-upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_family_whose_none_member_is_missing_says_so() {
+        let Some(gw) = gateway(AutoRouterSettings::default()).await else {
+            return;
+        };
+        gw.state.families.store(vec![family("acme-gone")]);
+        let secret = gw.key().await;
+
+        let (status, body) = gw
+            .verdicts(
+                &secret,
+                json!({"model": "acme", "state": "x", "questions": question()}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("'acme-gone', which is not registered"));
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_model_gets_the_verdicts_default() {
+        let Some(gw) = gateway(AutoRouterSettings {
+            verdicts_default_model: Some("judge".into()),
+            ..Default::default()
+        })
+        .await
+        else {
+            return;
+        };
+        let (seen, base) = spawn_upstream().await;
+        gw.register("judge", &base).await;
+        let secret = gw.key().await;
+
+        let (status, body) = gw
+            .verdicts(&secret, json!({"state": "x", "questions": question()}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["model"], "judge");
+        assert_eq!(
+            seen.lock().unwrap().pop().unwrap()["model"],
+            "judge-upstream"
+        );
+
+        // A named model still wins over the default.
+        gw.register("other", &base).await;
+        let (status, body) = gw
+            .verdicts(
+                &secret,
+                json!({"model": "other", "state": "x", "questions": question()}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["model"], "other");
+    }
+
+    #[tokio::test]
+    async fn without_a_default_a_request_without_a_model_goes_to_auto() {
+        let Some(gw) = gateway(AutoRouterSettings::default()).await else {
+            return;
+        };
+        let secret = gw.key().await;
+
+        // No candidates are registered, so `auto` has nothing to pick.
+        let (status, body) = gw
+            .verdicts(&secret, json!({"state": "x", "questions": question()}))
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body["error"]["message"],
+            "no model is available to satisfy the auto request"
+        );
     }
 }
