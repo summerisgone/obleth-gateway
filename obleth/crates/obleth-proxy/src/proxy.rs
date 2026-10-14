@@ -2820,20 +2820,23 @@ async fn run_pipeline(
                         yield item;
                     }
                     drop(permit);
-                    let (ttft_ms, input_tokens, output_tokens) = {
+                    // A failed client-facing turn settles like a failed
+                    // pass-through stream; a clean one with its usage, or the
+                    // estimate when the upstream reported none.
+                    let (ttft_ms, settled) = {
                         let s = stats.lock().unwrap_or_else(|e| e.into_inner());
-                        let toks = if s.final_set {
-                            (s.input_tokens, s.output_tokens)
-                        } else {
-                            (est.input_tokens, est.estimated_output_tokens)
-                        };
-                        (s.ttft_ms, toks.0, toks.1)
+                        let usage = s
+                            .final_set
+                            .then(|| UpstreamUsage::uncached(s.input_tokens, s.output_tokens));
+                        (
+                            s.ttft_ms,
+                            drained_settlement(status_code, s.failure, usage, s.failed_turn_chars, est),
+                        )
                     };
                     let total_ms = request_start.elapsed().as_millis() as u32;
                     accounting.monitor(scan_policy.as_ref(), output_monitor);
-                    let _ = settle_guard.complete(accounting.settle(
-                        UpstreamUsage::uncached(input_tokens, output_tokens),
-                        ttft_ms, total_ms, status_code, None,
+                    let _ = settle_guard.complete(accounting.settle_with(
+                        settled.tokens, ttft_ms, total_ms, settled.status, None, settled.billed,
                     )).await;
                 };
                 if let Some(t) = tracer.take() {
@@ -2875,6 +2878,7 @@ async fn run_pipeline(
         let mut buf: Vec<u8> = Vec::new();
         let mut ttft_ms = 0u32;
         let mut truncated = false;
+        let mut read_error: Option<String> = None;
         let mut byte_stream = upstream.bytes_stream();
         while let Some(item) = byte_stream.next().await {
             match item {
@@ -2891,9 +2895,33 @@ async fn run_pipeline(
                 Err(e) => {
                     tracing::warn!(error = %e, "upstream read failed during boon interception");
                     truncated = true;
+                    read_error = Some(e.to_string());
                     break;
                 }
             }
+        }
+
+        // The upstream broke off before its whole answer arrived. Nothing has
+        // reached the client, and a cut-off completion reports no usage: a
+        // failed call (502), billed nothing.
+        if let Some(err) = read_error {
+            drop(permit);
+            state.alerts.issue(
+                "upstream_stream_error",
+                "Upstream stream failed",
+                format!(
+                    "tenant `{}` model `{model}` status `{status_code}`: {err}",
+                    resolved.tenant_name
+                ),
+            );
+            let total_ms = request_start.elapsed().as_millis() as u32;
+            let _ = settle_guard
+                .complete(accounting.settle_unbilled(ttft_ms, total_ms, 502))
+                .await;
+            if let Some(t) = tracer.take() {
+                t.finish("error");
+            }
+            return error_json(StatusCode::BAD_GATEWAY, "upstream stream failed");
         }
 
         // Parse + transform. Oversized, truncated, or unparseable bodies pass
@@ -2907,6 +2935,63 @@ async fn run_pipeline(
             && buf.len() <= BOON_BUFFER_MAX)
             .then(|| serde_json::from_slice::<serde_json::Value>(&buf).ok())
             .flatten();
+
+        // A 200 whose body is the upstream's own failure (an error object, or
+        // a generation the server aborted) has nothing to transform. The
+        // client gets that body under the failure's status, as if the
+        // upstream had said so in its status line; the request is billed
+        // only the usage the body reports and is never cached.
+        if let Some(failure) = completion
+            .as_ref()
+            .and_then(crate::upstream_failure::payload_failure)
+        {
+            drop(permit);
+            tracing::warn!(
+                status = failure.status,
+                message = %failure.message,
+                "upstream reported a failure inside a 200 response"
+            );
+            if failure.status >= 500 {
+                state.alerts.issue(
+                    "upstream_error_event",
+                    "Upstream reported an error inside a response",
+                    format!(
+                        "tenant `{}` model `{model}` status `{}`: {}",
+                        resolved.tenant_name, failure.status, failure.message
+                    ),
+                );
+            }
+            let (tokens, billed) = match completion.as_ref().and_then(completion_body_usage) {
+                Some(tokens) => (tokens, true),
+                None => (UpstreamUsage::default(), false),
+            };
+            let total_ms = request_start.elapsed().as_millis() as u32;
+            let _ = settle_guard
+                .complete(accounting.settle_with(
+                    tokens,
+                    ttft_ms,
+                    total_ms,
+                    failure.status,
+                    None,
+                    billed,
+                ))
+                .await;
+            if let Some(t) = tracer.take() {
+                t.finish("error");
+            }
+            let mut builder = Response::builder()
+                .status(failure.status)
+                .header(header::CONTENT_TYPE, content_type)
+                .header("x-obleth-request-id", request_id.to_string())
+                .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
+            if !boons_applied.is_empty() {
+                builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
+            }
+            return builder.body(Body::from(buf)).unwrap_or_else(|_| {
+                error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+            });
+        }
+
         let (final_body, final_content_type): (Bytes, String) = match completion.as_mut() {
             Some(body_json) => {
                 // Tool-loop and repair calls run while the fairshare permit is
@@ -3046,6 +3131,13 @@ async fn run_pipeline(
         t.finish(if status_code < 400 { "ok" } else { "error" });
     }
 
+    // A generation request's 200 can still carry the upstream's failure in its
+    // body (an SSE error event, or a JSON error object); watched so it is
+    // recorded as the failure it is.
+    let mut failure_watch = (method == Method::POST)
+        .then(|| crate::upstream_failure::FailureWatch::for_content_type(&content_type_str))
+        .flatten();
+
     // ---- stream back, inspecting for actual usage, then reconcile ----
     let body_stream = async_stream::stream! {
         let mut byte_stream = upstream.bytes_stream();
@@ -3071,6 +3163,7 @@ async fn run_pipeline(
                     // gateway-requested usage chunk is filtered out.
                     append_tail(&mut tail, &chunk);
                     streamed_chars += delta_text_chars(&chunk);
+                    if let Some(watch) = failure_watch.as_mut() { watch.push(&chunk); }
                     let chunk = match usage_filter.as_mut() {
                         Some(filter) => filter.push(chunk),
                         None => chunk,
@@ -3141,20 +3234,43 @@ async fn run_pipeline(
             // Settlement is handed off before the error is yielded: the error
             // makes hyper drop this body, and the guard would otherwise settle
             // it as a client disconnect.
-            let (tokens, billed) = truncated_stream_billing(usage, streamed_chars, est);
+            let settled = drained_settlement(status_code, Some(502), usage, streamed_chars, est);
             let _ = settle_guard.complete(accounting.settle_with(
-                tokens, ttft_ms, total_ms, 502, None, billed,
+                settled.tokens, ttft_ms, total_ms, settled.status, None, settled.billed,
             )).await;
             // An error item aborts the response instead of ending it cleanly,
             // so the client cannot mistake the truncated body for a whole one.
             yield Err(std::io::Error::other(format!("upstream stream failed: {err}")));
         } else {
-            let tokens = usage.unwrap_or(UpstreamUsage::uncached(
-                est.input_tokens,
-                est.estimated_output_tokens,
-            ));
+            // The bytes already went to the client as the upstream sent them;
+            // a failure it reported in them is recorded as one.
+            let failure = failure_watch.take().and_then(|w| w.finish());
+            if let Some(failure) = &failure {
+                tracing::warn!(
+                    status = failure.status,
+                    message = %failure.message,
+                    "upstream reported a failure inside a {status_code} response"
+                );
+                if failure.status >= 500 {
+                    accounting.state.alerts.issue(
+                        "upstream_error_event",
+                        "Upstream reported an error inside a response",
+                        format!(
+                            "tenant `{}` model `{model}` status `{}`: {}",
+                            accounting.resolved.tenant_name, failure.status, failure.message
+                        ),
+                    );
+                }
+            }
+            let settled = drained_settlement(
+                status_code,
+                failure.as_ref().map(|f| f.status),
+                usage,
+                streamed_chars,
+                est,
+            );
             // store the full response for identical future requests
-            let cache_put = if cacheable && status_code == 200 {
+            let cache_put = if cacheable && settled.cacheable {
                 store_in_cache.as_deref().map(|ck| {
                     // Take ownership of the buffer instead of copying it; the
                     // lossy re-encode only runs for invalid UTF-8 (never for the
@@ -3166,8 +3282,8 @@ async fn run_pipeline(
             } else {
                 None
             };
-            let _ = settle_guard.complete(accounting.settle(
-                tokens, ttft_ms, total_ms, status_code, cache_put,
+            let _ = settle_guard.complete(accounting.settle_with(
+                settled.tokens, ttft_ms, total_ms, settled.status, cache_put, settled.billed,
             )).await;
         }
     };
@@ -3421,11 +3537,58 @@ async fn release_term_hold(
     }
 }
 
-/// Tokens and billing for a stream the upstream broke off. Reported usage
-/// wins; otherwise the text already delivered is estimated the way the
-/// admission estimator counts text (`HeuristicTokenizer::count_text`,
-/// ~4 characters per token) on top of the prompt estimate. Nothing streamed
-/// means nothing generated, so it is unbilled.
+/// How a drained pass-through response settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DrainedSettlement {
+    status: u16,
+    tokens: UpstreamUsage,
+    billed: bool,
+    /// The body may be stored in the response cache.
+    cacheable: bool,
+}
+
+/// Settlement for a response that has finished streaming to the client.
+/// `failure` is the status of a failure seen on the way: the stream broke off
+/// (502), or the upstream reported an error inside its own 200. A failed
+/// response is billed like a broken-off stream, never with the admission
+/// estimate (which is `max_tokens` when the client set it), and is never
+/// cached. A clean one settles with its reported usage, or the estimate
+/// when the upstream reported none.
+fn drained_settlement(
+    status_code: u16,
+    failure: Option<u16>,
+    usage: Option<UpstreamUsage>,
+    streamed_chars: usize,
+    est: CostEstimate,
+) -> DrainedSettlement {
+    match failure {
+        Some(status) => {
+            let (tokens, billed) = truncated_stream_billing(usage, streamed_chars, est);
+            DrainedSettlement {
+                status,
+                tokens,
+                billed,
+                cacheable: false,
+            }
+        }
+        None => DrainedSettlement {
+            status: status_code,
+            tokens: usage.unwrap_or(UpstreamUsage::uncached(
+                est.input_tokens,
+                est.estimated_output_tokens,
+            )),
+            billed: true,
+            cacheable: status_code == 200,
+        },
+    }
+}
+
+/// Tokens and billing for a stream that failed: the upstream broke it off, or
+/// reported an error in it. Reported usage wins; otherwise the text already
+/// delivered is estimated the way the admission estimator counts text
+/// (`HeuristicTokenizer::count_text`, ~4 characters per token) on top of the
+/// prompt estimate. Nothing streamed means nothing generated, so it is
+/// unbilled.
 fn truncated_stream_billing(
     usage: Option<UpstreamUsage>,
     streamed_chars: usize,
@@ -9364,5 +9527,110 @@ mod lifecycle_tests {
             .find("apply_multipart_text_view(fields,&json);")
             .expect("a redaction reaches the forwarded form");
         assert!(scan < write_back);
+    }
+
+    #[test]
+    fn a_failed_stream_settles_for_its_output_and_is_never_cached() {
+        let est = CostEstimate {
+            input_tokens: 30,
+            estimated_output_tokens: 8192,
+        };
+        // An error event after "Hello, world and more" (21 characters)
+        // streamed, with no usage reported: the delivered text is billed.
+        let failed = drained_settlement(200, Some(500), None, 21, est);
+        assert_eq!(
+            failed,
+            DrainedSettlement {
+                status: 500,
+                tokens: UpstreamUsage::uncached(30, 5),
+                billed: true,
+                cacheable: false,
+            }
+        );
+        // An error before any output: nothing generated, nothing billed.
+        let empty = drained_settlement(200, Some(400), None, 0, est);
+        assert_eq!(
+            empty,
+            DrainedSettlement {
+                status: 400,
+                tokens: UpstreamUsage::default(),
+                billed: false,
+                cacheable: false,
+            }
+        );
+        // Usage the upstream did report (an aborted generation still sends
+        // it) wins over the estimate from text.
+        let reported = UpstreamUsage::new(12, 7, 4);
+        let aborted = drained_settlement(200, Some(502), Some(reported), 99, est);
+        assert_eq!((aborted.status, aborted.tokens), (502, reported));
+        assert!(aborted.billed && !aborted.cacheable);
+        // The admission estimate (here `max_tokens`) is a ceiling, never the
+        // output of a failed call.
+        for settled in [failed, empty, aborted] {
+            assert_ne!(settled.tokens.output, est.estimated_output_tokens);
+        }
+    }
+
+    #[test]
+    fn a_clean_stream_settles_as_it_always_has() {
+        let est = CostEstimate {
+            input_tokens: 30,
+            estimated_output_tokens: 8192,
+        };
+        let reported = UpstreamUsage::new(12, 7, 4);
+        assert_eq!(
+            drained_settlement(200, None, Some(reported), 28, est),
+            DrainedSettlement {
+                status: 200,
+                tokens: reported,
+                billed: true,
+                cacheable: true,
+            }
+        );
+        // With no usage reported the estimate stands in, as before.
+        assert_eq!(
+            drained_settlement(200, None, None, 28, est).tokens,
+            UpstreamUsage::uncached(30, 8192)
+        );
+        // Only a 200 is ever cached.
+        assert!(!drained_settlement(206, None, Some(reported), 0, est).cacheable);
+    }
+
+    #[test]
+    fn every_reported_failure_is_an_error_status_so_it_never_trains_the_average() {
+        // Settlement samples the completion-length average for 200s only.
+        let full = include_str!("proxy.rs");
+        let src = squash(&full[..full.find("\nmod tests {").expect("the test module")]);
+        assert!(src.contains(
+            "ifstatus_code==200&&output_tokens>0{state.output_stats.observe(model,output_tokens"
+        ));
+        for payload in [
+            serde_json::json!({"error": {"message": "x", "code": 500}}),
+            serde_json::json!({"error": {"message": "x", "code": 400}}),
+            serde_json::json!({"error": "x"}),
+            serde_json::json!({"choices": [{"finish_reason": "abort"}]}),
+        ] {
+            let failure = crate::upstream_failure::payload_failure(&payload).unwrap();
+            assert!((400..=599).contains(&failure.status), "{payload}");
+        }
+    }
+
+    #[test]
+    fn the_pass_through_stream_watches_raw_upstream_bytes_and_caches_only_clean_answers() {
+        let src = squash(handler());
+        let stream = src
+            .find("//----streamback,inspectingforactualusage,thenreconcile----")
+            .expect("the pass-through stream");
+        let rest = &src[stream..];
+        // The watch sees the bytes as the upstream sent them, before the
+        // gateway's own usage chunk is filtered out of the client's copy.
+        let watch = rest.find("watch.push(&chunk);").expect("the failure watch");
+        let filter = rest.find("filter.push(chunk)").expect("the usage filter");
+        assert!(watch < filter);
+        assert!(rest.contains("letcache_put=ifcacheable&&settled.cacheable{"));
+        assert!(
+            !rest.contains("estimated_output_tokens"),
+            "settles via drained_settlement"
+        );
     }
 }
