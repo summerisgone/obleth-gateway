@@ -19,7 +19,7 @@ jobs:
   edge:
     strategy:
       matrix:
-        component: [obleth, obleth-provisioner, control-plane, benchmark-backend]
+        component: [obleth, obleth-provisioner, control-plane, benchmark-backend, obleth-compressor]
         include:
           - component: obleth
             context: .
@@ -29,6 +29,8 @@ jobs:
             context: ./control-plane
           - component: benchmark-backend
             context: ./benchmark-backend
+          - component: obleth-compressor
+            context: .
     runs-on: ubuntu-latest
     permissions:
       contents: read
