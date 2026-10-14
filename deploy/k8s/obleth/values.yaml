@@ -430,10 +430,12 @@ compressor:
   numThreads: 4
   image:
     repository: ghcr.io/thediymaker/obleth-gateway/obleth-compressor
-    # Empty -> v{appVersion} from Chart.yaml, so each chart release pins its
-    # own image. Override to test a specific tag (e.g. "main" for edge builds).
+    # Empty -> image.tag, like every other component (so "main" or "dev" edge
+    # builds move it too), else v{appVersion} from Chart.yaml. Set it only to run
+    # the compressor on a different tag from the rest.
     tag: ""
-    pullPolicy: IfNotPresent
+    # Empty -> image.pullPolicy.
+    pullPolicy: ""
   # Reserve AND bound each replica's cores. Keep cpu == numThreads (small). Do NOT
   # leave this empty ({}) in production: the scorer would grab node cores uncapped,
   # starve neighbours, and make CPU-based autoscaling meaningless. The model is
