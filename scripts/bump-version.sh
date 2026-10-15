@@ -22,5 +22,5 @@ sed -i "s/^appVersion: .*/appVersion: \"$new\"/" deploy/k8s/obleth/Chart.yaml
 (cd obleth && cargo check --quiet)
 (cd benchmark-backend && cargo check --quiet)
 
-scripts/check-versions.sh
+bash scripts/check-versions.sh
 echo "bumped to $new — commit, then tag with: git tag v$new && git push origin main v$new"

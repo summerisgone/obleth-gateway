@@ -4,6 +4,73 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v2.2.0
+
+Reasoning effort is translated for each model, and model families give one name to an instruct model and its thinking sibling. `/v1/models` now carries what a catalog needs, including the boons that run on each model. Fair share is counted across every gateway. Verdicts take images. A stream the upstream cuts short now says so instead of reading as a whole answer. Text-to-speech streams through the gateway, a new route lists a speech model's voices, and the Playground has a Speech mode.
+
+> **Upgrade notes.** No breaking changes. Postgres migration `0035` and the new ClickHouse `usage` columns only add tables and columns, and the gateway applies them when it starts.
+>
+> - **Chart:** the compressor's image tag and pull policy now default to `image.tag` and `image.pullPolicy`, like every other component. A release install is unchanged (both still resolve to `v{appVersion}`), but an install that sets `image.tag` to an edge build now moves the compressor with it. Set `compressor.image.tag` to keep it on its own tag.
+> - **Behaviour to expect after upgrading:**
+>   - A stream the upstream breaks off, goes silent on past the read timeout, or closes with neither `[DONE]` nor a finish reason now ends with one SSE error event and an aborted response. It used to end with `finish_reason: "stop"` on models with a tool boon and with a bare abort elsewhere. It is recorded as a 502 and billed for what reached the client.
+>   - A 200 response that carries the upstream's failure (an SSE `error` event, `finish_reason` `abort` or `error`, or a JSON error body) is recorded with the error's status, billed for what it produced and never cached.
+>   - A read timeout before the response headers is a 504 with no retry. It was retried as a dropped connection, which ran the generation a second time.
+>   - `auto` classifies the newest user message, not the first, so a conversation can be routed differently from one turn to the next.
+>   - In shared fairshare mode, `GET /api/v1/fairshare/live` counts every live gateway (`scope: "cluster"`); each gateway's own counts are in `replica_in_flight` and `replica_queued`. No field is renamed or removed.
+>   - Models nobody configures keep passing reasoning effort through as sent.
+
+**Gateway**
+
+- **Reasoning effort maps.** A chat model can carry a map from the four levels (`none`, `low`, `medium`, `high`) to the fields its server understands, set with `PUT /api/v1/models/{id}/reasoning`.
+  - **Modes:** `passthrough` (the default) sends requests as they come, `mapped` replaces the caller's effort with the level's fields, and `unsupported` removes it.
+  - **Mapped levels:** a level may use another level, `{}` leaves the server's default, and an optional default level applies when the caller names none.
+  - **Where effort is read:** `reasoning_effort` or `reasoning.effort` on chat, `reasoning.effort` on Responses, and `output_config.effort` or `thinking` on Messages. `minimal`, `xhigh` and `max` fold to the nearest level.
+  - **What callers see:** responses carry `x-obleth-reasoning-effort` (and `-requested` when a fallback changed it), cache entries are kept apart per level, and `/v1/models` lists each mapped model's levels.
+- **Model families.** One name stands for several chat models, and the effort level picks which one answers (for example, an instruct model at `none` and its thinking sibling for the rest).
+  - **Serving:** the member serves the request as if it had been named, with its own pool, prices, lifecycle and allowlist entry (the family's name is also accepted), and its own map applies.
+  - **Naming:** family names share one namespace with model names, aliases and variants.
+  - **API:** families are managed at `/api/v1/model-families`, listed in `/v1/models` while their default member is, and carried in backups and manifests.
+- **A listing switch.** `listed: false` (`PUT /api/v1/models/{id}/listing`) keeps a model out of `/v1/models` and `/model/info` while it is still served by name and can still be a family member or an `auto` candidate.
+- **`/v1/models` is a catalog.**
+  - Every entry carries the description, context window, prices and `supports_*` flags under the `/model/info` key names.
+  - Every entry carries `boons` and `boon_details`: whether each boon runs on the model, whether the model has the ability itself, which helper model does the work, and why an idle grant is idle.
+  - A family takes these from its default member.
+- **Verdicts.**
+  - **Images:** a request can carry up to 8 `images` (data or http(s) URLs), and the state becomes optional. A named model must support vision, and `auto` only picks models that do.
+  - **Families:** a family name resolves to its `none` member.
+  - **Default model:** `model` is optional; without it the new `verdicts_default_model` routing setting answers, or `auto` when that is unset.
+- **`auto` reads the newest user message.**
+  - A follow-up with no topic of its own ("thanks", "make it shorter") steps back up to three user messages, so it keeps the conversation's topic.
+  - The user message gets first claim on the classifier's 2,000-byte budget.
+- **Failures are recorded as failures.**
+  - Errors inside a 200, streams cut short and read timeouts before headers are each settled with their real status and billed for what was delivered, never the admission estimate (see the upgrade notes).
+  - The Responses translation ends a failed stream with `response.failed`.
+- **Fair share across gateways.** In shared mode each gateway publishes a bounded view of its scheduler twice a second, and the live view and the shares merge them, so a tenant holding a full pool spread over three gateways reads as holding all of it.
+- **Text-to-speech streams.**
+  - `/v1/audio/speech` already passed the backend's body through as it arrived, so a streaming backend's raw audio chunks and `speech.audio.*` events reach the client while the rest is still being made.
+  - New: `GET /v1/audio/voices?model=` forwards to the model's server and returns its voices (`{"voices": [...]}`, the vLLM-Omni shape). It is checked like a speech request, costs nothing, and passes a backend's 404 through.
+- **The streaming tool loop opens with an assistant role chunk**, so clients see `delta.role` on models with a tool boon.
+
+**ClickHouse, telemetry and the chart**
+
+- Usage rows carry `reasoning_effort`, `reasoning_effort_requested` and `model_family`, added with `ADD COLUMN IF NOT EXISTS`. A call through a family records the family in `model_family`, and `model_variant` holds real variants only.
+- `datastores.nodeSelector` and `datastores.tolerations` place the bundled Postgres, Redis and ClickHouse on nodes whose storage can attach their volumes. Both are empty by default, which renders nothing.
+- Edge builds (`:main`, `:dev`) now include the compressor.
+
+**Dashboard**
+
+- **Models:**
+  - A chat model's page has a Reasoning section: mode, presets or custom fields per level, and a preview of what each level becomes.
+  - The Models page has a Model families card with an editor and a preview of where requests go.
+  - General has a "List in /v1/models" switch.
+- **Logs:** each request shows the effort asked for and served, and "via <family>" for calls through a family.
+- **Fair share:** "Below share" is judged per pool, counted across every gateway, and only while another tenant in the pool holds more than its share. Overview links each item to its pool, and the Fairshare page says when it is showing one gateway's counts.
+- **Routing:** a Verdicts row picks the model for requests that name none.
+- **Playground:**
+  - Verdicts takes photos.
+  - The new Speech mode reads pasted text aloud with any text-to-speech model, playing it as it arrives on backends that stream. It shows time to first audio, speed against real time and cost, and finished readings can be replayed and downloaded. Its voice picker comes from the voices route, and Get code covers speech.
+  - The dashboard's content security policy allows media from `blob:` URLs, which the replay player needs.
+
 ## v2.1.0
 
 Models can be staged, deprecated and retired. There is a web search endpoint and a web search boon, opt-in model variants, per-end-user fairshare for shared keys, and cached prompt tokens on every API. Launching on Slurm is redesigned around a library of recipes that were each run and served. ClickHouse no longer fills its disk with its own logs.
