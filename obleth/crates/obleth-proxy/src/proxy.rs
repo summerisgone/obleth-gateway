@@ -2488,10 +2488,21 @@ async fn run_pipeline(
                     break 'targets;
                 }
                 Ok(Err(e)) => {
+                    // The client's read timeout also covers the wait for the
+                    // response headers, so a slow non-streaming generation can
+                    // end here rather than in the arm below. It is the same
+                    // timeout: a 504, and never the fresh-connection retry,
+                    // which would run the whole generation again.
+                    let read_timed_out = e.is_timeout();
+                    timed_out |= read_timed_out;
                     let connection_error = is_connection_error(&e);
                     last_err = Some(e.to_string());
                     if configured_left {
-                        state.metrics.record_upstream_attempt("retry");
+                        state.metrics.record_upstream_attempt(if read_timed_out {
+                            "timeout"
+                        } else {
+                            "retry"
+                        });
                         tokio::time::sleep(backoff_for(backoff, attempt)).await;
                         continue;
                     }
@@ -5783,6 +5794,11 @@ fn is_retryable_status(status: u16) -> bool {
 /// well-known signatures.
 fn is_connection_error(e: &reqwest::Error) -> bool {
     use std::error::Error;
+    // reqwest reports a read timeout before the headers as a request error;
+    // the upstream got the request and was working on it.
+    if e.is_timeout() {
+        return false;
+    }
     if e.is_connect() || e.is_request() {
         return true;
     }
@@ -9759,5 +9775,36 @@ mod lifecycle_tests {
             assert!(!err.is_timeout(), "{hangup:?}");
             assert_eq!(accepted.load(Ordering::SeqCst), 1, "{hangup:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_read_timeout_before_response_headers_is_a_timeout_not_a_connection_error() {
+        use crate::upstream_failure::test_support::{spawn_failing_upstream, Hangup};
+        use std::sync::atomic::Ordering;
+        let (accepted, base) =
+            spawn_failing_upstream(usize::MAX, Hangup::Silent, String::new()).await;
+        let err = reqwest::Client::builder()
+            .read_timeout(Duration::from_millis(200))
+            .build()
+            .unwrap()
+            .post(format!("{base}/chat/completions"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await
+            .expect_err("the upstream never answers");
+        // The upstream has the request and is still working on it: retrying
+        // on a fresh connection would run the whole generation again.
+        assert!(err.is_timeout(), "{err:?}");
+        assert!(!is_connection_error(&err), "{err:?}");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_read_timeout_on_send_is_recorded_as_a_timeout() {
+        let src = squash(handler());
+        let arm = src.find("Ok(Err(e))=>{").expect("the send-error arm");
+        let rest = &src[arm..];
+        assert!(rest.contains("letread_timed_out=e.is_timeout();timed_out|=read_timed_out;"));
     }
 }

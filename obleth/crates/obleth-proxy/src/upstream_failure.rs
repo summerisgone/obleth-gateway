@@ -877,11 +877,14 @@ pub(crate) mod test_support {
         Reset,
         /// An orderly close.
         Close,
+        /// No hang-up: the connection stays open and nothing is ever sent.
+        Silent,
     }
 
     /// An upstream at the returned base URL (`.../v1`) whose first `failures`
-    /// connections read the whole request and then hang up before sending a
-    /// byte of response; every later one answers `200` with `body` as JSON.
+    /// connections read the whole request and then hang up (or, for
+    /// [`Hangup::Silent`], go quiet) before sending a byte of response; every
+    /// later one answers `200` with `body` as JSON.
     /// The counter is the number of connections accepted.
     pub(crate) async fn spawn_failing_upstream(
         failures: usize,
@@ -899,6 +902,9 @@ pub(crate) mod test_support {
                 tokio::spawn(async move {
                     read_request(&mut socket).await;
                     if n < failures {
+                        if matches!(hangup, Hangup::Silent) {
+                            std::future::pending::<()>().await;
+                        }
                         if matches!(hangup, Hangup::Reset) {
                             let _ = socket.set_zero_linger();
                         }
