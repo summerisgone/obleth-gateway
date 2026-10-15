@@ -3993,19 +3993,21 @@ pub(crate) async fn derive_intent(
         if let Some(name) = settings.classifier_model.as_deref() {
             if name != crate::router::AUTO_MODEL_NAME {
                 if let Some(brain) = resolve_model(state, name).await {
-                    let prompt = classifier_prompt(json);
-                    if !prompt.trim().is_empty() {
-                        let mut intent = state
+                    let brain = &brain;
+                    let prompts = crate::router::classifier_prompts(json);
+                    let classified = crate::router::classify_turns(prompts, |prompt| async move {
+                        state
                             .classifier
-                            .classify(&state.http, &brain, &prompt, available_tags)
-                            .await;
-                        if !intent.tags.is_empty() {
-                            if let Some(d) = forced {
-                                intent.difficulty = d;
-                                intent.source = crate::router::IntentSource::Header;
-                            }
-                            return intent;
+                            .classify(&state.http, brain, &prompt, available_tags)
+                            .await
+                    })
+                    .await;
+                    if let Some(mut intent) = classified {
+                        if let Some(d) = forced {
+                            intent.difficulty = d;
+                            intent.source = crate::router::IntentSource::Header;
                         }
+                        return intent;
                     }
                 }
             }
@@ -4019,29 +4021,6 @@ pub(crate) async fn derive_intent(
         intent.source = crate::router::IntentSource::Header;
     }
     intent
-}
-
-/// Build a compact prompt for the classifier: the system message (if any) plus
-/// the first user message's text.
-fn classifier_prompt(json: &serde_json::Value) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
-        let mut have_user = false;
-        for msg in messages {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            let text = message_text(msg.get("content"));
-            if role == "system" && !text.is_empty() {
-                parts.push(text);
-            } else if role == "user" && !have_user && !text.is_empty() {
-                parts.push(text);
-                have_user = true;
-            }
-            if have_user {
-                break;
-            }
-        }
-    }
-    parts.join("\n")
 }
 
 fn message_text(content: Option<&serde_json::Value>) -> String {
@@ -4388,8 +4367,9 @@ fn maybe_alert_key_budget(
 fn models_list_response(state: &AppState, resolved: &ResolvedKey) -> Response<Body> {
     let candidates = state.model_registry.load();
     let allowed = allowed_models_for(resolved);
-    let mut list = registry_models_list(&candidates, allowed);
-    let families = family_entries(&state.families.all(), &candidates, allowed);
+    let boons = state.boons.settings();
+    let mut list = registry_models_list(&candidates, allowed, &boons);
+    let families = family_entries(&state.families.all(), &candidates, allowed, &boons);
     if let Some(data) = list["data"].as_array_mut() {
         data.extend(families);
         data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
@@ -4405,6 +4385,7 @@ fn family_entries(
     families: &[std::sync::Arc<obleth_config::ModelFamily>],
     candidates: &[obleth_config::routing::Candidate],
     allowed: Option<&[String]>,
+    boons: &obleth_config::BoonSettings,
 ) -> Vec<serde_json::Value> {
     let now = chrono::Utc::now();
     families
@@ -4417,7 +4398,7 @@ fn family_entries(
                     && c.model.enabled
                     && c.model.lifecycle.status_at(now).listed()
             })?;
-            Some(family_entry(f, Some(&member.model)))
+            Some(family_entry(f, Some(&member.model), boons))
         })
         .collect()
 }
@@ -4435,11 +4416,12 @@ fn family_visible(family: &obleth_config::ModelFamily, allowed: Option<&[String]
 
 /// One family's discovery entry: which model answers at each level, and the
 /// level a request that names none gets. The catalog facts (context window,
-/// prices, capabilities) are the default member's, which serves a request
-/// that names no level; `description` falls back to it too.
+/// prices, capabilities, boons) are the default member's, which serves a
+/// request that names no level; `description` falls back to it too.
 fn family_entry(
     family: &obleth_config::ModelFamily,
     default_member: Option<&ResolvedModel>,
+    boons: &obleth_config::BoonSettings,
 ) -> serde_json::Value {
     let mut entry = serde_json::json!({
         "id": family.name,
@@ -4457,7 +4439,7 @@ fn family_entry(
         if family.description.is_empty() {
             obj.remove("description");
         }
-        ModelDetails::of(member).extend(obj);
+        ModelDetails::of(member, &member.boons, boons).extend(obj);
     }
     entry
 }
@@ -4519,17 +4501,18 @@ fn model_visible(allowed: Option<&[String]>, model_name: &str) -> bool {
 fn registry_models_list(
     candidates: &[obleth_config::routing::Candidate],
     allowed: Option<&[String]>,
+    boons: &obleth_config::BoonSettings,
 ) -> serde_json::Value {
     let mut data: Vec<serde_json::Value> = candidates
         .iter()
         // An unlisted model (and its variants) is served by name only.
         .filter(|c| c.model.enabled && c.model.listed && is_listed_model_type(&c.model.model_type))
         .flat_map(|c| {
-            std::iter::once(ModelFacts::of(&c.model)).chain(
+            std::iter::once(ModelFacts::of(&c.model, boons)).chain(
                 c.model
                     .variants
                     .iter()
-                    .map(|v| ModelFacts::of_variant(&c.model, v)),
+                    .map(|v| ModelFacts::of_variant(&c.model, v, boons)),
             )
         })
         .filter(|f| f.visible(allowed))
@@ -4542,8 +4525,8 @@ fn registry_models_list(
 }
 
 /// One discovery entry (`/v1/models` and `/v1/models/{id}`). A variant's
-/// entry also names the model it is served by, says what it is for, and lists
-/// the boons a request through it runs with.
+/// entry also names the model it is served by and says what it is for; its
+/// boons are the ones a request through it runs with.
 fn model_entry(facts: &ModelFacts) -> serde_json::Value {
     let mut entry = serde_json::json!({
         "id": facts.model_name,
@@ -4558,7 +4541,6 @@ fn model_entry(facts: &ModelFacts) -> serde_json::Value {
     if let (Some(v), Some(obj)) = (&facts.variant, entry.as_object_mut()) {
         obj.insert("variant_of".into(), v.parent.clone().into());
         obj.insert("description".into(), v.description.clone().into());
-        obj.insert("boons".into(), v.boons.clone().into());
     }
     if let (Some(r), Some(obj)) = (reasoning_fields(&facts.reasoning), entry.as_object_mut()) {
         obj.insert("reasoning".into(), r);
@@ -4634,10 +4616,15 @@ struct ModelDetails {
     supports_response_schema: bool,
     supports_system_messages: bool,
     supports_vision: bool,
+    /// The boons a request to this entry runs with (a variant's are its
+    /// model's, then its own).
+    boons: Vec<String>,
+    /// What each of `boons` does on this model; see [`boon_details`].
+    boon_details: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ModelDetails {
-    fn of(model: &ResolvedModel) -> Self {
+    fn of(model: &ResolvedModel, boons: &[String], settings: &obleth_config::BoonSettings) -> Self {
         ModelDetails {
             description: model.description.clone(),
             context_window: model.context_window,
@@ -4648,6 +4635,8 @@ impl ModelDetails {
             supports_response_schema: model.supports_response_schema,
             supports_system_messages: model.supports_system_messages,
             supports_vision: model.supports_vision,
+            boons: boons.to_vec(),
+            boon_details: boon_details(model, boons, settings),
         }
     }
 
@@ -4683,7 +4672,152 @@ impl ModelDetails {
             self.supports_system_messages.into(),
         );
         obj.insert("supports_vision".into(), self.supports_vision.into());
+        obj.insert("boons".into(), self.boons.clone().into());
+        obj.insert(
+            "boon_details".into(),
+            serde_json::Value::Object(self.boon_details.clone()),
+        );
     }
+}
+
+/// What each granted boon does on `model` as the gateway is configured now,
+/// keyed by boon name. The `supports_*` flags are the model's own abilities;
+/// this says which of them the gateway lends it, and which model does the
+/// work. Without it, an answer about an image from a text-only model with the
+/// vision boon reads as the model's own vision, and cannot be reproduced
+/// against that model anywhere else.
+///
+/// Each value has:
+/// - `active`: whether the boon runs on this model's requests. A grant can
+///   sit idle: the model has the ability itself, the boon is off gateway-wide
+///   or has no helper set, or a tool boon's model cannot call functions.
+/// - `native`: for the boons that stand in for an ability a model may have
+///   itself (`vision`, `structured_output`), whether this model has it.
+/// - `helper_model`: when active, the registered model (or search route)
+///   that does the boon's work. Absent when no other model is involved.
+/// - `inactive_reason`: when not active, why.
+///
+/// Gates that depend on the caller or the request (a tenant's compression
+/// policy, a request with no image in it) are not reflected: `active` means
+/// the boon runs for a request it applies to.
+fn boon_details(
+    model: &ResolvedModel,
+    boons: &[String],
+    settings: &obleth_config::BoonSettings,
+) -> serde_json::Map<String, serde_json::Value> {
+    boons
+        .iter()
+        .map(|boon| (boon.clone(), boon_detail(model, boon, settings)))
+        .collect()
+}
+
+/// One entry of [`boon_details`]. Each arm mirrors the gate the boon itself
+/// applies in [`crate::boons`], minus the per-request parts.
+fn boon_detail(
+    model: &ResolvedModel,
+    boon: &str,
+    settings: &obleth_config::BoonSettings,
+) -> serde_json::Value {
+    fn named(name: Option<&str>) -> Option<String> {
+        name.map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+    }
+    // A tool boon needs the model to call its tool.
+    let tool_gate = |active: bool| {
+        if !active {
+            Some("off")
+        } else if !model.supports_function_calling {
+            Some("needs_function_calling")
+        } else {
+            None
+        }
+    };
+    let (native, helper, inactive_reason) = match boon {
+        "vision" => (
+            Some(model.supports_vision),
+            named(settings.vision.fallback_model.as_deref()),
+            if model.supports_vision {
+                Some("native")
+            } else if !settings.vision.active() {
+                Some("off")
+            } else {
+                None
+            },
+        ),
+        // With no fixer, an invalid reply goes back to the model itself.
+        "structured_output" => (
+            Some(model.supports_response_schema),
+            named(settings.structured_output.fixer_model.as_deref()),
+            if model.supports_response_schema {
+                Some("native")
+            } else if !settings.structured_output.active() {
+                Some("off")
+            } else {
+                None
+            },
+        ),
+        "image_generation" => (
+            None,
+            named(settings.image_generation.image_model.as_deref()),
+            tool_gate(settings.image_generation.active()),
+        ),
+        "web_search" => (
+            None,
+            named(settings.web_search.search_tool.as_deref()),
+            tool_gate(settings.web_search.active()),
+        ),
+        "speculation" => {
+            let s = &settings.speculation;
+            let drafter = crate::boons::speculation::effective_draft_model(model, s);
+            let reason = if !s.active() {
+                Some("off")
+            } else if drafter.is_empty() || drafter == model.model_name {
+                Some("no_drafter")
+            } else if crate::boons::speculation::scoring_base(model, &s.verify_url_template)
+                .is_empty()
+            {
+                Some("no_scoring_endpoint")
+            } else {
+                None
+            };
+            (None, named(Some(&drafter)), reason)
+        }
+        "compression" => (
+            None,
+            None,
+            (!settings.compression.active()).then_some("off"),
+        ),
+        "knowledge" => (
+            None,
+            None,
+            if !settings.knowledge.active() {
+                Some("off")
+            } else if model.knowledge_collections.is_empty() {
+                Some("no_collections")
+            } else {
+                None
+            },
+        ),
+        // Stored boons are normalized to the known set; a name this gateway
+        // does not know never runs.
+        _ => (None, None, Some("unknown")),
+    };
+    let mut out = serde_json::Map::new();
+    out.insert("active".into(), inactive_reason.is_none().into());
+    if let Some(native) = native {
+        out.insert("native".into(), native.into());
+    }
+    match (inactive_reason, helper) {
+        (Some(reason), _) => {
+            out.insert("inactive_reason".into(), reason.into());
+        }
+        (None, Some(helper)) => {
+            out.insert("helper_model".into(), helper.into());
+        }
+        (None, None) => {}
+    }
+    serde_json::Value::Object(out)
 }
 
 /// The variant-only part of a discovery entry.
@@ -4692,13 +4826,10 @@ struct VariantFacts {
     /// The model the variant is served by.
     parent: String,
     description: String,
-    /// The boons a request through the variant runs with: the model's own,
-    /// then the variant's.
-    boons: Vec<String>,
 }
 
 impl ModelFacts {
-    fn of(model: &ResolvedModel) -> Self {
+    fn of(model: &ResolvedModel, boons: &obleth_config::BoonSettings) -> Self {
         ModelFacts {
             model_name: model.model_name.clone(),
             model_type: model.model_type.clone(),
@@ -4708,21 +4839,28 @@ impl ModelFacts {
             variant: None,
             lifecycle: model.lifecycle.clone(),
             reasoning: model.reasoning.clone(),
-            details: ModelDetails::of(model),
+            details: ModelDetails::of(model, &model.boons, boons),
             status: model.lifecycle.status_at(chrono::Utc::now()),
         }
     }
 
-    fn of_variant(model: &ResolvedModel, variant: &obleth_config::ModelVariant) -> Self {
+    /// A variant's entry: its model's facts, with the boons a request through
+    /// the variant runs with (the model's own, then the variant's).
+    fn of_variant(
+        model: &ResolvedModel,
+        variant: &obleth_config::ModelVariant,
+        boons: &obleth_config::BoonSettings,
+    ) -> Self {
+        let granted = obleth_config::union_boons(&model.boons, &variant.boons);
         ModelFacts {
             model_name: variant.name.clone(),
             aliases: Vec::new(),
             variant: Some(VariantFacts {
                 parent: model.model_name.clone(),
                 description: variant.description.clone(),
-                boons: obleth_config::union_boons(&model.boons, &variant.boons),
             }),
-            ..ModelFacts::of(model)
+            details: ModelDetails::of(model, &granted, boons),
+            ..ModelFacts::of(model, boons)
         }
     }
 
@@ -4757,6 +4895,7 @@ impl ModelFacts {
 /// resolution matches on.
 fn model_facts_index(
     candidates: &[obleth_config::routing::Candidate],
+    boons: &obleth_config::BoonSettings,
 ) -> std::collections::HashMap<String, std::sync::Arc<ModelFacts>> {
     let mut by_name: std::collections::HashMap<String, std::sync::Arc<ModelFacts>> =
         std::collections::HashMap::new();
@@ -4766,7 +4905,7 @@ fn model_facts_index(
         .collect();
     let facts: Vec<std::sync::Arc<ModelFacts>> = candidates
         .iter()
-        .map(|c| std::sync::Arc::new(ModelFacts::of(&c.model)))
+        .map(|c| std::sync::Arc::new(ModelFacts::of(&c.model, boons)))
         .collect();
     for (c, f) in candidates.iter().zip(facts.iter()) {
         if !c.model.upstream_model.is_empty() {
@@ -4785,7 +4924,7 @@ fn model_facts_index(
         for v in &c.model.variants {
             by_name
                 .entry(v.name.clone())
-                .or_insert_with(|| std::sync::Arc::new(ModelFacts::of_variant(&c.model, v)));
+                .or_insert_with(|| std::sync::Arc::new(ModelFacts::of_variant(&c.model, v, boons)));
         }
     }
     for f in facts {
@@ -4842,7 +4981,8 @@ fn registered_model_entry(
         return None;
     }
     let candidates = state.model_registry.load();
-    let Some(facts) = model_facts_index(&candidates).get(id).cloned() else {
+    let boons = state.boons.settings();
+    let Some(facts) = model_facts_index(&candidates, &boons).get(id).cloned() else {
         let family = state.families.get(id)?;
         if !family_visible(&family, allowed) {
             return Some(Err(()));
@@ -4851,7 +4991,7 @@ fn registered_model_entry(
             .iter()
             .find(|c| c.model.model_name == family.members.get(family.default_level))
             .map(|c| &c.model);
-        return Some(Ok(family_entry(&family, member)));
+        return Some(Ok(family_entry(&family, member, &boons)));
     };
     if !facts.answers_by_id(allowed) {
         return Some(Err(()));
@@ -4887,7 +5027,8 @@ fn registered_model_entry(
 /// model a caller would be refused would be advertising a 403.
 fn model_info_response(state: &AppState, resolved: &ResolvedKey) -> Response<Body> {
     let candidates = state.model_registry.load();
-    let data = registry_model_info(&candidates, allowed_models_for(resolved));
+    let boons = state.boons.settings();
+    let data = registry_model_info(&candidates, allowed_models_for(resolved), &boons);
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({ "data": data })),
@@ -4900,6 +5041,7 @@ fn model_info_response(state: &AppState, resolved: &ResolvedKey) -> Response<Bod
 fn registry_model_info(
     candidates: &[obleth_config::routing::Candidate],
     allowed: Option<&[String]>,
+    boons: &obleth_config::BoonSettings,
 ) -> Vec<serde_json::Value> {
     let now = chrono::Utc::now();
     candidates
@@ -4907,13 +5049,17 @@ fn registry_model_info(
         .filter(|c| c.model.enabled && c.model.listed && is_listed_model_type(&c.model.model_type))
         .filter(|c| model_visible(allowed, &c.model.model_name))
         .filter(|c| c.model.lifecycle.status_at(now).listed())
-        .map(|c| model_info_entry(&c.model, c.healthy))
+        .map(|c| model_info_entry(&c.model, c.healthy, boons))
         .collect()
 }
 
 /// One `/model/info` entry. Split out so the payload shape is unit-testable
 /// without a registry or a request.
-fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
+fn model_info_entry(
+    model: &ResolvedModel,
+    healthy: bool,
+    boons: &obleth_config::BoonSettings,
+) -> serde_json::Value {
     let status = model.lifecycle.status_at(chrono::Utc::now());
     let mut entry = serde_json::json!({
         "model_name": model.model_name,
@@ -4942,6 +5088,8 @@ fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
             "variants": model.variants,
             "tags": model.tags,
             "boons": model.boons,
+            // What each boon does here, and which model does it.
+            "boon_details": boon_details(model, &model.boons, boons),
             "supports_tool_choice": model.supports_tool_choice,
             "context_window": model.context_window,
             "cost_per_image": model.cost_per_image,
@@ -6635,7 +6783,7 @@ mod tests {
             ),
             disabled,
         ];
-        let list = registry_models_list(&candidates, None);
+        let list = registry_models_list(&candidates, None, &Default::default());
         assert_eq!(list["object"], "list");
         let data = list["data"].as_array().unwrap();
         let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
@@ -6664,7 +6812,7 @@ mod tests {
             candidate("glm-5-3", "glm-5-3", "chat", "none", &[], &[]),
             candidate("web-search", "searxng", "search", "unknown", &[], &[]),
         ];
-        let ids: Vec<String> = registry_models_list(&candidates, None)["data"]
+        let ids: Vec<String> = registry_models_list(&candidates, None, &Default::default())["data"]
             .as_array()
             .unwrap()
             .iter()
@@ -6672,7 +6820,7 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["glm-5-3"]);
         // Nor found by a detail lookup, under its name or its upstream's.
-        let index = model_facts_index(&candidates);
+        let index = model_facts_index(&candidates, &Default::default());
         assert!(!index.contains_key("web-search"));
         assert!(!index.contains_key("searxng"));
     }
@@ -6688,8 +6836,10 @@ mod tests {
             &["glm-5-3-fp8"],
             &[],
         )];
-        let listed = registry_models_list(&candidates, None)["data"][0].clone();
-        let detail = model_entry(&model_facts_index(&candidates)["glm-5-3-fp8"]);
+        let listed =
+            registry_models_list(&candidates, None, &Default::default())["data"][0].clone();
+        let detail =
+            model_entry(&model_facts_index(&candidates, &Default::default())["glm-5-3-fp8"]);
         assert_eq!(listed, detail);
     }
 
@@ -6715,7 +6865,7 @@ mod tests {
             ),
         ];
         let allowed = vec!["glm-5-3".to_string()];
-        let list = registry_models_list(&candidates, Some(&allowed));
+        let list = registry_models_list(&candidates, Some(&allowed), &Default::default());
         let ids: Vec<&str> = list["data"]
             .as_array()
             .unwrap()
@@ -6725,7 +6875,7 @@ mod tests {
         assert_eq!(ids, vec!["glm-5-3"]);
         // No allowlist, or an internal caller, sees every enabled route.
         assert_eq!(
-            registry_models_list(&candidates, None)["data"]
+            registry_models_list(&candidates, None, &Default::default())["data"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -6760,7 +6910,7 @@ mod tests {
             candidate("shared-name", "shared-name-fp8", "chat", "fp8", &[], &[]),
             candidate("other", "shared-name", "chat", "none", &[], &[]),
         ];
-        let index = model_facts_index(&candidates);
+        let index = model_facts_index(&candidates, &Default::default());
         assert_eq!(index["shared-name"].model_name, "shared-name");
         assert_eq!(index["shared-name-fp8"].model_name, "shared-name");
         assert_eq!(index["other"].model_name, "other");
@@ -6792,7 +6942,7 @@ mod tests {
         let active = candidate("gemma4-31b-it", "gemma", "chat", "bf16", &[], &[]);
         let candidates = vec![old, gone, overdue, active];
 
-        let list = registry_models_list(&candidates, None);
+        let list = registry_models_list(&candidates, None, &Default::default());
         let data = list["data"].as_array().unwrap();
         let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
         // Retired (by status or by date) is gone, variants included.
@@ -6805,13 +6955,14 @@ mod tests {
         assert!(data[0].get("status").is_none());
 
         // Asking for a retired model by id still says what became of it.
-        let detail = model_entry(&model_facts_index(&candidates)["llama2-70b"]);
+        let detail =
+            model_entry(&model_facts_index(&candidates, &Default::default())["llama2-70b"]);
         assert_eq!(detail["status"], "retired");
 
-        let info = model_info_entry(&candidates[0].model, true);
+        let info = model_info_entry(&candidates[0].model, true, &Default::default());
         assert_eq!(info["model_info"]["status"], "deprecated");
         assert_eq!(info["model_info"]["replacement"], "gemma4-31b-it");
-        let info = model_info_entry(&candidates[3].model, true);
+        let info = model_info_entry(&candidates[3].model, true, &Default::default());
         assert_eq!(info["model_info"]["status"], "active");
         assert!(info["model_info"].get("replacement").is_none());
     }
@@ -6830,7 +6981,7 @@ mod tests {
 
         // Not in the listing, variants included, whatever the allowlist says.
         for allowed in [None, Some(&["qwen4-72b".to_string()][..])] {
-            let list = registry_models_list(&candidates, allowed);
+            let list = registry_models_list(&candidates, allowed, &Default::default());
             let ids: Vec<&str> = list["data"]
                 .as_array()
                 .unwrap()
@@ -6840,14 +6991,14 @@ mod tests {
             assert!(!ids.iter().any(|id| id.starts_with("qwen4")), "{ids:?}");
         }
         // Not on /model/info.
-        let info = registry_model_info(&candidates, None);
+        let info = registry_model_info(&candidates, None, &Default::default());
         let names: Vec<&str> = info
             .iter()
             .map(|m| m["model_name"].as_str().unwrap())
             .collect();
         assert_eq!(names, vec!["gemma4-31b-it"]);
         // A lookup by any of its names answers like an unknown model.
-        let index = model_facts_index(&candidates);
+        let index = model_facts_index(&candidates, &Default::default());
         for id in ["qwen4-72b", "qwen4", "qwen4-72b-spec"] {
             assert!(!index[id].answers_by_id(None), "{id}");
         }
@@ -6871,7 +7022,7 @@ mod tests {
         let other = candidate("gemma4-31b-it", "gemma", "chat", "bf16", &[], &[]);
         let candidates = vec![instruct, think, other];
 
-        let list = registry_models_list(&candidates, None);
+        let list = registry_models_list(&candidates, None, &Default::default());
         let ids: Vec<&str> = list["data"]
             .as_array()
             .unwrap()
@@ -6879,10 +7030,10 @@ mod tests {
             .map(|m| m["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["gemma4-31b-it"]);
-        let info = registry_model_info(&candidates, None);
+        let info = registry_model_info(&candidates, None, &Default::default());
         assert_eq!(info.len(), 1);
         // Still a model the caller can ask about, by any of its names.
-        let index = model_facts_index(&candidates);
+        let index = model_facts_index(&candidates, &Default::default());
         for id in ["acme-instruct", "acme-instruct-2507", "acme-think"] {
             assert!(index[id].answers_by_id(None), "{id}");
         }
@@ -6902,7 +7053,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         });
-        let entries = family_entries(&[family], &candidates, None);
+        let entries = family_entries(&[family], &candidates, None, &Default::default());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["id"], "acme");
         assert_eq!(entries[0]["family"]["members"]["high"], "acme-think");
@@ -6936,7 +7087,7 @@ mod tests {
         model.tags = vec!["coding".into()];
         model.context_window = 200_000;
 
-        let entry = model_info_entry(&model, false);
+        let entry = model_info_entry(&model, false, &Default::default());
         assert_eq!(entry["model_name"], "glm-5-3");
         // The per-route object is ours; the upstream name lives in it.
         assert_eq!(entry["obleth_params"]["model"], "glm-5-3-mxfp4");
@@ -6974,7 +7125,7 @@ mod tests {
             &["glm-5-3-fp8"],
             &[],
         )];
-        let index = model_facts_index(&candidates);
+        let index = model_facts_index(&candidates, &Default::default());
         for id in ["glm-5-3", "glm-5-3-fp8", "glm-5-3-mxfp4"] {
             assert_eq!(
                 index.get(id).map(|f| f.model_name.as_str()),
@@ -7010,7 +7161,7 @@ mod tests {
             &["glm-5-3-fp8"],
             &["coding"],
         ))];
-        let list = registry_models_list(&candidates, None);
+        let list = registry_models_list(&candidates, None, &Default::default());
         let data = list["data"].as_array().unwrap();
         let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
         // Aliases stay out of the listing; a variant is listed by its name.
@@ -7028,7 +7179,8 @@ mod tests {
         // The parent's own entry is unchanged by having variants.
         assert!(data[0].get("variant_of").is_none());
         // A detail lookup by the variant's name answers with its entry.
-        let detail = model_entry(&model_facts_index(&candidates)["glm-5-3-spec"]);
+        let detail =
+            model_entry(&model_facts_index(&candidates, &Default::default())["glm-5-3-spec"]);
         assert_eq!(&detail, spec);
     }
 
@@ -7045,7 +7197,7 @@ mod tests {
         ))];
         let ids = |allowed: &[&str]| -> Vec<String> {
             let allowed: Vec<String> = allowed.iter().map(|a| a.to_string()).collect();
-            registry_models_list(&candidates, Some(&allowed))["data"]
+            registry_models_list(&candidates, Some(&allowed), &Default::default())["data"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -7055,6 +7207,191 @@ mod tests {
         assert_eq!(ids(&["glm-5-3"]), vec!["glm-5-3", "glm-5-3-spec"]);
         assert_eq!(ids(&["glm-5-3-spec"]), vec!["glm-5-3-spec"]);
         assert!(ids(&["other"]).is_empty());
+    }
+
+    /// Gateway settings with every boon on and each helper pointed at a model.
+    fn boons_configured() -> obleth_config::BoonSettings {
+        let mut s = obleth_config::BoonSettings::default();
+        s.vision.enabled = true;
+        s.vision.fallback_model = Some("describer".into());
+        s.structured_output.enabled = true;
+        s.image_generation.enabled = true;
+        s.image_generation.image_model = Some("painter".into());
+        s.web_search.enabled = true;
+        s.web_search.search_tool = Some("web".into());
+        s.speculation.enabled = true;
+        s.speculation.draft_model = Some("drafter".into());
+        s.compression.enabled = true;
+        s.knowledge.enabled = true;
+        s
+    }
+
+    #[test]
+    fn a_lent_ability_names_the_model_that_lends_it() {
+        // A text-only model granted vision. Its entry has to say that the
+        // model cannot see, that the gateway lends it sight, and which model
+        // does the looking: an answer about an image is that model's
+        // description read back, which the model alone does not reproduce.
+        use super::{model_entry, model_facts_index, registry_model_info};
+        let mut c = candidate("text-only", "text-only", "chat", "none", &[], &[]);
+        c.model.boons = vec!["vision".into()];
+        let candidates = vec![c];
+        let s = boons_configured();
+        let detail = model_entry(&model_facts_index(&candidates, &s)["text-only"]);
+        assert_eq!(detail["supports_vision"], false);
+        assert_eq!(detail["boons"], serde_json::json!(["vision"]));
+        assert_eq!(
+            detail["boon_details"],
+            serde_json::json!({
+                "vision": {"active": true, "native": false, "helper_model": "describer"}
+            })
+        );
+        // `/model/info` says the same.
+        let info = &registry_model_info(&candidates, None, &s)[0]["model_info"];
+        assert_eq!(info["boon_details"], detail["boon_details"]);
+    }
+
+    #[test]
+    fn a_model_with_no_boons_says_so() {
+        use super::{model_entry, model_facts_index, registry_model_info};
+        let candidates = vec![candidate("plain", "plain", "chat", "none", &[], &[])];
+        let s = boons_configured();
+        let detail = model_entry(&model_facts_index(&candidates, &s)["plain"]);
+        assert_eq!(detail["boons"], serde_json::json!([]));
+        assert_eq!(detail["boon_details"], serde_json::json!({}));
+        let info = &registry_model_info(&candidates, None, &s)[0]["model_info"];
+        assert_eq!(info["boon_details"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn an_idle_boon_grant_says_why_and_names_no_helper() {
+        use super::boon_details;
+        use serde_json::json;
+        let s = boons_configured();
+        let mut model = candidate("m", "m", "chat", "none", &[], &[]).model;
+        model.boons = [
+            "vision",
+            "structured_output",
+            "image_generation",
+            "web_search",
+            "speculation",
+            "knowledge",
+            "compression",
+        ]
+        .map(String::from)
+        .to_vec();
+        model.supports_vision = true;
+        model.supports_response_schema = true;
+        model.supports_function_calling = false;
+        let d = boon_details(&model, &model.boons, &s);
+        // The model has the ability itself, so the boon steps aside.
+        assert_eq!(
+            d["vision"],
+            json!({"active": false, "native": true, "inactive_reason": "native"})
+        );
+        assert_eq!(
+            d["structured_output"],
+            json!({"active": false, "native": true, "inactive_reason": "native"})
+        );
+        // A tool boon needs a model that can call its tool.
+        assert_eq!(
+            d["image_generation"],
+            json!({"active": false, "inactive_reason": "needs_function_calling"})
+        );
+        assert_eq!(
+            d["web_search"],
+            json!({"active": false, "inactive_reason": "needs_function_calling"})
+        );
+        // A drafter is set, but nothing can score its drafts.
+        assert_eq!(
+            d["speculation"],
+            json!({"active": false, "inactive_reason": "no_scoring_endpoint"})
+        );
+        assert_eq!(
+            d["knowledge"],
+            json!({"active": false, "inactive_reason": "no_collections"})
+        );
+        // Compression has no helper; the gateway does it alone.
+        assert_eq!(d["compression"], json!({"active": true}));
+
+        // Switched off gateway-wide, every grant is idle.
+        let d = boon_details(&model, &model.boons, &Default::default());
+        for (boon, detail) in &d {
+            if detail.get("native") == Some(&json!(true)) {
+                continue;
+            }
+            assert_eq!(detail["inactive_reason"], "off", "{boon}");
+        }
+    }
+
+    #[test]
+    fn an_active_boon_names_its_helper() {
+        use super::boon_details;
+        use serde_json::json;
+        let s = boons_configured();
+        let mut model = candidate("m", "m", "chat", "none", &[], &[]).model;
+        model.boons = [
+            "structured_output",
+            "image_generation",
+            "web_search",
+            "speculation",
+        ]
+        .map(String::from)
+        .to_vec();
+        model.supports_response_schema = false;
+        model.supports_function_calling = true;
+        model.verify_api_base = "http://scorer:8000/v1".into();
+        model.draft_model = "own-drafter".into();
+        let d = boon_details(&model, &model.boons, &s);
+        // No fixer is set: an invalid reply goes back to the model itself.
+        assert_eq!(
+            d["structured_output"],
+            json!({"active": true, "native": false})
+        );
+        assert_eq!(
+            d["image_generation"],
+            json!({"active": true, "helper_model": "painter"})
+        );
+        assert_eq!(
+            d["web_search"],
+            json!({"active": true, "helper_model": "web"})
+        );
+        // The model's own drafter wins over the gateway default.
+        assert_eq!(
+            d["speculation"],
+            json!({"active": true, "helper_model": "own-drafter"})
+        );
+
+        let mut s = s;
+        s.structured_output.fixer_model = Some("fixer".into());
+        let d = boon_details(&model, &model.boons, &s);
+        assert_eq!(
+            d["structured_output"],
+            json!({"active": true, "native": false, "helper_model": "fixer"})
+        );
+    }
+
+    #[test]
+    fn a_variant_details_the_boons_it_adds() {
+        use super::{model_entry, model_facts_index};
+        let mut c = with_variants(candidate("glm-5-3", "glm-5-3", "chat", "none", &[], &[]));
+        c.model.verify_api_base = "http://scorer:8000/v1".into();
+        let candidates = vec![c];
+        let s = boons_configured();
+        let index = model_facts_index(&candidates, &s);
+        let parent = model_entry(&index["glm-5-3"]);
+        let spec = model_entry(&index["glm-5-3-spec"]);
+        assert_eq!(parent["boons"], serde_json::json!(["vision"]));
+        assert!(parent["boon_details"].get("speculation").is_none());
+        assert_eq!(spec["boons"], serde_json::json!(["vision", "speculation"]));
+        assert_eq!(
+            spec["boon_details"]["speculation"],
+            serde_json::json!({"active": true, "helper_model": "drafter"})
+        );
+        assert_eq!(
+            spec["boon_details"]["vision"],
+            parent["boon_details"]["vision"]
+        );
     }
 
     #[test]
@@ -8426,7 +8763,7 @@ mod tests {
         let body = serde_json::json!({"prompt": "a fox", "n": 4, "seconds": "5"});
         assert!((compute_modality_cost(Some(&route), &body) - 0.3).abs() < 1e-9);
         assert_eq!(mode_for_model_type("video"), "video_generation");
-        let info = model_info_entry(&route, true);
+        let info = model_info_entry(&route, true, &Default::default());
         assert_eq!(info["model_info"]["mode"], "video_generation");
         assert_eq!(info["model_info"]["cost_per_video"], 0.3);
 

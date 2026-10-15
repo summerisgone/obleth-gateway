@@ -34,8 +34,8 @@ use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use obleth_config::routing::route_explain::RouteExplain;
 use obleth_config::routing::{
-    difficulty_from_header, explain_selection, heuristic_intent, BoonGrants, IntentSource,
-    RequestFeatures, RouterWeights,
+    classifier_prompts, classify_turns, difficulty_from_header, explain_selection,
+    heuristic_intent, BoonGrants, IntentSource, RequestFeatures, RouterWeights,
 };
 use obleth_config::{
     hash_api_key, ApiKey, DeploymentLaunch, FairshareGroup, ManagedModelSpec, McpServer,
@@ -2800,9 +2800,11 @@ pub struct SimulateRouteRequest {
     pub uniform: Option<f64>,
     /// Ask the LIVE intent classifier (the same brain, cache and timeout the
     /// data plane uses) instead of the keyword heuristic. Costs one small
-    /// model call. Ignored — heuristics as before — when the classifier is
-    /// disabled, unconfigured, or this admin runs without a data plane; the
-    /// response's `tag_source` says which one actually ran.
+    /// model call per user turn it reads: the newest, and up to two before it
+    /// when the newer ones name no topic. Ignored — heuristics as before —
+    /// when the classifier is disabled, unconfigured, or this admin runs
+    /// without a data plane; the response's `tag_source` says which one
+    /// actually ran.
     #[serde(default)]
     pub classify: bool,
 }
@@ -2827,12 +2829,13 @@ pub struct SimulateRouteRequest {
 /// simulations can be diffed without mistaking sampling noise for a weight
 /// effect.
 ///
-/// **This path never calls the classifier brain.** A simulation must not incur
-/// model calls or upstream latency, so intent is derived from `heuristic_intent`
-/// plus the optional `effort` override only. `tag_source`/`difficulty_source`
-/// therefore report `heuristic` (or `header`), never `classifier` — the
-/// dashboard must not imply a classification that did not happen. With the
-/// classifier enabled, a real request's tags may differ from what is shown here.
+/// Intent comes from `heuristic_intent` plus the optional `effort` override
+/// unless the body sets `classify: true`. Then the live classifier reads the
+/// same per-turn prompts the data plane builds ([`classifier_prompts`]), walks
+/// them the same way ([`classify_turns`]), and is offered the same tags, the
+/// candidates' tags under the tenant's allowlist. `tag_source` and
+/// `difficulty_source` say which one ran, so the dashboard never implies a
+/// classification that did not happen.
 ///
 /// Read-only: no audit entry is recorded, and nothing is written.
 #[utoipa::path(
@@ -2928,26 +2931,28 @@ async fn simulate_route(
                 .await?
                 .unwrap_or_default();
             if settings.classifier_active() {
-                // Same menu the data plane offers: only tags a candidate
-                // actually carries. The prompt is the synthesized body's text,
-                // which for a plain `prompt` is exactly what a client would
-                // have sent.
+                // Same menu the data plane offers: only tags a candidate the
+                // tenant may use actually carries.
                 let mut menu: Vec<String> = Vec::new();
                 for c in &candidates {
+                    if let Some(allowed) = allowed.as_deref() {
+                        if !allowed.iter().any(|m| m == &c.model.model_name) {
+                            continue;
+                        }
+                    }
                     for t in &c.model.tags {
                         if !menu.contains(t) {
                             menu.push(t.clone());
                         }
                     }
                 }
-                let text = simulate_prompt_text(&json);
-                if !menu.is_empty() && !text.trim().is_empty() {
-                    let derived = classify(text, menu).await;
-                    // Empty tags = the classifier's documented failure shape;
-                    // fall back to heuristics exactly as the data plane does.
-                    if !derived.tags.is_empty() {
-                        intent = Some(derived);
-                    }
+                if !menu.is_empty() {
+                    // `None` is the classifier's failure shape; heuristics take
+                    // over below, exactly as on the data plane.
+                    intent = classify_turns(classifier_prompts(&json), |prompt| {
+                        classify(prompt, menu.clone())
+                    })
+                    .await;
                 }
             }
         }
@@ -2992,39 +2997,6 @@ async fn simulate_route(
         uniform,
         &intent,
     )))
-}
-
-/// The classifier prompt for a simulated request: the system message (if any)
-/// plus the first user message's text — the same compact shape the data
-/// plane's classifier reads, so a simulated classification is of the same
-/// prompt a live one would see.
-fn simulate_prompt_text(json: &serde_json::Value) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
-        let mut have_user = false;
-        for msg in messages {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-            let text = match msg.get("content") {
-                Some(serde_json::Value::String(s)) => s.clone(),
-                Some(serde_json::Value::Array(parts)) => parts
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                _ => String::new(),
-            };
-            if role == "system" && !text.is_empty() {
-                parts.push(text);
-            } else if role == "user" && !have_user && !text.is_empty() {
-                parts.push(text);
-                have_user = true;
-            }
-            if have_user {
-                break;
-            }
-        }
-    }
-    parts.join("\n")
 }
 
 /// View of the persisted model-"boons" settings, flattened per boon
