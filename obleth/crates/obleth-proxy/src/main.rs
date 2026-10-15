@@ -19,6 +19,7 @@ mod replicas;
 mod responses;
 mod router;
 mod search;
+mod speech;
 mod state;
 mod upstream_failure;
 mod verdicts;
@@ -641,6 +642,9 @@ async fn main() -> anyhow::Result<()> {
             "/search/:tool",
             axum::routing::post(search::search_named).get(search::tools),
         )
+        // The voices a text-to-speech model's server offers (not in OpenAI's
+        // API; vLLM-Omni's shape). Speech itself streams through the fallback.
+        .route(speech::VOICES_PATH, get(speech::voices))
         .route("/mcp/:server", axum::routing::any(mcp::mcp_handler))
         .route("/mcp/:server/*rest", axum::routing::any(mcp::mcp_handler))
         .fallback(proxy::proxy_handler)
