@@ -8,6 +8,9 @@
 //
 // Styles stay on 'unsafe-inline': Next's font loader, Recharts, and shadcn
 // primitives write style attributes that a nonce cannot cover.
+//
+// Media may come from blob: URLs: the Playground's Speech mode assembles the
+// audio it streamed in the browser and replays it from an object URL.
 
 export interface CspOptions {
   development?: boolean;
@@ -20,6 +23,7 @@ export function contentSecurityPolicy(nonce: string, opts: CspOptions = {}): str
     `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${development ? " 'unsafe-eval'" : ""}`,
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob:",
+    "media-src 'self' blob:",
     "font-src 'self' data:",
     "connect-src 'self'",
     "frame-ancestors 'none'",

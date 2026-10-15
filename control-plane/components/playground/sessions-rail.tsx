@@ -24,6 +24,7 @@ function subtitle(s: PlaygroundSession, now: number): string {
   let detail = "";
   if (s.launcher) detail = "Choose what to try";
   else if (s.mode === "image") detail = s.imageModel ?? "";
+  else if (s.mode === "speech") detail = s.speechModel ?? "";
   else if (s.mode === "router") detail = s.routerPrompt?.trim() ? "auto" : "";
   else if (s.mode === "search") detail = s.searchQuery?.trim().slice(0, 40) ?? "";
   else if (s.mode === "verdicts") detail = `${s.verdictQuestions?.length ?? 1} question${(s.verdictQuestions?.length ?? 1) === 1 ? "" : "s"}`;

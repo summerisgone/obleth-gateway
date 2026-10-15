@@ -8,7 +8,8 @@
 //
 // The system key secret is fetched once (cached) from the admin API and never
 // leaves the server. Only server-side route handlers import this — today
-// `app/api/charo/*` and `app/api/live/playground/{images,verdicts,search}`.
+// `app/api/charo/*` and
+// `app/api/live/playground/{images,verdicts,search,speech,voices}`.
 
 import { obleth } from "@/lib/obleth";
 
@@ -73,6 +74,19 @@ export interface GatewaySearchBody {
   [k: string]: unknown;
 }
 
+export interface GatewaySpeechBody {
+  model: string;
+  input: string;
+  voice?: string;
+  /** Style direction ("calm and slow"); backends that do not support it ignore it. */
+  instructions?: string;
+  /** Container of the returned audio, e.g. `wav`. */
+  response_format?: string;
+  /** `audio` streams raw bytes as they are made; `sse` wraps them in events. */
+  stream_format?: "audio" | "sse";
+  [k: string]: unknown;
+}
+
 /**
  * POST a chat-completions request to the data plane as the reserved tenant.
  * Returns the raw `fetch` Response so callers can read the
@@ -115,6 +129,34 @@ export async function gatewaySearch(
   signal?: AbortSignal,
 ): Promise<Response> {
   return gatewayPost("/v1/search", body, signal);
+}
+
+/**
+ * POST a text-to-speech request to the data plane's `/v1/audio/speech` as the
+ * reserved tenant. The body is audio bytes, streamed when the backend streams;
+ * callers pass it through without reading it.
+ */
+export async function gatewaySpeech(
+  body: GatewaySpeechBody,
+  signal?: AbortSignal,
+): Promise<Response> {
+  return gatewayPost("/v1/audio/speech", body, signal);
+}
+
+/**
+ * GET the voices a speech model's server offers, from the data plane's
+ * `/v1/audio/voices`. Not every server can list them; callers treat a 404 as
+ * "type a voice name instead".
+ */
+export async function gatewayVoices(
+  model: string,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const secret = await getControlPlaneKey();
+  return fetch(`${PROXY_BASE}/v1/audio/voices?model=${encodeURIComponent(model)}`, {
+    headers: { Authorization: `Bearer ${secret}` },
+    signal,
+  });
 }
 
 async function gatewayPost(

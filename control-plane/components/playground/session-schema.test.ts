@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { describe, expect, it } from "vitest";
-import { ROUTER_PROMPT_MAX_LENGTH, sessionSchema } from "./playground";
+import { ROUTER_PROMPT_MAX_LENGTH, SPEECH_TEXT_MAX_LENGTH, sessionSchema } from "./playground";
 
 // Pins the failure mode fix round 2 found: a `routerPrompt` longer than the
 // schema allows doesn't just get rejected for that one session — it fails
@@ -60,3 +60,25 @@ describe("sessionSchema / verdicts mode", () => {
     expect(sessionSchema.safeParse({ ...base, mode: "chat" }).success).toBe(true);
   });
 });
+
+describe("sessionSchema / speech mode", () => {
+  // Same trap again: one session the schema rejects wipes every saved session.
+  it("round-trips a speech session with its whole draft, text at the cap", () => {
+    const session = {
+      ...base,
+      mode: "speech" as const,
+      speechModel: "voice-1",
+      speechText: "x".repeat(SPEECH_TEXT_MAX_LENGTH),
+      speechVoice: "tara",
+      speechInstructions: "calm and slow",
+    };
+    const result = z.array(sessionSchema).safeParse([session]);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data[0]).toMatchObject({ mode: "speech", speechVoice: "tara" });
+  });
+
+  it("rejects speech text past the cap the relay enforces", () => {
+    expect(sessionSchema.safeParse({ ...base, mode: "speech", speechText: "x".repeat(SPEECH_TEXT_MAX_LENGTH + 1) }).success).toBe(false);
+  });
+});
+

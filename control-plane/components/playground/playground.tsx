@@ -10,6 +10,7 @@ import { useEnabledModels } from "@/components/charo/use-enabled-models";
 import { UnifiedWorkspace } from "./workspaces";
 import { RouterWorkspace } from "./router-workspace";
 import { ImageWorkspace } from "./image-workspace";
+import { SpeechWorkspace } from "./speech-workspace";
 import { SearchWorkspace } from "./search-workspace";
 import { VerdictsWorkspace } from "./verdicts-workspace";
 import { NewSession } from "./new-session";
@@ -30,11 +31,15 @@ import { cn } from "@/lib/utils";
 // headline use case, so the cap is generous rather than tight.
 export const ROUTER_PROMPT_MAX_LENGTH = 100_000;
 
+// Speech mode's text cap, shared by the schema and the composer's `maxLength`
+// for the same reason as ROUTER_PROMPT_MAX_LENGTH above.
+export const SPEECH_TEXT_MAX_LENGTH = 20_000;
+
 // Exported so a test can assert a session parses/round-trips without
 // duplicating the schema, and so its cap can be checked against
 // ROUTER_PROMPT_MAX_LENGTH directly rather than by re-deriving it.
 export const sessionSchema = z.object({
-  id: z.string(), title: z.string(), mode: z.enum(["chat", "compare", "router", "image", "verdicts", "search"]),
+  id: z.string(), title: z.string(), mode: z.enum(["chat", "compare", "router", "image", "speech", "verdicts", "search"]),
   models: z.array(z.string()).min(1).max(4), generation: generationSchema,
   recipients: z.array(z.number().int().min(0).max(3)).optional(),
   // Last touched, for ordering and grouping the session rail.
@@ -69,6 +74,14 @@ export const sessionSchema = z.object({
   imageCount: z.number().int().min(1).max(4).optional(),
   imageSteps: z.number().int().min(1).max(150).optional(),
   imageSeed: z.number().int().min(0).max(4_294_967_295).optional(),
+  // Speech mode's form draft, kept on the session for the same reason as the
+  // image fields; the audio itself is memory-only (see speech-workspace.tsx —
+  // a minute of WAV is megabytes, far past what localStorage can hold).
+  // `speechText` matches the relay's and the gateway's input cap.
+  speechModel: z.string().max(200).optional(),
+  speechText: z.string().max(SPEECH_TEXT_MAX_LENGTH).optional(),
+  speechVoice: z.string().max(200).optional(),
+  speechInstructions: z.string().max(2000).optional(),
   // Verdicts mode's form draft: the state text, the target model, and the
   // question builder rows live on the session for the same reason the router
   // fields do — a mode toggle remounts the workspace. Results are memory-only
@@ -143,14 +156,16 @@ export function Playground({ scope, gatewayBase = "http://localhost:8080", openM
     opened.current = true;
     const image = openModel.type === "image";
     const search = openModel.type === "search";
+    const speech = openModel.type === "audio_speech";
     const next: PlaygroundSession = {
       ...fresh(),
       title: openModel.name,
       launcher: false,
-      mode: image ? "image" : search ? "search" : "chat",
-      models: [search ? "auto" : openModel.name],
+      mode: image ? "image" : search ? "search" : speech ? "speech" : "chat",
+      models: [search || speech ? "auto" : openModel.name],
       ...(image ? { imageModel: openModel.name } : {}),
       ...(search ? { searchTool: openModel.name } : {}),
+      ...(speech ? { speechModel: openModel.name } : {}),
     };
     setSessions((all) => [next, ...all]);
     setActive(next.id);
@@ -198,7 +213,7 @@ export function Playground({ scope, gatewayBase = "http://localhost:8080", openM
       if (!parsed.success) { setNotice("That file is not a Playground session export."); return; }
       const next = { ...parsed.data, id: uuid(), updatedAt: Date.now() };
       for (const [key, value] of Object.entries(data.conversations ?? {})) {
-        // Only conversation lanes; images are not persisted anyway.
+        // Only conversation lanes; images and audio are not persisted anyway.
         if (/^compare:\d$/.test(key) && value) localStorage.setItem(`${root}:${next.id}:${key}`, JSON.stringify(value));
       }
       setSessions((all) => [next, ...all]); setActive(next.id); setNotice(null);
@@ -275,6 +290,8 @@ export function Playground({ scope, gatewayBase = "http://localhost:8080", openM
             ? <RouterWorkspace session={session} update={update} settingsOpen={settingsOpen} onOpenSession={openSession} />
             : session.mode === "image"
             ? <ImageWorkspace storageKey={`${root}:${session.id}:image`} session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} />
+            : session.mode === "speech"
+            ? <SpeechWorkspace storageKey={`${root}:${session.id}:speech`} session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} />
             : session.mode === "verdicts"
             ? <VerdictsWorkspace session={session} update={update} models={models} loading={loading} />
             : session.mode === "search"
