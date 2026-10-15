@@ -20,6 +20,11 @@
 //! Only the tool execution between turns pauses the stream. The first turn
 //! reuses the response the proxy already opened (preserving retry/failover on
 //! the hot path); follow-up turns are dispatched here directly.
+//!
+//! A turn the upstream stops short of (its connection breaks or goes silent,
+//! it closes before `[DONE]` and a finish reason, or a follow-up turn cannot
+//! be dispatched) ends the client's stream the way the pass-through path
+//! does: an error event, then an aborted response.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -31,7 +36,9 @@ use obleth_config::{ResolvedKey, ResolvedModel, ToolLoopSettings};
 use serde_json::{json, Value};
 
 use crate::state::AppState;
-use crate::upstream_failure::{payload_failure, DEFAULT_FAILURE_STATUS};
+use crate::upstream_failure::{
+    payload_failure, stream_cut_error, stream_cut_event, DEFAULT_FAILURE_STATUS,
+};
 
 /// Visible marker prefix shown inline before a gateway tool runs.
 const SEARCH_GLYPH: &str = "\u{1f50e}";
@@ -169,28 +176,12 @@ pub fn run(
                     match dispatch(&state, &target, &request, deadline.bound(dispatch_timeout)).await {
                         Ok(r) => r,
                         Err(e) => {
+                            // The answer cannot go on past the tool call: it
+                            // ends the way a broken-off stream does.
                             tracing::warn!(error = %e, "tool stream follow-up dispatch failed");
-                            yield Ok(Bytes::from(content_chunk(
-                                "chatcmpl-toolstream",
-                                &upstream_model,
-                                created,
-                                &format!("\n\n[search continuation failed: {e}]\n\n"),
-                            )));
-                            if let Some(ctx) = image_ctx.as_ref() {
-                                if let Some(chunk) =
-                                    image_chunk("chatcmpl-toolstream", &upstream_model, created, &ctx.images)
-                                {
-                                    yield Ok(Bytes::from(chunk));
-                                }
-                            }
-                            yield Ok(Bytes::from(finish_chunk(
-                                "chatcmpl-toolstream",
-                                &upstream_model,
-                                created,
-                                None,
-                            )));
-                            yield Ok(Bytes::from(done()));
+                            yield Ok(stream_cut_event(upstream_start.elapsed()));
                             fail_stats(&stats, DEFAULT_FAILURE_STATUS, None, 0);
+                            yield Err(stream_cut_error());
                             return;
                         }
                     }
@@ -212,13 +203,15 @@ pub fn run(
             let mut failure: Option<u16> = None;
             let mut error_forwarded = false;
             let mut turn_chars = 0usize;
+            // The upstream stopped short: its connection broke or went silent.
+            let mut broke_off = false;
 
             'read: while let Some(item) = next_within(&mut bytes, idle).await {
                 let chunk = match item {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!(error = %e, "tool stream upstream read error");
-                        failure = Some(DEFAULT_FAILURE_STATUS);
+                        broke_off = true;
                         break 'read;
                     }
                 };
@@ -308,9 +301,23 @@ pub fn run(
                 }
             }
 
-            // A failed turn ends the loop: its tool calls, possibly cut off,
-            // are not run. The client's stream closes the way a plain answer
-            // does, unless the upstream's error event already said why.
+            // A turn the upstream stopped short of, or that closed with
+            // neither `[DONE]` nor a finish reason, ends the client's stream
+            // the way the pass-through path does: an error event, then an
+            // aborted response, with no finish chunk and no `[DONE]`. Its tool
+            // calls, possibly cut off, are not run.
+            if !error_forwarded && (broke_off || (!turn_done && finish_reason.is_none())) {
+                if !broke_off {
+                    tracing::warn!("tool stream upstream ended before its last event");
+                }
+                yield Ok(stream_cut_event(upstream_start.elapsed()));
+                fail_stats(&stats, failure.unwrap_or(DEFAULT_FAILURE_STATUS), usage, turn_chars);
+                yield Err(stream_cut_error());
+                return;
+            }
+
+            // A turn the upstream failed in its own words (an error event, or
+            // a generation it aborted) ends the loop too, with what it said.
             if let Some(status) = failure {
                 if !error_forwarded {
                     if let Some(ctx) = image_ctx.as_ref() {
@@ -483,27 +490,9 @@ pub fn run(
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "tool stream finalization dispatch failed");
-                yield Ok(Bytes::from(content_chunk(
-                    "chatcmpl-toolstream",
-                    &upstream_model,
-                    created,
-                    "\n\n[reached the tool-call turn limit and could not produce a final answer]\n\n",
-                )));
-                if let Some(ctx) = image_ctx.as_ref() {
-                    if let Some(chunk) =
-                        image_chunk("chatcmpl-toolstream", &upstream_model, created, &ctx.images)
-                    {
-                        yield Ok(Bytes::from(chunk));
-                    }
-                }
-                yield Ok(Bytes::from(finish_chunk(
-                    "chatcmpl-toolstream",
-                    &upstream_model,
-                    created,
-                    None,
-                )));
-                yield Ok(Bytes::from(done()));
+                yield Ok(stream_cut_event(upstream_start.elapsed()));
                 fail_stats(&stats, DEFAULT_FAILURE_STATUS, None, 0);
+                yield Err(stream_cut_error());
                 return;
             }
         };
@@ -518,13 +507,14 @@ pub fn run(
         let mut failure: Option<u16> = None;
         let mut error_forwarded = false;
         let mut turn_chars = 0usize;
+        let mut broke_off = false;
 
         'final_read: while let Some(item) = next_within(&mut bytes, idle).await {
             let chunk = match item {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(error = %e, "tool stream final read error");
-                    failure = Some(DEFAULT_FAILURE_STATUS);
+                    broke_off = true;
                     break 'final_read;
                 }
             };
@@ -589,6 +579,18 @@ pub fn run(
             if turn_done {
                 break 'final_read;
             }
+        }
+
+        // Stopped short, as a tool turn can be: the same error event and
+        // aborted response.
+        if !error_forwarded && (broke_off || (!turn_done && finish_reason.is_none())) {
+            if !broke_off {
+                tracing::warn!("tool stream final turn ended before its last event");
+            }
+            yield Ok(stream_cut_event(upstream_start.elapsed()));
+            fail_stats(&stats, failure.unwrap_or(DEFAULT_FAILURE_STATUS), usage, turn_chars);
+            yield Err(stream_cut_error());
+            return;
         }
 
         // The finalization turn is the client-facing final answer, so it is

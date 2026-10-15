@@ -12,11 +12,61 @@
 //! through untouched, but records it with an error status, bills only what
 //! was produced, never caches it, and keeps it out of the completion-length
 //! averages.
+//!
+//! A stream can also stop short with no word from the upstream at all: its
+//! connection breaks or goes silent, or it closes before its terminal event.
+//! The gateway then tells the client itself, with [`stream_cut_event`], and
+//! aborts the response, so the cut is never mistaken for a whole answer.
 
+use std::time::Duration;
+
+use bytes::Bytes;
 use serde_json::Value;
 
 /// Status recorded for a failure that carries no HTTP code of its own.
 pub(crate) const DEFAULT_FAILURE_STATUS: u16 = 502;
+
+/// The SSE event that tells a client its stream stopped before the response
+/// was complete, `elapsed` after the upstream call began. An error object in
+/// OpenAI's shape: OpenAI's SDKs raise an `APIError` for any stream event
+/// whose JSON carries an `error` key. It names no upstream detail.
+pub(crate) fn stream_cut_event(elapsed: Duration) -> Bytes {
+    let event = serde_json::json!({
+        "error": {
+            "message": format!(
+                "upstream stream ended before the response was complete (after {} s)",
+                elapsed.as_secs()
+            ),
+            "type": crate::proxy::GATEWAY_ERROR_TYPE,
+            "code": DEFAULT_FAILURE_STATUS,
+        }
+    });
+    Bytes::from(format!("data: {event}\n\n"))
+}
+
+/// The error that aborts a response after [`stream_cut_event`]: the body ends
+/// without its clean close (no `[DONE]`, no final chunk), so a client reading
+/// raw SSE sees a truncated stream too.
+pub(crate) fn stream_cut_error() -> std::io::Error {
+    std::io::Error::other("upstream stream ended before the response was complete")
+}
+
+/// Whether bytes sent so far (their last few) end at an SSE event boundary,
+/// so an event can follow them without joining the one before. Nothing sent
+/// is a boundary.
+pub(crate) fn at_event_boundary(sent_tail: &[u8]) -> bool {
+    sent_tail.is_empty()
+        || sent_tail.ends_with(b"\n\n")
+        || sent_tail.ends_with(b"\r\n\r\n")
+        || sent_tail.ends_with(b"\r\r")
+}
+
+/// Keep the last four bytes sent, for [`at_event_boundary`].
+pub(crate) fn remember_sent(sent_tail: &mut Vec<u8>, chunk: &[u8]) {
+    sent_tail.extend_from_slice(&chunk[chunk.len().saturating_sub(4)..]);
+    let excess = sent_tail.len().saturating_sub(4);
+    sent_tail.drain(..excess);
+}
 
 /// Error payloads are small; an SSE event or JSON body above this is
 /// generated content, and is not inspected.
@@ -138,6 +188,26 @@ fn may_report_failure(payload: &[u8]) -> bool {
         .any(|needle| contains(payload, needle))
 }
 
+/// Whether a choice in this event reached its finish reason. Every chunk
+/// names `finish_reason`, mostly as `null`; only one that sets it to a string
+/// is parsed. (Quotes inside generated text are escaped, so text cannot pass
+/// for the field.)
+fn reports_finish(payload: &[u8]) -> bool {
+    if !contains(payload, b"\"finish_reason\":\"") && !contains(payload, b"\"finish_reason\": \"") {
+        return false;
+    }
+    serde_json::from_slice::<Value>(payload)
+        .ok()
+        .and_then(|v| {
+            v.get("choices")?.as_array().map(|choices| {
+                choices
+                    .iter()
+                    .any(|c| c.get("finish_reason").is_some_and(Value::is_string))
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -148,6 +218,10 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// SSE bodies are read event by event; the first failure wins. A JSON body is
 /// judged whole at [`FailureWatch::finish`]. Events and bodies past
 /// [`MAX_INSPECTED_BYTES`] are generated content and are skipped.
+///
+/// A chat or text completion stream ([`FailureWatch::expecting_end`]) is
+/// also watched for its end: `[DONE]`, or at least a finish reason for
+/// upstreams that send no `[DONE]`.
 pub(crate) struct FailureWatch {
     sse: bool,
     /// SSE: the line being read. JSON: the body so far.
@@ -161,6 +235,12 @@ pub(crate) struct FailureWatch {
     /// SSE: the current event outgrew the cap.
     event_oversized: bool,
     failure: Option<UpstreamFailure>,
+    /// SSE: the stream is a chat or text completion, which has an end.
+    expect_end: bool,
+    /// SSE: `[DONE]` arrived.
+    done: bool,
+    /// SSE: a choice reached its finish reason.
+    finished: bool,
 }
 
 impl FailureWatch {
@@ -177,7 +257,35 @@ impl FailureWatch {
             pending_oversized: false,
             event_oversized: false,
             failure: None,
+            expect_end: false,
+            done: false,
+            finished: false,
         })
+    }
+
+    /// Watch, too, that the stream reaches its end: it is a chat or text
+    /// completion, which closes with `[DONE]`.
+    pub(crate) fn expecting_end(mut self) -> Self {
+        self.expect_end = true;
+        self
+    }
+
+    /// An SSE stream rather than a JSON body.
+    pub(crate) fn is_sse(&self) -> bool {
+        self.sse
+    }
+
+    /// `[DONE]` has arrived: the response is whole, and nothing the
+    /// connection does after it can cut it short.
+    pub(crate) fn saw_done(&self) -> bool {
+        self.done
+    }
+
+    /// After [`FailureWatch::finish`]: a stream expected to end that closed
+    /// with neither `[DONE]` nor a finish reason, and no failure of the
+    /// upstream's own to say why.
+    pub(crate) fn ended_early(&self) -> bool {
+        self.sse && self.expect_end && self.failure.is_none() && !self.done && !self.finished
     }
 
     pub(crate) fn push(&mut self, chunk: &[u8]) {
@@ -200,10 +308,11 @@ impl FailureWatch {
         self.extend_pending(rest);
     }
 
-    /// The failure the response reported, if any.
-    pub(crate) fn finish(mut self) -> Option<UpstreamFailure> {
+    /// The failure the response reported, if any. Called once, when the body
+    /// has ended.
+    pub(crate) fn finish(&mut self) -> Option<UpstreamFailure> {
         if self.failure.is_some() {
-            return self.failure;
+            return self.failure.clone();
         }
         if self.sse {
             // A last event the upstream never terminated with a blank line.
@@ -211,14 +320,15 @@ impl FailureWatch {
                 self.end_line();
             }
             self.dispatch();
-            return self.failure;
+            return self.failure.clone();
         }
         if self.pending_oversized || !may_report_failure(&self.pending) {
             return None;
         }
-        serde_json::from_slice::<Value>(&self.pending)
+        self.failure = serde_json::from_slice::<Value>(&self.pending)
             .ok()
-            .and_then(|body| payload_failure(&body))
+            .and_then(|body| payload_failure(&body));
+        self.failure.clone()
     }
 
     fn extend_pending(&mut self, bytes: &[u8]) {
@@ -278,6 +388,13 @@ impl FailureWatch {
         let error_event = std::mem::take(&mut self.error_event);
         let oversized = std::mem::take(&mut self.event_oversized);
         let data = &self.data[..];
+        if self.expect_end && !oversized {
+            if data == b"[DONE]" {
+                self.done = true;
+            } else if !self.finished && reports_finish(data) {
+                self.finished = true;
+            }
+        }
         let failure = if error_event {
             let reported = serde_json::from_slice::<Value>(data)
                 .ok()
@@ -539,6 +656,129 @@ mod tests {
         let failure = payload_failure(&json!({"error": "e".repeat(1000)})).unwrap();
         assert_eq!(failure.message.chars().count(), MAX_MESSAGE_CHARS + 3);
     }
+
+    #[test]
+    fn the_cut_event_is_an_openai_error_event_and_reads_as_a_bad_gateway() {
+        let event = stream_cut_event(std::time::Duration::from_millis(3_600_400));
+        let text = std::str::from_utf8(&event).unwrap();
+        assert!(
+            text.starts_with("data: ") && text.ends_with("\n\n"),
+            "{text:?}"
+        );
+        let payload: Value = serde_json::from_str(&text[6..]).unwrap();
+        assert_eq!(
+            payload,
+            json!({"error": {
+                "message": "upstream stream ended before the response was complete (after 3600 s)",
+                "type": "obleth_gateway_error",
+                "code": 502,
+            }})
+        );
+        // What the gateway says is a failure by its own reading too, so a
+        // translating surface or a downstream obleth records it as one.
+        assert_eq!(watch_sse(text.as_bytes()).unwrap().status, 502);
+    }
+
+    fn watch_end(wire: &str) -> FailureWatch {
+        let mut watch = FailureWatch::for_content_type("text/event-stream")
+            .unwrap()
+            .expecting_end();
+        watch.push(wire.as_bytes());
+        watch.finish();
+        watch
+    }
+
+    fn finish(reason: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({"object": "chat.completion.chunk",
+                   "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]})
+        )
+    }
+
+    #[test]
+    fn a_completion_stream_without_done_or_a_finish_reason_ended_early() {
+        // Text and then nothing: the upstream stopped short.
+        let cut = format!("{}{}", content("Hello"), content(", wor"));
+        assert!(watch_end(&cut).ended_early());
+        // Nothing at all is no answer either.
+        assert!(watch_end("").ended_early());
+        // A comment or a keep-alive does not end it.
+        assert!(watch_end(&format!("{cut}: keep-alive\n\n")).ended_early());
+        // Generated text that talks about the field is not the field.
+        assert!(watch_end(&content(r#"say "finish_reason":"stop" now"#)).ended_early());
+    }
+
+    #[test]
+    fn done_or_a_finish_reason_ends_a_completion_stream() {
+        let whole = format!("{}{}data: [DONE]\n\n", content("Hello"), finish("stop"));
+        let watch = watch_end(&whole);
+        assert!(!watch.ended_early() && watch.saw_done());
+        // An upstream that sends no `[DONE]` still says when it finished, in
+        // either JSON spacing.
+        let no_done = format!("{}{}", content("Hello"), finish("length"));
+        assert!(!watch_end(&no_done).ended_early());
+        let spaced = format!(
+            "{}data: {{\"choices\": [{{\"index\": 0, \"delta\": {{}}, \"finish_reason\": \"stop\"}}]}}\n\n",
+            content("Hello")
+        );
+        assert!(!watch_end(&spaced).ended_early());
+        // `[DONE]` without its blank line, at the very end, still counts.
+        let watch = watch_end(&format!("{}data: [DONE]", content("Hello")));
+        assert!(!watch.ended_early() && watch.saw_done());
+        // Split anywhere, the verdict is the same.
+        for cut in 0..=whole.len() {
+            let mut watch = FailureWatch::for_content_type("text/event-stream")
+                .unwrap()
+                .expecting_end();
+            watch.push(&whole.as_bytes()[..cut]);
+            watch.push(&whole.as_bytes()[cut..]);
+            watch.finish();
+            assert!(!watch.ended_early(), "split at byte {cut}");
+        }
+    }
+
+    #[test]
+    fn a_stream_that_reported_its_failure_or_has_no_end_is_not_ended_early() {
+        // The upstream's own error event says why; no second word is needed.
+        let failed = format!(
+            "{}data: {}\n\n",
+            content("Hello"),
+            json!({"error": {"message": "boom", "code": 500}})
+        );
+        let watch = watch_end(&failed);
+        assert!(watch.failure.is_some() && !watch.ended_early());
+        // Only completion streams are expected to end; other bodies are not
+        // judged.
+        let mut other = FailureWatch::for_content_type("text/event-stream").unwrap();
+        other.push(content("Hello").as_bytes());
+        other.finish();
+        assert!(!other.ended_early());
+        let mut json_body = FailureWatch::for_content_type("application/json")
+            .unwrap()
+            .expecting_end();
+        json_body.push(b"{\"choices\": [");
+        json_body.finish();
+        assert!(!json_body.ended_early() && !json_body.is_sse());
+    }
+
+    #[test]
+    fn the_sent_tail_tells_an_event_boundary() {
+        let mut tail = Vec::new();
+        assert!(at_event_boundary(&tail));
+        remember_sent(&mut tail, b"data: {\"a\": 1}\n\n");
+        assert!(at_event_boundary(&tail));
+        assert_eq!(tail.len(), 4);
+        remember_sent(&mut tail, b"data: {\"a\":");
+        assert!(!at_event_boundary(&tail));
+        // A blank line split across two sends.
+        remember_sent(&mut tail, b" 2}\n");
+        assert!(!at_event_boundary(&tail));
+        remember_sent(&mut tail, b"\n");
+        assert!(at_event_boundary(&tail));
+        remember_sent(&mut tail, b"data: x\r\n\r\n");
+        assert!(at_event_boundary(&tail));
+    }
 }
 
 /// Bare HTTP/1.1 upstreams, for tests that need a connection to fail in ways a
@@ -599,6 +839,75 @@ pub(crate) mod test_support {
         (accepted, format!("http://{addr}/v1"))
     }
 
+    /// How a streaming upstream ends its response.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum StreamEnd {
+        /// The events, then a clean close of the body.
+        Clean,
+        /// The connection is reset mid-body.
+        Reset,
+        /// The connection closes mid-body, before the last chunk.
+        Close,
+        /// The upstream holds the connection open and sends nothing more.
+        Silent,
+    }
+
+    /// An upstream at the returned base URL (`.../v1`) that answers every
+    /// request `200` with an SSE body: each of `events` as its own chunk,
+    /// then `end`. The counter is the number of connections accepted.
+    pub(crate) async fn spawn_sse_upstream(
+        events: Vec<String>,
+        end: StreamEnd,
+    ) -> (Arc<AtomicUsize>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let events = events.clone();
+                tokio::spawn(async move {
+                    read_request(&mut socket).await;
+                    let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                                transfer-encoding: chunked\r\nconnection: close\r\n\r\n";
+                    if socket.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    for event in &events {
+                        let chunk = format!("{:x}\r\n{event}\r\n", event.len());
+                        if socket.write_all(chunk.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let _ = socket.flush().await;
+                        // Each event its own read, as a live stream is.
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    // Let the reader take every event before the end, so a
+                    // reset cannot discard one still in its buffer.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    match end {
+                        StreamEnd::Clean => {
+                            let _ = socket.write_all(b"0\r\n\r\n").await;
+                            let _ = socket.shutdown().await;
+                        }
+                        StreamEnd::Reset => {
+                            let _ = socket.set_zero_linger();
+                            drop(socket);
+                        }
+                        StreamEnd::Close => {
+                            let _ = socket.shutdown().await;
+                        }
+                        StreamEnd::Silent => {
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        }
+                    }
+                });
+            }
+        });
+        (accepted, format!("http://{addr}/v1"))
+    }
+
     /// Read one request: its headers, then `content-length` bytes of body.
     async fn read_request(socket: &mut TcpStream) {
         let mut buf = Vec::new();
@@ -645,7 +954,9 @@ mod pipeline {
     use serde_json::{json, Value};
     use uuid::Uuid;
 
-    use super::test_support::{spawn_failing_upstream, Hangup};
+    use futures_util::StreamExt;
+
+    use super::test_support::{spawn_failing_upstream, spawn_sse_upstream, Hangup, StreamEnd};
     use crate::state::AppState;
 
     /// Price of one output token; input is free, so spend counts output only.
@@ -735,6 +1046,14 @@ mod pipeline {
         wal_dir: std::path::PathBuf,
     }
 
+    /// A streamed response as the client read it.
+    struct Streamed {
+        status: StatusCode,
+        boons: String,
+        text: String,
+        aborted: bool,
+    }
+
     impl Drop for Gateway {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.wal_dir);
@@ -802,6 +1121,45 @@ mod pipeline {
             )
         }
 
+        /// Send a streamed chat request and read its body to the end, or to
+        /// the error that aborts it. Returns the status, the boons header,
+        /// the bytes that arrived, and whether the body was aborted.
+        async fn chat_stream(&self, secret: &str, body: &Value) -> Streamed {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = crate::proxy::proxy_handler(State(self.state.clone()), req).await;
+            let status = resp.status();
+            let boons = resp
+                .headers()
+                .get(crate::boons::BOONS_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let mut data = resp.into_body().into_data_stream();
+            let mut text = String::new();
+            let mut aborted = false;
+            while let Some(item) = data.next().await {
+                match item {
+                    Ok(chunk) => text.push_str(&String::from_utf8_lossy(&chunk)),
+                    Err(_) => {
+                        aborted = true;
+                        break;
+                    }
+                }
+            }
+            Streamed {
+                status,
+                boons,
+                text,
+                aborted,
+            }
+        }
+
         /// Settled requests by status class, from the gateway's own metrics.
         fn requests_with_status(&self, class: &str) -> u64 {
             let label = format!("status=\"{class}\"");
@@ -826,6 +1184,15 @@ mod pipeline {
     }
 
     async fn gateway() -> Option<Gateway> {
+        gateway_with(reqwest::Client::new(), Default::default()).await
+    }
+
+    /// A gateway whose upstream client is `http` (so a test can give it a
+    /// short read timeout) and whose boons run with `boons`.
+    async fn gateway_with(
+        http: reqwest::Client,
+        boons: obleth_config::BoonSettings,
+    ) -> Option<Gateway> {
         let (Ok(db), Ok(redis_url)) = (
             std::env::var("OBLETH_TEST_DATABASE_URL"),
             std::env::var("OBLETH_TEST_REDIS_URL"),
@@ -850,7 +1217,6 @@ mod pipeline {
         )
         .await
         .expect("telemetry sink");
-        let http = reqwest::Client::new();
         let state = AppState {
             redis,
             fairshare: obleth_fairshare::FairShare::start(
@@ -870,7 +1236,7 @@ mod pipeline {
             families: crate::reasoning::FamilyRegistry::new(),
             classifier: crate::classifier::Classifier::new(Default::default()),
             output_stats: Default::default(),
-            boons: crate::boons::BoonEngine::new(Default::default()),
+            boons: crate::boons::BoonEngine::new(boons),
             tool_cache: Cache::builder().build(),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             fail_open: false,
@@ -1008,6 +1374,212 @@ mod pipeline {
             let (status, _, text) = gw.chat(&secret, &request(&name, false)).await;
             assert_eq!(status, StatusCode::OK, "{name}: {text}");
             assert_eq!(accepted.load(Ordering::SeqCst), 2, "{name}");
+        }
+    }
+
+    /// The two ways a chat stream runs through the gateway: passed through as
+    /// the upstream sends it, or driven by the streaming tool loop (here
+    /// armed by the image-generation boon, as on any tool-boon model).
+    #[derive(Clone, Copy, Debug)]
+    enum Path {
+        Plain,
+        Boon,
+    }
+
+    const PATHS: [Path; 2] = [Path::Plain, Path::Boon];
+
+    fn sse_event(value: &Value) -> String {
+        format!("data: {value}\n\n")
+    }
+
+    /// A gateway for `path` whose upstream reads give up after half a second
+    /// of silence, with a model on `base` named after the case.
+    async fn gateway_for(path: Path, name: &str, base: &str) -> Option<Gateway> {
+        let http = reqwest::Client::builder()
+            .read_timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let boons = obleth_config::BoonSettings {
+            image_generation: obleth_config::ImageGenerationBoonSettings {
+                enabled: true,
+                image_model: Some("image-model".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let gw = gateway_with(http, boons).await?;
+        let mut model = route(name, base);
+        model.cache_enabled = false;
+        if let Path::Boon = path {
+            model.boons = vec!["image_generation".into()];
+            model.supports_function_calling = true;
+        }
+        gw.register(model).await;
+        Some(gw)
+    }
+
+    fn assert_path(path: Path, streamed: &Streamed, case: &str) {
+        match path {
+            Path::Boon => assert!(streamed.boons.contains("image_generation"), "{case}"),
+            Path::Plain => assert!(streamed.boons.is_empty(), "{case}: {}", streamed.boons),
+        }
+    }
+
+    /// The `data:` payloads of every event the client received.
+    fn payloads(text: &str) -> Vec<String> {
+        text.split("\n\n")
+            .filter_map(|event| event.trim().strip_prefix("data: "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_stream_the_upstream_stops_short_of_ends_with_an_error_event_on_every_path() {
+        let text = [delta("Hello"), delta(" world")].map(|v| sse_event(&v));
+        for path in PATHS {
+            for end in [
+                StreamEnd::Reset,
+                StreamEnd::Close,
+                StreamEnd::Silent,
+                StreamEnd::Clean,
+            ] {
+                let case = format!("{path:?}/{end:?}");
+                let name = format!("cut-{path:?}-{end:?}").to_lowercase();
+                let (_, base) = spawn_sse_upstream(text.to_vec(), end).await;
+                let Some(gw) = gateway_for(path, &name, &base).await else {
+                    return;
+                };
+                let (secret, key) = gw.tenant().await;
+                let mut body = request(&name, true);
+                body["stream_options"] = json!({"include_usage": true});
+
+                let streamed = gw.chat_stream(&secret, &body).await;
+                assert_path(path, &streamed, &case);
+                assert_eq!(streamed.status, StatusCode::OK, "{case}");
+                // The text that streamed reached the client, then the
+                // gateway's error event, then the response was aborted: no
+                // finish chunk, no usage chunk, no `[DONE]`.
+                assert!(streamed.aborted, "{case}: {}", streamed.text);
+                let events = payloads(&streamed.text);
+                assert!(streamed.text.contains("Hello") && streamed.text.contains(" world"));
+                assert!(
+                    !streamed.text.contains("[DONE]"),
+                    "{case}: {}",
+                    streamed.text
+                );
+                assert!(!streamed.text.contains("finish_reason\":\"stop"), "{case}");
+                assert!(!streamed.text.contains("completion_tokens"), "{case}");
+                let last: Value = serde_json::from_str(events.last().unwrap()).unwrap();
+                assert_eq!(last["error"]["type"], "obleth_gateway_error", "{case}");
+                assert_eq!(last["error"]["code"], 502, "{case}");
+                assert!(
+                    last["error"]["message"].as_str().unwrap().starts_with(
+                        "upstream stream ended before the response was complete (after "
+                    ),
+                    "{case}: {last}"
+                );
+                assert_eq!(
+                    events.iter().filter(|e| e.contains("\"error\"")).count(),
+                    1,
+                    "{case}"
+                );
+                // Recorded as a failed call (502) billed for the text that
+                // reached the client ("Hello world": 11 characters, 2
+                // tokens), never for the 8192 `max_tokens` it allowed.
+                assert_eq!(gw.requests_with_status("5xx"), 1, "{case}");
+                assert_eq!(gw.requests_with_status("2xx"), 0, "{case}");
+                assert_eq!(gw.output_tokens(), 2, "{case}");
+                assert!(
+                    (gw.spent(&key).await - 2.0 * OUTPUT_RATE).abs() < 1e-9,
+                    "{case}"
+                );
+                assert!(
+                    !gw.state.output_stats.snapshot().contains_key(&name),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_upstreams_own_error_event_is_forwarded_once_on_every_path() {
+        let events = [
+            delta("Hello"),
+            json!({"error": {"message": "Internal server error",
+                             "type": "InternalServerError", "param": null, "code": 500}}),
+        ]
+        .map(|v| sse_event(&v));
+        for path in PATHS {
+            let name = format!("own-error-{path:?}").to_lowercase();
+            let (_, base) = spawn_sse_upstream(events.to_vec(), StreamEnd::Reset).await;
+            let Some(gw) = gateway_for(path, &name, &base).await else {
+                return;
+            };
+            let (secret, _) = gw.tenant().await;
+
+            let streamed = gw.chat_stream(&secret, &request(&name, true)).await;
+            assert_path(path, &streamed, &format!("{path:?}"));
+            // The upstream said why; the gateway adds no word of its own.
+            assert!(streamed.text.contains("Internal server error"), "{path:?}");
+            assert!(!streamed.text.contains("obleth_gateway_error"), "{path:?}");
+            assert!(
+                !streamed.text.contains("finish_reason\":\"stop"),
+                "{path:?}"
+            );
+            // Recorded with the error's own status.
+            assert_eq!(gw.requests_with_status("5xx"), 1, "{path:?}");
+            assert_eq!(gw.requests_with_status("2xx"), 0, "{path:?}");
+            assert_eq!(gw.output_tokens(), 1, "{path:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_whole_stream_ends_as_it_always_has_on_every_path() {
+        let events = [
+            delta("Hello"),
+            delta(" world"),
+            json!({"id": "c1", "object": "chat.completion.chunk",
+                   "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            json!({"id": "c1", "object": "chat.completion.chunk", "choices": [],
+                   "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}}),
+        ]
+        .map(|v| sse_event(&v))
+        .into_iter()
+        .chain(["data: [DONE]\n\n".to_string()])
+        .collect::<Vec<_>>();
+        for path in PATHS {
+            let name = format!("whole-{path:?}").to_lowercase();
+            let (_, base) = spawn_sse_upstream(events.clone(), StreamEnd::Clean).await;
+            let Some(gw) = gateway_for(path, &name, &base).await else {
+                return;
+            };
+            let (secret, key) = gw.tenant().await;
+            let mut body = request(&name, true);
+            body["stream_options"] = json!({"include_usage": true});
+
+            let streamed = gw.chat_stream(&secret, &body).await;
+            assert_path(path, &streamed, &format!("{path:?}"));
+            assert!(!streamed.aborted, "{path:?}: {}", streamed.text);
+            assert!(
+                !streamed.text.contains("\"error\""),
+                "{path:?}: {}",
+                streamed.text
+            );
+            // A finish chunk, the usage chunk the client asked for, `[DONE]`.
+            let events = payloads(&streamed.text);
+            assert_eq!(
+                events.last().map(String::as_str),
+                Some("[DONE]"),
+                "{path:?}"
+            );
+            let usage: Value = serde_json::from_str(&events[events.len() - 2]).unwrap();
+            assert_eq!(usage["usage"]["completion_tokens"], 2, "{path:?}");
+            assert!(events
+                .iter()
+                .any(|e| e.contains("\"finish_reason\":\"stop\"")));
+            assert_eq!(gw.requests_with_status("2xx"), 1, "{path:?}");
+            assert_eq!(gw.output_tokens(), 2, "{path:?}");
+            assert!((gw.spent(&key).await - 2.0 * OUTPUT_RATE).abs() < 1e-9);
         }
     }
 }

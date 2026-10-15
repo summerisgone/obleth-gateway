@@ -604,6 +604,19 @@ impl StreamTranslator {
 
     /// Feed one parsed `chat.completion.chunk`.
     pub(crate) fn on_chunk(&mut self, chunk: &Value) -> Vec<String> {
+        if self.completed {
+            return Vec::new();
+        }
+        // An error event (the upstream's own, or the gateway's for a stream
+        // that stopped short) carries no `choices`; it ends the response as
+        // failed, not completed.
+        if let Some(err) = chunk.get("error").filter(|e| e.is_object()) {
+            let message = err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("upstream error");
+            return self.fail(message);
+        }
         let mut out = Vec::new();
         if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
             self.usage = Some(responses_usage(u));
@@ -1010,6 +1023,41 @@ mod tests {
         assert_eq!(failed["response"]["status"], "failed");
         assert_eq!(failed["response"]["error"]["code"], "server_error");
         // The text that did stream is closed and echoed, not dropped.
+        assert_eq!(
+            failed["response"]["output"][0]["content"][0]["text"],
+            "partial"
+        );
+    }
+
+    #[test]
+    fn an_error_event_in_the_chat_stream_ends_failed_with_its_message() {
+        let mut t = StreamTranslator::new("req1", "m");
+        let mut frames = t.on_chunk(&delta("partial"));
+        let cut = String::from_utf8(
+            crate::upstream_failure::stream_cut_event(std::time::Duration::from_secs(3600))
+                .to_vec(),
+        )
+        .unwrap();
+        let event: Value = serde_json::from_str(cut.trim().trim_start_matches("data: ")).unwrap();
+        frames.extend(t.on_chunk(&event));
+        // The pipeline then aborts its body (`fail`) and the shim closes
+        // (`finish`): neither adds a second terminal event, and a stray chunk
+        // after the end is dropped.
+        frames.extend(t.on_chunk(&delta("late")));
+        frames.extend(t.fail("upstream stream ended before the response finished"));
+        frames.extend(t.finish());
+        let parsed = parse(&frames);
+        let events: Vec<&str> = parsed.iter().map(|(e, _)| e.as_str()).collect();
+        assert!(!events.contains(&"response.completed"));
+        assert_eq!(
+            events.iter().filter(|e| **e == "response.failed").count(),
+            1
+        );
+        let (_, failed) = parsed.last().unwrap();
+        assert_eq!(
+            failed["response"]["error"]["message"],
+            "upstream stream ended before the response was complete (after 3600 s)"
+        );
         assert_eq!(
             failed["response"]["output"][0]["content"][0]["text"],
             "partial"

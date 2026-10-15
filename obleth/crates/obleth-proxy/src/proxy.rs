@@ -2284,24 +2284,34 @@ async fn run_pipeline(
                     accounting.arm_estimate(&mut settle_guard);
                     let body_stream = async_stream::stream! {
                         futures_util::pin_mut!(driver);
+                        // A continuation that stopped short ends with an error
+                        // item, held until the request has settled (see the
+                        // streaming tool loop below).
+                        let mut abort: Option<std::io::Error> = None;
                         while let Some(item) = driver.next().await {
-                            yield item;
+                            match item {
+                                Ok(chunk) => yield Ok(chunk),
+                                Err(e) => {
+                                    abort = Some(e);
+                                    break;
+                                }
+                            }
                         }
                         drop(permit);
-                        let (ttft_ms, input_tokens, output_tokens) = {
+                        let (ttft_ms, settled) = {
                             let s = spec_stats.lock().unwrap_or_else(|e| e.into_inner());
-                            let toks = if s.final_set {
-                                (s.input_tokens, s.output_tokens)
-                            } else {
-                                (est.input_tokens, est.estimated_output_tokens)
-                            };
-                            (s.ttft_ms, toks.0, toks.1)
+                            let usage = s
+                                .final_set
+                                .then(|| UpstreamUsage::uncached(s.input_tokens, s.output_tokens));
+                            (s.ttft_ms, drained_settlement(200, s.failure, usage, 0, est))
                         };
                         let total_ms = request_start.elapsed().as_millis() as u32;
-                        let _ = settle_guard.complete(accounting.settle(
-                            UpstreamUsage::uncached(input_tokens, output_tokens),
-                            ttft_ms, total_ms, 200, None,
+                        let _ = settle_guard.complete(accounting.settle_with(
+                            settled.tokens, ttft_ms, total_ms, settled.status, None, settled.billed,
                         )).await;
+                        if let Some(e) = abort {
+                            yield Err(e);
+                        }
                     };
                     if let Some(t) = tracer.take() {
                         t.finish("ok");
@@ -2813,11 +2823,25 @@ async fn run_pipeline(
 
                 let body_stream = async_stream::stream! {
                     futures_util::pin_mut!(driver);
+                    // The driver ends a stream the upstream stopped short of
+                    // with an error item, which aborts the response. It is
+                    // held until the request has settled: hyper drops the
+                    // body on it, and the guard would otherwise settle the
+                    // request as a client disconnect.
+                    let mut abort: Option<std::io::Error> = None;
                     while let Some(item) = driver.next().await {
-                        if let (Some(monitor), Ok(chunk)) = (output_monitor.as_mut(), &item) {
-                            monitor.push(chunk);
+                        match item {
+                            Ok(chunk) => {
+                                if let Some(monitor) = output_monitor.as_mut() {
+                                    monitor.push(&chunk);
+                                }
+                                yield Ok(chunk);
+                            }
+                            Err(e) => {
+                                abort = Some(e);
+                                break;
+                            }
                         }
-                        yield item;
                     }
                     drop(permit);
                     // A failed client-facing turn settles like a failed
@@ -2838,6 +2862,9 @@ async fn run_pipeline(
                     let _ = settle_guard.complete(accounting.settle_with(
                         settled.tokens, ttft_ms, total_ms, settled.status, None, settled.billed,
                     )).await;
+                    if let Some(e) = abort {
+                        yield Err(e);
+                    }
                 };
                 if let Some(t) = tracer.take() {
                     t.finish(if status_code < 400 { "ok" } else { "error" });
@@ -3133,10 +3160,20 @@ async fn run_pipeline(
 
     // A generation request's 200 can still carry the upstream's failure in its
     // body (an SSE error event, or a JSON error object); watched so it is
-    // recorded as the failure it is.
+    // recorded as the failure it is. A chat or text completion stream is also
+    // watched for its end, so one the upstream stops short of is told apart
+    // from a whole answer.
+    let expect_end = is_stream_usage_path(&path);
     let mut failure_watch = (method == Method::POST)
         .then(|| crate::upstream_failure::FailureWatch::for_content_type(&content_type_str))
-        .flatten();
+        .flatten()
+        .map(|watch| {
+            if expect_end {
+                watch.expecting_end()
+            } else {
+                watch
+            }
+        });
 
     // ---- stream back, inspecting for actual usage, then reconcile ----
     let body_stream = async_stream::stream! {
@@ -3147,10 +3184,13 @@ async fn run_pipeline(
         let mut full: Vec<u8> = Vec::new();
         let mut cacheable = store_in_cache.is_some();
         let mut usage_filter = strip_usage_chunk.then(UsageChunkFilter::default);
-        let mut upstream_error: Option<String> = None;
+        let mut broke_off = false;
         // Characters of generated text delivered so far, for billing a stream
         // the upstream breaks off before reporting usage.
         let mut streamed_chars: usize = 0;
+        // The last bytes sent, so an event the gateway adds starts on an
+        // event boundary.
+        let mut sent_tail: Vec<u8> = Vec::with_capacity(8);
 
         while let Some(item) = byte_stream.next().await {
             match item {
@@ -3180,7 +3220,14 @@ async fn run_pipeline(
                             full = Vec::new();
                         }
                     }
+                    crate::upstream_failure::remember_sent(&mut sent_tail, &chunk);
                     yield Ok::<Bytes, std::io::Error>(chunk);
+                }
+                Err(e) if failure_watch.as_ref().is_some_and(|w| w.saw_done()) => {
+                    // The answer is whole once `[DONE]` is in; a connection
+                    // the upstream drops after it cuts nothing.
+                    tracing::debug!(error = %e, "upstream stream closed uncleanly after [DONE]");
+                    break;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "upstream stream error");
@@ -3193,12 +3240,12 @@ async fn run_pipeline(
                         ),
                     );
                     cacheable = false;
-                    upstream_error = Some(e.to_string());
+                    broke_off = true;
                     break;
                 }
             }
         }
-        if upstream_error.is_none() {
+        if !broke_off {
             // A partial trailing event is passed through as received.
             if let Some(rest) = usage_filter.take().map(UsageChunkFilter::finish) {
                 if !rest.is_empty() {
@@ -3211,6 +3258,7 @@ async fn run_pipeline(
                             full = Vec::new();
                         }
                     }
+                    crate::upstream_failure::remember_sent(&mut sent_tail, &rest);
                     yield Ok::<Bytes, std::io::Error>(rest);
                 }
             }
@@ -3227,24 +3275,57 @@ async fn run_pipeline(
         let total_ms = request_start.elapsed().as_millis() as u32;
         accounting.monitor(scan_policy.as_ref(), output_monitor);
 
-        if let Some(err) = upstream_error {
-            // A stream the upstream broke off is a failed call (502), billed
-            // for what reached the client: reported usage, else the streamed
-            // text's estimated tokens; nothing only when nothing streamed.
+        // A failure the upstream reported in the bytes it sent.
+        let failure = failure_watch.as_mut().and_then(|w| w.finish());
+        // A completion stream that closed with neither `[DONE]` nor a finish
+        // reason stopped short as surely as one whose connection broke.
+        let ended_early = !broke_off
+            && failure_watch.as_ref().is_some_and(|w| w.ended_early());
+        if ended_early {
+            tracing::warn!("upstream stream ended before its last event");
+            accounting.state.alerts.issue(
+                "upstream_stream_error",
+                "Upstream stream failed",
+                format!(
+                    "tenant `{}` model `{model}` status `{status_code}`: \
+                     stream ended before its last event",
+                    accounting.resolved.tenant_name
+                ),
+            );
+        }
+
+        if broke_off || ended_early {
+            // A stream the upstream broke off is a failed call (502, or the
+            // status of an error it reported first), billed for what reached
+            // the client: reported usage, else the streamed text's estimated
+            // tokens; nothing only when nothing streamed.
             // Settlement is handed off before the error is yielded: the error
             // makes hyper drop this body, and the guard would otherwise settle
             // it as a client disconnect.
-            let settled = drained_settlement(status_code, Some(502), usage, streamed_chars, est);
+            let status = failure
+                .as_ref()
+                .map_or(crate::upstream_failure::DEFAULT_FAILURE_STATUS, |f| f.status);
+            let settled = drained_settlement(status_code, Some(status), usage, streamed_chars, est);
             let _ = settle_guard.complete(accounting.settle_with(
                 settled.tokens, ttft_ms, total_ms, settled.status, None, settled.billed,
             )).await;
+            // The client is told in the stream, in the error shape its SDK
+            // raises on, unless the upstream's own error event already said
+            // why.
+            if failure.is_none() && failure_watch.as_ref().is_some_and(|w| w.is_sse()) {
+                if !crate::upstream_failure::at_event_boundary(&sent_tail) {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n\n"));
+                }
+                yield Ok::<Bytes, std::io::Error>(crate::upstream_failure::stream_cut_event(
+                    upstream_start.elapsed(),
+                ));
+            }
             // An error item aborts the response instead of ending it cleanly,
             // so the client cannot mistake the truncated body for a whole one.
-            yield Err(std::io::Error::other(format!("upstream stream failed: {err}")));
+            yield Err(crate::upstream_failure::stream_cut_error());
         } else {
             // The bytes already went to the client as the upstream sent them;
             // a failure it reported in them is recorded as one.
-            let failure = failure_watch.take().and_then(|w| w.finish());
             if let Some(failure) = &failure {
                 tracing::warn!(
                     status = failure.status,
@@ -6347,8 +6428,11 @@ pub(crate) fn gate_resolved_key(
     Ok(())
 }
 
+/// The `type` of an error the gateway itself reports, in OpenAI's error shape.
+pub(crate) const GATEWAY_ERROR_TYPE: &str = "obleth_gateway_error";
+
 pub(crate) fn error_json(status: StatusCode, msg: &str) -> Response<Body> {
-    let body = serde_json::json!({ "error": { "message": msg, "type": "obleth_gateway_error" } });
+    let body = serde_json::json!({ "error": { "message": msg, "type": GATEWAY_ERROR_TYPE } });
     (status, axum::Json(body)).into_response()
 }
 
