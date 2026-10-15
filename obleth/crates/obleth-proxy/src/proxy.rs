@@ -1728,14 +1728,8 @@ async fn run_pipeline(
     let cache_ttl = route.as_ref().map(|r| r.cache_ttl_secs).unwrap_or(0);
     // TTL <= 0 means "don't cache": nothing is ever written, so a lookup could
     // never hit and would only cost a Redis round-trip.
-    // Keyed by the variant's name when the client used one: its boons can
-    // change the answer, so it must not share entries with its parent.
-    // A translated effort is keyed too: a Responses or Messages caller's
-    // level travels outside the body, and two levels must not share answers.
-    let cache_name = match effort_served {
-        Some(level) => format!("{}@{level}", variant.as_deref().unwrap_or(&model)),
-        None => variant.as_deref().unwrap_or(&model).to_string(),
-    };
+    let cache_name =
+        response_cache_name(&model, variant.as_deref(), effort_served.or(family_level));
     let cache_key = (cache_enabled && cache_ttl > 0).then(|| {
         obleth_config::cache_key(&resolved.tenant_id.to_string(), &cache_name, &body_bytes)
     });
@@ -6039,6 +6033,28 @@ pub(crate) struct RequestMeta {
     pub(crate) model_family: String,
 }
 
+/// The name a response cache entry is keyed by.
+///
+/// A variant's name when the client used one: its boons can change the
+/// answer, so it must not share entries with its parent. (A family's name
+/// rides the same slot.) The level is part of the name whenever it shaped
+/// the request outside the body: a translated effort, whose Responses or
+/// Messages caller sent the level in a field the chat body does not keep,
+/// and a family's level, which also picked the member that answers, even a
+/// member with no effort control of its own. Two levels must not share
+/// answers.
+fn response_cache_name(
+    model: &str,
+    variant: Option<&str>,
+    level: Option<obleth_config::ReasoningLevel>,
+) -> String {
+    let name = variant.unwrap_or(model);
+    match level {
+        Some(level) => format!("{name}@{level}"),
+        None => name.to_string(),
+    }
+}
+
 /// Record the name the client called the model by: a family's goes in
 /// `model_family` (the family name rides the variant slot through the
 /// pipeline, for the allowlist, the cache and the response header), a real
@@ -6493,7 +6509,7 @@ mod tests {
         is_multipart_endpoint, is_retryable_status, looks_like_context_length_error,
         messages_input_estimate, multipart_text_view, output_guardrails_unenforceable,
         parse_multipart, prepare_upstream_body, redress_error, request_type_for_path,
-        requires_registered_model, resolve_conversation, session_hash_order,
+        requires_registered_model, resolve_conversation, response_cache_name, session_hash_order,
         should_translate_as_stream, strip_beta_query, surface, tenant_active_now, weighted_order,
         MultipartField, RequestMeta, TooLong, END_USER_HEADER, REGISTERED_MODEL_PATHS,
     };
@@ -6865,6 +6881,27 @@ mod tests {
         // is rejected as an unmapped path before it can be served.
         assert!(is_models_endpoint("/v1/models"));
         assert!(is_models_endpoint("/v1/models/"));
+    }
+
+    #[test]
+    fn response_cache_names_keep_levels_and_variants_apart() {
+        use obleth_config::ReasoningLevel;
+        assert_eq!(response_cache_name("m", None, None), "m");
+        assert_eq!(response_cache_name("m", Some("m-spec"), None), "m-spec");
+        assert_eq!(
+            response_cache_name("m", None, Some(ReasoningLevel::High)),
+            "m@high"
+        );
+        // A family's level picks the member, so every level is its own
+        // entry even when no member translates the level itself.
+        assert_ne!(
+            response_cache_name("acme-think", Some("acme"), Some(ReasoningLevel::High)),
+            response_cache_name("acme-instruct", Some("acme"), Some(ReasoningLevel::None)),
+        );
+        assert_eq!(
+            response_cache_name("acme-think", Some("acme"), Some(ReasoningLevel::High)),
+            "acme@high"
+        );
     }
 
     #[test]
