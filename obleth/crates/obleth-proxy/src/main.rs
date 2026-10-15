@@ -20,6 +20,7 @@ mod responses;
 mod router;
 mod search;
 mod state;
+mod upstream_failure;
 mod verdicts;
 mod videos;
 

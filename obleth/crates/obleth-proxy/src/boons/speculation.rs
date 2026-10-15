@@ -50,6 +50,7 @@ use super::tool_stream::{
     content_chunk, done, finish_chunk, parse_data_lines, split_event, usage_chunk,
 };
 use crate::state::AppState;
+use crate::upstream_failure::{payload_failure, stream_cut_error, DEFAULT_FAILURE_STATUS};
 
 /// Response header naming the drafter model whose verified text reached the
 /// client. Set only when the cascade committed (released a verified draft);
@@ -113,6 +114,10 @@ pub struct SpecStats {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub final_set: bool,
+    /// The status to record when the continuation failed: it broke off,
+    /// could not be dispatched, or reported an error of its own. The tokens
+    /// above are then what reached the client.
+    pub failure: Option<u16>,
 }
 
 /// What [`run`] decided. Both committed outcomes carry `drafted_by`, the
@@ -1430,6 +1435,14 @@ fn drive_stream(
         );
         let mut cont_usage: Option<(u32, u32)> = None;
         let mut finish: Option<Value> = None;
+        // How the continuation ended: `[DONE]`, broken off (its connection
+        // broke or went silent, or it never started), or with an error event
+        // of its own, forwarded as sent.
+        let mut done_seen = false;
+        let mut broke_off = false;
+        let mut failure: Option<u16> = None;
+        let mut error_forwarded = false;
+        let mut cont_chars = 0usize;
         match dispatch_stream(&state, &route, &body, dispatch_timeout).await {
             Ok(resp) => {
                 let mut bytes = Box::pin(resp.bytes_stream());
@@ -1438,9 +1451,23 @@ fn drive_stream(
                     while let Some(event) = split_event(&mut buf) {
                         for data in parse_data_lines(&event) {
                             if data == "[DONE]" {
+                                done_seen = true;
                                 break 'relay;
                             }
                             let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
+                            if let Some(reported) = payload_failure(&v) {
+                                failure.get_or_insert(reported.status);
+                                if v.get("choices").is_none() {
+                                    tracing::warn!(
+                                        status = reported.status,
+                                        message = %reported.message,
+                                        "speculation continuation reported an error"
+                                    );
+                                    yield Ok(Bytes::from(format!("data: {data}\n\n")));
+                                    error_forwarded = true;
+                                    break 'relay;
+                                }
+                            }
                             if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
                                 cont_usage = Some((
                                     u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
@@ -1459,6 +1486,7 @@ fn drive_stream(
                                 }
                             }
                             if !text.is_empty() {
+                                cont_chars += text.chars().count();
                                 yield Ok(Bytes::from(content_chunk(&id, &model_name, created, &text)));
                             }
                         }
@@ -1467,10 +1495,7 @@ fn drive_stream(
                         Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
                         Some(Err(e)) => {
                             tracing::warn!(error = %e, "speculation continuation stream failed");
-                            yield Ok(Bytes::from(content_chunk(
-                                &id, &model_name, created,
-                                "\n\n[the answer above may be incomplete: the continuation stream failed]\n",
-                            )));
+                            broke_off = true;
                             break 'relay;
                         }
                         None => break 'relay,
@@ -1479,10 +1504,7 @@ fn drive_stream(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "speculation continuation dispatch failed");
-                yield Ok(Bytes::from(content_chunk(
-                    &id, &model_name, created,
-                    "\n\n[the answer above may be incomplete: the continuation failed to start]\n",
-                )));
+                broke_off = true;
             }
         }
         // Settle with what the target actually processed: its prompt covers
@@ -1490,16 +1512,44 @@ fn drive_stream(
         // released draft deltas plus the continuation's completion tokens.
         let (cin, cout) = cont_usage.unwrap_or((0, 0));
         let input = if cin > 0 { cin } else { verifier.prefix_len() };
+
+        // A continuation that stopped short, or closed with neither `[DONE]`
+        // nor a finish reason, ends with an error item and no finish chunk or
+        // `[DONE]`: the proxy settles the request, then tells the client with
+        // an error event and aborts the response, as for every other stream
+        // cut short. It is billed for what reached the client; unreported
+        // continuation tokens are estimated from its text (~4 characters a
+        // token).
+        if !error_forwarded && (broke_off || (!done_seen && finish.is_none())) {
+            let cont_out = match cont_usage {
+                Some(_) => cout,
+                None if cont_chars == 0 => 0,
+                None => u32::try_from(cont_chars / 4).unwrap_or(u32::MAX).max(1),
+            };
+            if let Ok(mut st) = stats.lock() {
+                st.input_tokens = input;
+                st.output_tokens = (released as u32).saturating_add(cont_out);
+                st.final_set = true;
+                st.failure = Some(failure.unwrap_or(DEFAULT_FAILURE_STATUS));
+            }
+            yield Err(stream_cut_error());
+            return;
+        }
+
         let output = (released as u32).saturating_add(cout);
-        yield Ok(Bytes::from(finish_chunk(&id, &model_name, created, finish)));
-        if plan.include_usage {
-            yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, input, output)));
+        // The upstream's own error event already ended the answer.
+        if !error_forwarded {
+            yield Ok(Bytes::from(finish_chunk(&id, &model_name, created, finish)));
+            if plan.include_usage {
+                yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, input, output)));
+            }
         }
         yield Ok(Bytes::from(done()));
         if let Ok(mut st) = stats.lock() {
             st.input_tokens = input;
             st.output_tokens = output;
             st.final_set = true;
+            st.failure = failure;
         }
     })
 }
