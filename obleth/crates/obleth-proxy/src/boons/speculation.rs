@@ -50,9 +50,7 @@ use super::tool_stream::{
     content_chunk, done, finish_chunk, parse_data_lines, split_event, usage_chunk,
 };
 use crate::state::AppState;
-use crate::upstream_failure::{
-    payload_failure, stream_cut_error, stream_cut_event, DEFAULT_FAILURE_STATUS,
-};
+use crate::upstream_failure::{payload_failure, stream_cut_error, DEFAULT_FAILURE_STATUS};
 
 /// Response header naming the drafter model whose verified text reached the
 /// client. Set only when the cascade committed (released a verified draft);
@@ -1516,17 +1514,18 @@ fn drive_stream(
         let input = if cin > 0 { cin } else { verifier.prefix_len() };
 
         // A continuation that stopped short, or closed with neither `[DONE]`
-        // nor a finish reason, ends the client's stream the way every other
-        // broken-off stream does: an error event, then an aborted response.
-        // It is billed for what reached the client; unreported continuation
-        // tokens are estimated from its text (~4 characters a token).
+        // nor a finish reason, ends with an error item and no finish chunk or
+        // `[DONE]`: the proxy settles the request, then tells the client with
+        // an error event and aborts the response, as for every other stream
+        // cut short. It is billed for what reached the client; unreported
+        // continuation tokens are estimated from its text (~4 characters a
+        // token).
         if !error_forwarded && (broke_off || (!done_seen && finish.is_none())) {
             let cont_out = match cont_usage {
                 Some(_) => cout,
                 None if cont_chars == 0 => 0,
                 None => u32::try_from(cont_chars / 4).unwrap_or(u32::MAX).max(1),
             };
-            yield Ok(stream_cut_event(started.elapsed()));
             if let Ok(mut st) = stats.lock() {
                 st.input_tokens = input;
                 st.output_tokens = (released as u32).saturating_add(cont_out);

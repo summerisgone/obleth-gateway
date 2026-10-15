@@ -51,6 +51,29 @@ pub(crate) fn stream_cut_error() -> std::io::Error {
     std::io::Error::other("upstream stream ended before the response was complete")
 }
 
+/// How long the end of a cut stream waits between its event and the abort.
+const CUT_FLUSH_PAUSE: Duration = Duration::from_millis(50);
+
+/// The end of a response the upstream stopped short of, for after the request
+/// has settled: `event` (the [`stream_cut_event`], unless the upstream's own
+/// error event already went out), then the abort.
+///
+/// The server writes a body's chunks into a buffer and flushes it only once
+/// the body has nothing ready; an error that follows a chunk at once aborts
+/// the connection with the chunk still in that buffer. The pause before the
+/// abort lets everything sent reach the client first.
+pub(crate) fn stream_cut_tail(
+    event: Option<Bytes>,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
+    async_stream::stream! {
+        if let Some(event) = event {
+            yield Ok(event);
+        }
+        tokio::time::sleep(CUT_FLUSH_PAUSE).await;
+        yield Err(stream_cut_error());
+    }
+}
+
 /// Whether bytes sent so far (their last few) end at an SSE event boundary,
 /// so an event can follow them without joining the one before. Nothing sent
 /// is a boundary.
@@ -762,6 +785,62 @@ mod tests {
         assert!(!json_body.ended_early() && !json_body.is_sse());
     }
 
+    /// What a real client reads from a server whose body is `body`: the
+    /// bytes that arrived, and whether the response was aborted.
+    async fn served(
+        body: impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    ) -> (String, bool) {
+        let body = std::sync::Arc::new(std::sync::Mutex::new(Some(axum::body::Body::from_stream(
+            body,
+        ))));
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let body = body.lock().unwrap().take().expect("one request");
+                async move {
+                    axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut resp = reqwest::get(format!("http://{addr}/")).await.unwrap();
+        let mut text = String::new();
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => text.push_str(&String::from_utf8_lossy(&chunk)),
+                Ok(None) => return (text, false),
+                Err(_) => return (text, true),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_cut_event_reaches_a_real_client_before_the_abort() {
+        use futures_util::StreamExt;
+        const TEXT: &str = "data: {\"x\": 1}\n\n";
+        let text = || futures_util::stream::iter([Ok(Bytes::from_static(TEXT.as_bytes()))]);
+        // Text, then at once the end of a cut stream: nothing in between
+        // gives the server a moment to flush, as when the request has just
+        // settled.
+        let event = stream_cut_event(std::time::Duration::from_secs(7));
+        let (got, aborted) = served(text().chain(stream_cut_tail(Some(event.clone())))).await;
+        assert!(aborted, "{got}");
+        assert_eq!(
+            got,
+            format!("{TEXT}{}", std::str::from_utf8(&event).unwrap())
+        );
+        // Without an event (the upstream's own already went out), only the
+        // abort.
+        let (got, aborted) = served(text().chain(stream_cut_tail(None))).await;
+        assert!(aborted, "{got}");
+        assert_eq!(got, TEXT);
+    }
+
     #[test]
     fn the_sent_tail_tells_an_event_boundary() {
         let mut tail = Vec::new();
@@ -954,8 +1033,6 @@ mod pipeline {
     use serde_json::{json, Value};
     use uuid::Uuid;
 
-    use futures_util::StreamExt;
-
     use super::test_support::{spawn_failing_upstream, spawn_sse_upstream, Hangup, StreamEnd};
     use crate::state::AppState;
 
@@ -1121,18 +1198,25 @@ mod pipeline {
             )
         }
 
-        /// Send a streamed chat request and read its body to the end, or to
-        /// the error that aborts it. Returns the status, the boons header,
-        /// the bytes that arrived, and whether the body was aborted.
+        /// Send a streamed chat request through a real HTTP server, as a
+        /// client reaches the gateway, and read its body to the end or to the
+        /// error that aborts it: what the server writes before an abort is
+        /// what a client sees. Returns the status, the boons header, the
+        /// bytes that arrived, and whether the body was aborted.
         async fn chat_stream(&self, secret: &str, body: &Value) -> Streamed {
-            let req = Request::builder()
-                .method(Method::POST)
-                .uri("/v1/chat/completions")
-                .header(header::AUTHORIZATION, format!("Bearer {secret}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap();
-            let resp = crate::proxy::proxy_handler(State(self.state.clone()), req).await;
+            let app = Router::new()
+                .route("/v1/chat/completions", post(crate::proxy::proxy_handler))
+                .with_state(self.state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut resp = reqwest::Client::new()
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .bearer_auth(secret)
+                .json(body)
+                .send()
+                .await
+                .expect("response headers");
             let status = resp.status();
             let boons = resp
                 .headers()
@@ -1140,18 +1224,14 @@ mod pipeline {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or_default()
                 .to_string();
-            let mut data = resp.into_body().into_data_stream();
             let mut text = String::new();
-            let mut aborted = false;
-            while let Some(item) = data.next().await {
-                match item {
-                    Ok(chunk) => text.push_str(&String::from_utf8_lossy(&chunk)),
-                    Err(_) => {
-                        aborted = true;
-                        break;
-                    }
+            let aborted = loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => text.push_str(&String::from_utf8_lossy(&chunk)),
+                    Ok(None) => break false,
+                    Err(_) => break true,
                 }
-            }
+            };
             Streamed {
                 status,
                 boons,

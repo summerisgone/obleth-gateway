@@ -2285,14 +2285,14 @@ async fn run_pipeline(
                     let body_stream = async_stream::stream! {
                         futures_util::pin_mut!(driver);
                         // A continuation that stopped short ends with an error
-                        // item, held until the request has settled (see the
-                        // streaming tool loop below).
-                        let mut abort: Option<std::io::Error> = None;
+                        // item; the client is told once the request has
+                        // settled (see the streaming tool loop below).
+                        let mut cut = false;
                         while let Some(item) = driver.next().await {
                             match item {
                                 Ok(chunk) => yield Ok(chunk),
-                                Err(e) => {
-                                    abort = Some(e);
+                                Err(_) => {
+                                    cut = true;
                                     break;
                                 }
                             }
@@ -2309,8 +2309,15 @@ async fn run_pipeline(
                         let _ = settle_guard.complete(accounting.settle_with(
                             settled.tokens, ttft_ms, total_ms, settled.status, None, settled.billed,
                         )).await;
-                        if let Some(e) = abort {
-                            yield Err(e);
+                        if cut {
+                            let event = crate::upstream_failure::stream_cut_event(
+                                request_start.elapsed(),
+                            );
+                            let tail = crate::upstream_failure::stream_cut_tail(Some(event));
+                            futures_util::pin_mut!(tail);
+                            while let Some(item) = tail.next().await {
+                                yield item;
+                            }
                         }
                     };
                     if let Some(t) = tracer.take() {
@@ -2824,11 +2831,12 @@ async fn run_pipeline(
                 let body_stream = async_stream::stream! {
                     futures_util::pin_mut!(driver);
                     // The driver ends a stream the upstream stopped short of
-                    // with an error item, which aborts the response. It is
-                    // held until the request has settled: hyper drops the
-                    // body on it, and the guard would otherwise settle the
-                    // request as a client disconnect.
-                    let mut abort: Option<std::io::Error> = None;
+                    // with an error item. The client is told, and the
+                    // response aborted, only once the request has settled:
+                    // the abort makes hyper drop the body, and the guard
+                    // would otherwise settle the request as a client
+                    // disconnect.
+                    let mut cut = false;
                     while let Some(item) = driver.next().await {
                         match item {
                             Ok(chunk) => {
@@ -2837,8 +2845,8 @@ async fn run_pipeline(
                                 }
                                 yield Ok(chunk);
                             }
-                            Err(e) => {
-                                abort = Some(e);
+                            Err(_) => {
+                                cut = true;
                                 break;
                             }
                         }
@@ -2862,8 +2870,14 @@ async fn run_pipeline(
                     let _ = settle_guard.complete(accounting.settle_with(
                         settled.tokens, ttft_ms, total_ms, settled.status, None, settled.billed,
                     )).await;
-                    if let Some(e) = abort {
-                        yield Err(e);
+                    if cut {
+                        let event =
+                            crate::upstream_failure::stream_cut_event(upstream_start.elapsed());
+                        let tail = crate::upstream_failure::stream_cut_tail(Some(event));
+                        futures_util::pin_mut!(tail);
+                        while let Some(item) = tail.next().await {
+                            yield item;
+                        }
                     }
                 };
                 if let Some(t) = tracer.take() {
@@ -3311,18 +3325,26 @@ async fn run_pipeline(
             )).await;
             // The client is told in the stream, in the error shape its SDK
             // raises on, unless the upstream's own error event already said
-            // why.
-            if failure.is_none() && failure_watch.as_ref().is_some_and(|w| w.is_sse()) {
-                if !crate::upstream_failure::at_event_boundary(&sent_tail) {
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n\n"));
+            // why. A blank line first ends an event the upstream left
+            // unfinished, so the two do not run together.
+            let event = (failure.is_none()
+                && failure_watch.as_ref().is_some_and(|w| w.is_sse()))
+            .then(|| {
+                let event = crate::upstream_failure::stream_cut_event(upstream_start.elapsed());
+                if crate::upstream_failure::at_event_boundary(&sent_tail) {
+                    event
+                } else {
+                    Bytes::from([&b"\n\n"[..], &event[..]].concat())
                 }
-                yield Ok::<Bytes, std::io::Error>(crate::upstream_failure::stream_cut_event(
-                    upstream_start.elapsed(),
-                ));
+            });
+            // Then an error item aborts the response instead of ending it
+            // cleanly, so the client cannot mistake the truncated body for a
+            // whole one.
+            let tail = crate::upstream_failure::stream_cut_tail(event);
+            futures_util::pin_mut!(tail);
+            while let Some(item) = tail.next().await {
+                yield item;
             }
-            // An error item aborts the response instead of ending it cleanly,
-            // so the client cannot mistake the truncated body for a whole one.
-            yield Err(crate::upstream_failure::stream_cut_error());
         } else {
             // The bytes already went to the client as the upstream sent them;
             // a failure it reported in them is recorded as one.

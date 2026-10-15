@@ -23,8 +23,9 @@
 //!
 //! A turn the upstream stops short of (its connection breaks or goes silent,
 //! it closes before `[DONE]` and a finish reason, or a follow-up turn cannot
-//! be dispatched) ends the client's stream the way the pass-through path
-//! does: an error event, then an aborted response.
+//! be dispatched) ends the driver's stream with an error item and no finish
+//! chunk or `[DONE]`. The proxy settles the request, then tells the client
+//! with an error event and aborts the response, as on the pass-through path.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -36,9 +37,7 @@ use obleth_config::{ResolvedKey, ResolvedModel, ToolLoopSettings};
 use serde_json::{json, Value};
 
 use crate::state::AppState;
-use crate::upstream_failure::{
-    payload_failure, stream_cut_error, stream_cut_event, DEFAULT_FAILURE_STATUS,
-};
+use crate::upstream_failure::{payload_failure, stream_cut_error, DEFAULT_FAILURE_STATUS};
 
 /// Visible marker prefix shown inline before a gateway tool runs.
 const SEARCH_GLYPH: &str = "\u{1f50e}";
@@ -179,7 +178,6 @@ pub fn run(
                             // The answer cannot go on past the tool call: it
                             // ends the way a broken-off stream does.
                             tracing::warn!(error = %e, "tool stream follow-up dispatch failed");
-                            yield Ok(stream_cut_event(upstream_start.elapsed()));
                             fail_stats(&stats, DEFAULT_FAILURE_STATUS, None, 0);
                             yield Err(stream_cut_error());
                             return;
@@ -302,15 +300,13 @@ pub fn run(
             }
 
             // A turn the upstream stopped short of, or that closed with
-            // neither `[DONE]` nor a finish reason, ends the client's stream
-            // the way the pass-through path does: an error event, then an
-            // aborted response, with no finish chunk and no `[DONE]`. Its tool
+            // neither `[DONE]` nor a finish reason, ends with an error item
+            // and no finish chunk or `[DONE]` (see the module doc). Its tool
             // calls, possibly cut off, are not run.
             if !error_forwarded && (broke_off || (!turn_done && finish_reason.is_none())) {
                 if !broke_off {
                     tracing::warn!("tool stream upstream ended before its last event");
                 }
-                yield Ok(stream_cut_event(upstream_start.elapsed()));
                 fail_stats(&stats, failure.unwrap_or(DEFAULT_FAILURE_STATUS), usage, turn_chars);
                 yield Err(stream_cut_error());
                 return;
@@ -490,7 +486,6 @@ pub fn run(
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "tool stream finalization dispatch failed");
-                yield Ok(stream_cut_event(upstream_start.elapsed()));
                 fail_stats(&stats, DEFAULT_FAILURE_STATUS, None, 0);
                 yield Err(stream_cut_error());
                 return;
@@ -581,13 +576,11 @@ pub fn run(
             }
         }
 
-        // Stopped short, as a tool turn can be: the same error event and
-        // aborted response.
+        // Stopped short, as a tool turn can be: the same error item.
         if !error_forwarded && (broke_off || (!turn_done && finish_reason.is_none())) {
             if !broke_off {
                 tracing::warn!("tool stream final turn ended before its last event");
             }
-            yield Ok(stream_cut_event(upstream_start.elapsed()));
             fail_stats(&stats, failure.unwrap_or(DEFAULT_FAILURE_STATUS), usage, turn_chars);
             yield Err(stream_cut_error());
             return;
