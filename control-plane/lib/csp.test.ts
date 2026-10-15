@@ -34,6 +34,14 @@ describe("contentSecurityPolicy", () => {
   });
 });
 
+describe("contentSecurityPolicy / media", () => {
+  // Without its own directive media falls back to default-src 'self', which
+  // blocks the Playground's replay of speech assembled into a blob: URL.
+  it("lets audio play from same-origin and blob: URLs only", () => {
+    expect(directive(contentSecurityPolicy("n", { development: false }), "media-src")).toBe("media-src 'self' blob:");
+  });
+});
+
 describe("generateNonce", () => {
   it("returns base64 text that differs per call", () => {
     const a = generateNonce();

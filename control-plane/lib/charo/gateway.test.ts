@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { gatewayChat, gatewayImages, gatewayVerdicts, getControlPlaneKey, __resetKeyCache } from "./gateway";
+import { gatewayChat, gatewayImages, gatewaySpeech, gatewayVerdicts, gatewayVoices, getControlPlaneKey, __resetKeyCache } from "./gateway";
 
 describe("gatewayChat", () => {
   beforeEach(() => {
@@ -72,6 +72,42 @@ describe("gatewayChat", () => {
       questions: { is_urgent: { type: "boolean", instructions: "Urgent?" } },
     });
     expect(res.status).toBe(200);
+  });
+
+  it("posts speech to /v1/audio/speech and passes the caller's abort signal", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/system/control-plane-key")) {
+        return new Response(JSON.stringify({ secret: "sk-test" }), { status: 200 });
+      }
+      expect(u).toBe("http://localhost:8080/v1/audio/speech");
+      expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer sk-test");
+      expect(init?.signal).toBe(controller.signal);
+      expect(JSON.parse(String(init?.body))).toEqual({ model: "tts", input: "hi", response_format: "wav", stream_format: "audio" });
+      return new Response(new Uint8Array([82, 73, 70, 70]), { status: 200, headers: { "content-type": "audio/wav" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await gatewaySpeech({ model: "tts", input: "hi", response_format: "wav", stream_format: "audio" }, controller.signal);
+    expect(res.headers.get("content-type")).toBe("audio/wav");
+  });
+
+  it("asks /v1/audio/voices for a model's voices with the same key", async () => {
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/system/control-plane-key")) {
+        return new Response(JSON.stringify({ secret: "sk-test" }), { status: 200 });
+      }
+      expect(u).toBe("http://localhost:8080/v1/audio/voices?model=my%20tts");
+      expect(init?.method ?? "GET").toBe("GET");
+      expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer sk-test");
+      return new Response(JSON.stringify({ voices: ["a"] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await gatewayVoices("my tts");
+    expect(await res.json()).toEqual({ voices: ["a"] });
   });
 
   it("caches the key secret across calls", async () => {

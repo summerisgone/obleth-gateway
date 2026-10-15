@@ -10,7 +10,7 @@ import { uuid } from "@/lib/uuid";
 import type { ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
-import { ModelAvatar, SectionLabel, Segmented, SettingsPanel, formatCost } from "./ui";
+import { ModelAvatar, RunError, SectionLabel, Segmented, SettingsPanel, formatCost } from "./ui";
 
 // Sizes offered in the picker. Deliberately a superset of the boon's default
 // allowed list: the playground drives the image model directly, so it is not
@@ -18,12 +18,6 @@ import { ModelAvatar, SectionLabel, Segmented, SettingsPanel, formatCost } from 
 // legitimate thing to want to do.
 const SIZES = ["256x256", "512x512", "768x768", "1024x1024"] as const;
 const COUNTS = [1, 2, 3, 4] as const;
-
-// Longer errors collapse behind a disclosure. Backends routinely return a
-// whole framework traceback on one line (`litellm.InternalServerError: ...
-// synStatus 31 ...`), which is worth keeping but not worth handing the full
-// width of the timeline to.
-const ERROR_LEAD_LENGTH = 120;
 
 interface GeneratedImage {
   id: string;
@@ -394,26 +388,6 @@ export function ImageWorkspace({
             </div>
           </section>
         </SettingsPanel>
-      )}
-    </div>
-  );
-}
-
-/** Backend errors arrive as one long line; show a lead and park the rest. */
-function RunError({ message }: { message: string }) {
-  const long = message.length > ERROR_LEAD_LENGTH;
-  return (
-    <div role="alert" className="max-w-2xl space-y-1 rounded-lg border border-border bg-secondary/50 px-3 py-2">
-      <p className="text-sm">
-        {long ? `${message.slice(0, ERROR_LEAD_LENGTH).trimEnd()}…` : message}
-      </p>
-      {long && (
-        <details>
-          <summary className="cursor-pointer text-[11px] text-muted-foreground">Show details</summary>
-          <pre className="mt-1 whitespace-pre-wrap break-words text-[11px] text-muted-foreground">
-            {message}
-          </pre>
-        </details>
       )}
     </div>
   );

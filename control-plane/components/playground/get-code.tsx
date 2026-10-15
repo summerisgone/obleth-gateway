@@ -12,6 +12,8 @@ import { Segmented, modelLabel } from "./ui";
 
 type Lang = "curl" | "python" | "javascript";
 
+const SPEECH_PATH = "/v1/audio/speech";
+
 /** The conversations the open chat lanes hold right now, keyed by lane index. */
 function liveLanes(sessionId: string): Map<number, Conversation> {
   const detail: Record<string, unknown> = {};
@@ -38,6 +40,20 @@ export function requestFor(session: PlaygroundSession, lane: number, lanes: Map<
         ...(session.imageSteps !== undefined ? { steps: session.imageSteps } : {}),
         ...(session.imageSeed !== undefined ? { seed: session.imageSeed } : {}),
       },
+    };
+  }
+  if (session.mode === "speech") {
+    return {
+      path: SPEECH_PATH,
+      body: {
+        model: session.speechModel ?? "SPEECH_MODEL",
+        input: session.speechText?.trim() || "Hello! This is how I sound.",
+        ...(session.speechVoice?.trim() ? { voice: session.speechVoice.trim() } : {}),
+        ...(session.speechInstructions?.trim() ? { instructions: session.speechInstructions.trim() } : {}),
+        response_format: "wav",
+        stream_format: "audio",
+      },
+      note: "Saves the audio to speech.wav, writing it as it arrives.",
     };
   }
   if (session.mode === "verdicts") {
@@ -116,6 +132,29 @@ export function snippet(lang: Lang, url: string, body: Record<string, unknown>):
   return `const response = await fetch("${url}", {\n  method: "POST",\n  headers: {\n    Authorization: \`Bearer \${process.env.OBLETH_API_KEY}\`,\n    "Content-Type": "application/json",\n  },\n  body: JSON.stringify(${json.replace(/\n/g, "\n  ")}),\n});\nconsole.log(await response.json());`;
 }
 
+/**
+ * Speech returns audio, not JSON, so its snippets write the body to a file as
+ * it streams in. Python uses the OpenAI SDK's streaming response, which
+ * requires a voice: a placeholder stands in when the session leaves it to the
+ * server.
+ */
+export function speechSnippet(lang: Lang, gatewayBase: string, body: Record<string, unknown>): string {
+  const url = `${gatewayBase}${SPEECH_PATH}`;
+  if (lang === "curl") return `${snippet("curl", url, body)} \\\n  --output speech.wav`;
+  if (lang === "python") {
+    const { model, input, voice, ...rest } = body;
+    const args = [
+      `    model=${pyLiteral(model, "    ")},`,
+      `    input=${pyLiteral(input, "    ")},`,
+      voice === undefined ? `    voice="VOICE",  # required by the SDK: a voice the model offers` : `    voice=${pyLiteral(voice, "    ")},`,
+      ...Object.entries(rest).map(([k, v]) => `    ${k}=${pyLiteral(v, "    ")},`),
+    ].join("\n");
+    return `import os\nfrom openai import OpenAI\n\nclient = OpenAI(\n    base_url="${gatewayBase}/v1",\n    api_key=os.environ["OBLETH_API_KEY"],\n)\n\nwith client.audio.speech.with_streaming_response.create(\n${args}\n) as response:\n    response.stream_to_file("speech.wav")`;
+  }
+  const json = JSON.stringify(body, null, 2);
+  return `import { createWriteStream } from "node:fs";\nimport { Readable } from "node:stream";\nimport { pipeline } from "node:stream/promises";\n\nconst response = await fetch("${url}", {\n  method: "POST",\n  headers: {\n    Authorization: \`Bearer \${process.env.OBLETH_API_KEY}\`,\n    "Content-Type": "application/json",\n  },\n  body: JSON.stringify(${json.replace(/\n/g, "\n  ")}),\n});\nif (!response.ok) throw new Error(await response.text());\nawait pipeline(Readable.fromWeb(response.body), createWriteStream("speech.wav"));`;
+}
+
 /** "Get code": the session's current request as something to paste into a terminal or a program. */
 export function GetCode({ open, onOpenChange, session, gatewayBase }: {
   open: boolean; onOpenChange: (open: boolean) => void; session: PlaygroundSession; gatewayBase: string;
@@ -138,7 +177,8 @@ export function GetCode({ open, onOpenChange, session, gatewayBase }: {
 
   const assistantOnly = chat && choices.length === 0;
   const { path, body, note } = requestFor(session, lane, lanes);
-  const code = snippet(lang, `${gatewayBase.replace(/\/$/, "")}${path}`, body);
+  const base = gatewayBase.replace(/\/$/, "");
+  const code = path === SPEECH_PATH ? speechSnippet(lang, base, body) : snippet(lang, `${base}${path}`, body);
   const copy = () => void navigator.clipboard.writeText(code).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }).catch(() => {});
 
   return (

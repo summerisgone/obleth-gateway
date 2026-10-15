@@ -9,6 +9,7 @@ let host: HTMLDivElement;
 const models = [
   { id: "1", model_name: "llama", model_type: "chat", enabled: true },
   { id: "2", model_name: "sdxl", model_type: "image", enabled: true },
+  { id: "3", model_name: "voice-1", model_type: "audio_speech", enabled: true },
 ];
 
 function button(label: string): HTMLButtonElement {
@@ -66,6 +67,7 @@ describe("Playground shell", () => {
     { mode: "Chat", shown: "System prompt", hidden: "Tenant ID" },
     { mode: "Router", shown: "Tenant ID", hidden: "System prompt" },
     { mode: "Image", shown: "Negative prompt", hidden: "System prompt" },
+    { mode: "Speech", shown: "Style instructions", hidden: "Negative prompt" },
   ])("shows $mode parameters in the settings panel, which one button hides", async ({ mode, shown, hidden }) => {
     await act(async () => button(mode).click());
     expect(fieldLabels()).toContain(shown);
@@ -87,6 +89,14 @@ describe("Playground shell", () => {
     await act(async () => button("Hide settings").click());
     await act(async () => button("Router").click());
     expect(fieldLabels()).not.toContain("Tenant ID");
+  });
+
+  it("offers Speech right after Image, as a tab and on the launcher", async () => {
+    const tabs = [...host.querySelectorAll("[aria-label='Playground mode'] button")].map((b) => b.getAttribute("aria-label"));
+    expect(tabs).toEqual(["Chat", "Image", "Speech", "Router", "Verdicts", "Search"]);
+    const card = [...host.querySelectorAll("button")].find((b) => b.textContent?.startsWith("Speech"))!;
+    await act(async () => card.click());
+    expect(fieldLabels()).toContain("Text to read aloud");
   });
 
   it("has no settings panel in Verdicts, whose three columns already hold everything", async () => {
@@ -111,5 +121,19 @@ describe("Playground shell", () => {
     expect(localStorage.getItem(`obleth-playground:test:${imported.id}:compare:0`)).not.toBeNull();
     // Only conversation lanes come back; nothing else is written.
     expect(localStorage.getItem(`obleth-playground:test:${imported.id}:image`)).toBeNull();
+  });
+});
+
+describe("Playground opened on a model", () => {
+  // The Models page's "Try in Playground" passes the model's type along, so a
+  // text-to-speech model lands in Speech mode with that model picked.
+  it("opens a Speech session for an audio_speech model", async () => {
+    await act(async () => {
+      root.render(<Playground scope="test" openModel={{ name: "voice-1", type: "audio_speech" }} />);
+    });
+    expect(button("Speech").getAttribute("aria-pressed")).toBe("true");
+    expect(host.querySelector<HTMLButtonElement>("#speech-target")!.textContent).toContain("voice-1");
+    const saved = JSON.parse(localStorage.getItem("obleth-playground:test") ?? "[]") as { mode: string; speechModel?: string; title: string }[];
+    expect(saved[0]).toMatchObject({ mode: "speech", speechModel: "voice-1", title: "voice-1" });
   });
 });

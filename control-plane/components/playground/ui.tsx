@@ -1,15 +1,16 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { Image as ImageIcon, MessageSquare, Route, Scale, Search, Sparkles, type LucideIcon } from "lucide-react";
+import { AudioLines, Image as ImageIcon, MessageSquare, Route, Scale, Search, Sparkles, type LucideIcon } from "lucide-react";
 import type { ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
 
-/** The four modes a session can be in, in tab order. Chat covers both one model and a comparison. */
+/** The modes a session can be in, in tab order. Chat covers both one model and a comparison. */
 export const MODES: { mode: PlaygroundSession["mode"]; label: string; icon: LucideIcon }[] = [
   { mode: "compare", label: "Chat", icon: MessageSquare },
   { mode: "image", label: "Image", icon: ImageIcon },
+  { mode: "speech", label: "Speech", icon: AudioLines },
   { mode: "router", label: "Router", icon: Route },
   { mode: "verdicts", label: "Verdicts", icon: Scale },
   { mode: "search", label: "Search", icon: Search },
@@ -85,6 +86,32 @@ export function Pill({ children, inverted, off, className }: { children: ReactNo
     >
       {children}
     </span>
+  );
+}
+
+// Longer errors collapse behind a disclosure. Backends routinely return a
+// whole framework traceback on one line (`litellm.InternalServerError: ...
+// synStatus 31 ...`), which is worth keeping but not worth handing the full
+// width of the timeline to.
+const ERROR_LEAD_LENGTH = 120;
+
+/** Backend errors arrive as one long line; show a lead and park the rest. Shared by the Image and Speech timelines. */
+export function RunError({ message }: { message: string }) {
+  const long = message.length > ERROR_LEAD_LENGTH;
+  return (
+    <div role="alert" className="max-w-2xl space-y-1 rounded-lg border border-border bg-secondary/50 px-3 py-2">
+      <p className="text-sm">
+        {long ? `${message.slice(0, ERROR_LEAD_LENGTH).trimEnd()}…` : message}
+      </p>
+      {long && (
+        <details>
+          <summary className="cursor-pointer text-[11px] text-muted-foreground">Show details</summary>
+          <pre className="mt-1 whitespace-pre-wrap break-words text-[11px] text-muted-foreground">
+            {message}
+          </pre>
+        </details>
+      )}
+    </div>
   );
 }
 
