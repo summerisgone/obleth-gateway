@@ -6448,6 +6448,8 @@ pub(crate) fn finalize(
         reasoning_effort: meta.reasoning_effort.clone(),
         reasoning_effort_requested: meta.reasoning_effort_requested.clone(),
         model_family: meta.model_family.clone(),
+        key_name: resolved.key_name.clone(),
+        tenant_name: resolved.tenant_name.clone(),
     });
 }
 
@@ -6602,6 +6604,7 @@ mod tests {
             key_id: Uuid::nil(),
             tenant_id: Uuid::nil(),
             tenant_name: "t".into(),
+            key_name: "k".into(),
             fairshare_group: "default".into(),
             group_weight: 100,
             weight: 100,

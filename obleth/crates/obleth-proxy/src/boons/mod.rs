@@ -1331,6 +1331,8 @@ fn helper_usage_record(
         reasoning_effort: String::new(),
         reasoning_effort_requested: String::new(),
         model_family: String::new(),
+        key_name: key.key_name.clone(),
+        tenant_name: key.tenant_name.clone(),
     }
 }
 
@@ -1561,6 +1563,7 @@ mod tests {
             key_id: uuid::Uuid::nil(),
             tenant_id: uuid::Uuid::nil(),
             tenant_name: "t".into(),
+            key_name: "k".into(),
             fairshare_group: "default".into(),
             group_weight: 100,
             weight: 1,
@@ -1855,6 +1858,7 @@ mod tests {
                 key_id: uuid::Uuid::nil(),
                 tenant_id: uuid::Uuid::nil(),
                 tenant_name: "t".into(),
+                key_name: "k".into(),
                 fairshare_group: "default".into(),
                 group_weight: 100,
                 weight: 1,

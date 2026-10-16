@@ -5031,11 +5031,16 @@ async fn get_usage_logs(
     let entries = rows
         .into_iter()
         .map(|row| {
+            // The live name when the key or tenant still exists, else the one
+            // recorded on the row, so a deleted key's requests keep their name.
             let tenant_name = tenant_names
                 .get(&row.tenant_id)
                 .cloned()
-                .unwrap_or_default();
-            let (key_name, key_prefix) = key_meta.get(&row.key_id).cloned().unwrap_or_default();
+                .unwrap_or_else(|| row.recorded_tenant_name.clone());
+            let (key_name, key_prefix) = key_meta
+                .get(&row.key_id)
+                .cloned()
+                .unwrap_or_else(|| (row.recorded_key_name.clone(), String::new()));
             let has_trace = traced.contains(&row.request_id);
             UsageLogEntry {
                 row,

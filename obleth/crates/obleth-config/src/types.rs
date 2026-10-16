@@ -272,6 +272,10 @@ pub struct ProvisionedIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedKey {
     pub key_id: Uuid,
+    /// The key's name, carried so each usage row can record it. Empty on an
+    /// entry cached before the field existed, until the cache is rewarmed.
+    #[serde(default)]
+    pub key_name: String,
     pub tenant_id: Uuid,
     pub tenant_name: String,
     pub fairshare_group: String,
@@ -1209,6 +1213,14 @@ pub struct UsageRecord {
     /// when it was one obleth knows; empty when none was named.
     #[serde(default)]
     pub reasoning_effort_requested: String,
+    /// The key's and tenant's names as they were when the request was served.
+    /// Frozen on the row like `cost_usd`, so usage stays attributable after the
+    /// key or tenant is deleted or renamed, for as long as the row is kept.
+    /// `#[serde(default)]` keeps older WAL records replayable.
+    #[serde(default)]
+    pub key_name: String,
+    #[serde(default)]
+    pub tenant_name: String,
 }
 
 /// Runtime-configurable retention for the raw per-request `usage` ledger.

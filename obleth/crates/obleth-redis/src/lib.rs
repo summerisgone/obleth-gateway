@@ -1073,6 +1073,7 @@ mod tests {
             key_id: Uuid::new_v4(),
             tenant_id: Uuid::new_v4(),
             tenant_name: "t".into(),
+            key_name: "k".into(),
             fairshare_group: "default".into(),
             group_weight: 100,
             weight: 7,

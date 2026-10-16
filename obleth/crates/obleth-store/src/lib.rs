@@ -1265,7 +1265,7 @@ impl Store {
     pub async fn resolved_key_by_hash(&self, hash: &str) -> Result<Option<ResolvedKey>> {
         let row = sqlx::query(
             "select k.id as key_id, k.tenant_id, k.disabled,
-                    t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
+                    k.name as key_name, t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
                     t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
                     t.timezone, t.active_from, t.active_until, t.weekly_windows,
                     t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at,
@@ -1295,7 +1295,7 @@ impl Store {
     pub async fn all_resolved_keys(&self) -> Result<Vec<(String, ResolvedKey)>> {
         let rows = sqlx::query(
             "select k.key_hash, k.id as key_id, k.tenant_id, k.disabled,
-                    t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
+                    k.name as key_name, t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
                     t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
                     t.timezone, t.active_from, t.active_until, t.weekly_windows,
                     t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at,
@@ -1329,7 +1329,7 @@ impl Store {
     ) -> Result<Vec<(String, ResolvedKey)>> {
         let rows = sqlx::query(
             "select k.key_hash, k.id as key_id, k.tenant_id, k.disabled,
-                    t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
+                    k.name as key_name, t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
                     t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
                     t.timezone, t.active_from, t.active_until, t.weekly_windows,
                     t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at,
@@ -4088,6 +4088,7 @@ fn resolved_from_row(row: &PgRow) -> Result<ResolvedKey> {
         key_id: row.try_get("key_id")?,
         tenant_id: row.try_get("tenant_id")?,
         tenant_name: row.try_get("tenant_name")?,
+        key_name: row.try_get("key_name")?,
         fairshare_group: row.try_get("fairshare_group")?,
         group_weight: row.try_get("group_weight")?,
         weight: row.try_get("weight")?,
