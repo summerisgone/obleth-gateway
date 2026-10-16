@@ -95,6 +95,8 @@ struct UsageRow<'a> {
     reasoning_effort: &'a str,
     reasoning_effort_requested: &'a str,
     model_family: &'a str,
+    key_name: &'a str,
+    tenant_name: &'a str,
 }
 
 impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
@@ -130,6 +132,8 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             reasoning_effort: &r.reasoning_effort,
             reasoning_effort_requested: &r.reasoning_effort_requested,
             model_family: &r.model_family,
+            key_name: &r.key_name,
+            tenant_name: &r.tenant_name,
         }
     }
 }
@@ -761,6 +765,8 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             reasoning_effort LowCardinality(String) DEFAULT '',
             reasoning_effort_requested LowCardinality(String) DEFAULT '',
             model_family String DEFAULT '',
+            key_name String DEFAULT '',
+            tenant_name String DEFAULT '',
             ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms),
             INDEX idx_ts_ms ts_ms TYPE minmax GRANULARITY 4
         ) ENGINE = MergeTree()
@@ -877,6 +883,14 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
         ))
         .execute()
         .await?;
+    for column in ["key_name", "tenant_name"] {
+        client
+            .query(&format!(
+                "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS {column} String DEFAULT ''"
+            ))
+            .execute()
+            .await?;
+    }
     // Required for `insert_deduplication_token` on a non-replicated table: an
     // insert that timed out after committing is replayed from the WAL with the
     // same token, and ClickHouse discards the duplicate.
@@ -1217,6 +1231,8 @@ mod conv_tests {
             reasoning_effort: String::new(),
             reasoning_effort_requested: String::new(),
             model_family: String::new(),
+            key_name: String::new(),
+            tenant_name: String::new(),
         }
     }
 
@@ -1442,6 +1458,8 @@ mod conv_tests {
             reasoning_effort: String::new(),
             reasoning_effort_requested: String::new(),
             model_family: String::new(),
+            key_name: String::new(),
+            tenant_name: String::new(),
         };
         let row = UsageRow::from(&rec);
         assert_eq!(row.session_id_source, "derived");
@@ -1481,6 +1499,8 @@ mod conv_tests {
             reasoning_effort: String::new(),
             reasoning_effort_requested: String::new(),
             model_family: String::new(),
+            key_name: String::new(),
+            tenant_name: String::new(),
         };
         rec.energy_wh = 1.5;
         rec.energy_cost_usd = 0.0002;
@@ -1525,6 +1545,18 @@ mod conv_tests {
                 row.model_family
             ),
             ("low", "none", "acme")
+        );
+    }
+
+    #[test]
+    fn usage_row_carries_the_key_and_tenant_names() {
+        let mut rec = record();
+        rec.key_name = "alice-notebook-1700000000000".into();
+        rec.tenant_name = "research".into();
+        let row = UsageRow::from(&rec);
+        assert_eq!(
+            (row.key_name, row.tenant_name),
+            ("alice-notebook-1700000000000", "research")
         );
     }
 }

@@ -323,6 +323,9 @@ export function ModelSettings({
           <Setting id="set-headers" label="Upstream headers" hint="Sent on every request, one Name: value per line." help={UPSTREAM_HEADERS_HINT} fields={["upstream_headers"]}>
             <TextArea name="upstream_headers" label="Upstream headers" rows={2} defaultValue={upstreamHeadersText(model.upstream_header_names)} placeholder="x-routing-hint: sticky" />
           </Setting>
+          <Setting id="set-rejected-fields" label="Rejected request fields" hint="Requests that include one of these fields get an error and are never sent to the model. Use it for an option the model's server can't handle. One field name per line." fields={["rejected_request_fields"]}>
+            <TextArea name="rejected_request_fields" label="Rejected request fields" rows={2} defaultValue={(model.rejected_request_fields ?? []).join("\n")} placeholder="bad_words" />
+          </Setting>
           <Setting id="set-timeout" label="Request timeout" hint="Seconds before the gateway gives up on a request. Blank uses the gateway default." fields={["request_timeout_secs"]} was={{ field: "request_timeout_secs" }}>
             <TextField name="request_timeout_secs" label="Request timeout in seconds" type="number" min={1} className="max-w-[10rem]" defaultValue={model.request_timeout_secs == null ? "" : String(model.request_timeout_secs)} placeholder="default" />
           </Setting>

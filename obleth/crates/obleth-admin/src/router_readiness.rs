@@ -278,6 +278,7 @@ mod tests {
             lifecycle: Default::default(),
             reasoning: Default::default(),
             listed: true,
+            rejected_request_fields: Vec::new(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: name.to_string(),

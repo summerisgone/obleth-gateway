@@ -1460,6 +1460,8 @@ fn build_probe_usage(
         reasoning_effort: String::new(),
         reasoning_effort_requested: String::new(),
         model_family: String::new(),
+        key_name: String::new(),
+        tenant_name: String::new(),
     }
 }
 

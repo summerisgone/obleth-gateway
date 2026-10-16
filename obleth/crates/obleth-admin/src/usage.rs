@@ -256,6 +256,14 @@ pub struct UsageLogRow {
     /// The model family the caller named, or empty; `model` is the member
     /// that served the request.
     pub model_family: String,
+    /// The key's and tenant's names as recorded on the row when it was
+    /// served; empty on rows written before they were. Not serialized: the
+    /// handler folds them into the entry's `key_name` / `tenant_name`, which
+    /// still name a deleted key or tenant.
+    #[serde(skip_serializing)]
+    pub recorded_key_name: String,
+    #[serde(skip_serializing)]
+    pub recorded_tenant_name: String,
 }
 
 /// A bind value for the request-log filters, in placeholder order.
@@ -360,7 +368,8 @@ const USAGE_LOG_SELECT: &str =
      toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
      cached_input_tokens, queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
      energy_wh, energy_cost_usd, co2_g, parent_request_id, model_variant, \
-     reasoning_effort, reasoning_effort_requested, model_family \
+     reasoning_effort, reasoning_effort_requested, model_family, \
+     key_name as recorded_key_name, tenant_name as recorded_tenant_name \
      from usage";
 
 /// Read individual `usage` rows newest-first, honoring the supplied filters and
@@ -1948,6 +1957,8 @@ mod alias_tests {
                 "reasoning_effort",
                 "reasoning_effort_requested",
                 "model_family",
+                "recorded_key_name",
+                "recorded_tenant_name",
             ]
         );
     }

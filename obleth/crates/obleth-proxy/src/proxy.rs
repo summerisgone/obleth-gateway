@@ -1530,6 +1530,42 @@ async fn run_pipeline(
         }
     }
 
+    // ---- request fields the model refuses ----
+    // Checked on the caller's body, before reasoning effort and boons add
+    // fields of their own, and before anything is sent.
+    if let Some(field) = route
+        .as_ref()
+        .and_then(|r| obleth_config::rejected_request_field(&json, &r.rejected_request_fields))
+    {
+        if let Some(t) = tracer.take() {
+            t.finish("error");
+        }
+        let elapsed = request_start.elapsed().as_millis() as u32;
+        finalize(
+            &state,
+            request_id,
+            &resolved,
+            &req_meta,
+            &model,
+            Admission::Rejected,
+            CostEstimate {
+                input_tokens: 0,
+                estimated_output_tokens: 0,
+            },
+            0,
+            0,
+            0,
+            0,
+            0,
+            elapsed,
+            StatusCode::BAD_REQUEST.as_u16(),
+            "off",
+            0.0,
+            crate::energy::EnergyFigures::default(),
+        );
+        return rejected_field_response(&model, field);
+    }
+
     // ---- reasoning effort ----
     // The caller's level becomes the fields the served model's server
     // understands (or is removed, for a model without effort control). Runs
@@ -6412,6 +6448,8 @@ pub(crate) fn finalize(
         reasoning_effort: meta.reasoning_effort.clone(),
         reasoning_effort_requested: meta.reasoning_effort_requested.clone(),
         model_family: meta.model_family.clone(),
+        key_name: resolved.key_name.clone(),
+        tenant_name: resolved.tenant_name.clone(),
     });
 }
 
@@ -6490,6 +6528,20 @@ pub(crate) fn error_json(status: StatusCode, msg: &str) -> Response<Body> {
     (status, axum::Json(body)).into_response()
 }
 
+/// `400` for a request carrying a field the model is set to refuse, in the
+/// OpenAI error shape with the field as `param`.
+fn rejected_field_response(model: &str, field: &str) -> Response<Body> {
+    let body = serde_json::json!({ "error": {
+        "message": format!(
+            "`{field}` is not supported by model `{model}`. Remove it from the request and retry."
+        ),
+        "type": "invalid_request_error",
+        "param": field,
+        "code": "unsupported_parameter",
+    } });
+    (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -6552,6 +6604,7 @@ mod tests {
             key_id: Uuid::nil(),
             tenant_id: Uuid::nil(),
             tenant_name: "t".into(),
+            key_name: "k".into(),
             fairshare_group: "default".into(),
             group_weight: 100,
             weight: 100,
@@ -7789,6 +7842,7 @@ mod tests {
             lifecycle: Default::default(),
             reasoning: Default::default(),
             listed: true,
+            rejected_request_fields: Vec::new(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "m".into(),
@@ -8801,6 +8855,7 @@ mod tests {
             lifecycle: Default::default(),
             reasoning: Default::default(),
             listed: true,
+            rejected_request_fields: Vec::new(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: name.to_string(),
@@ -9225,6 +9280,44 @@ mod lifecycle_tests {
         let ret = refuse + h[refuse..].find("returnresp;").expect("refusal returns");
         assert!(h[refuse..ret].contains("finalize("));
         assert!(h[refuse..ret].contains("StatusCode::GONE"));
+    }
+
+    #[test]
+    fn rejected_request_fields_are_refused_before_anything_is_sent() {
+        let h = squash(handler());
+        let allow = h.find("modelnotpermittedfortenant").expect("allowlist");
+        let check = h
+            .find("obleth_config::rejected_request_field(&json,&r.rejected_request_fields)")
+            .expect("rejected field check");
+        let effort = h.find("r.reasoning.plan(level)").expect("reasoning effort");
+        let boons = h.find(".enrich_request(").expect("boons");
+        let pool = h
+            .find("letpool=admission_pool(route.as_deref());")
+            .expect("admission pool");
+        // On the caller's body as the model resolved, before effort and
+        // boons add fields of their own and before admission or dispatch.
+        assert!(allow < check && check < effort && effort < boons && boons < pool);
+        // Recorded as a rejected 400, then returned.
+        let ret = check
+            + h[check..]
+                .find("returnrejected_field_response(&model,field);")
+                .expect("refusal returns");
+        assert!(h[check..ret].contains("finalize("));
+        assert!(h[check..ret].contains("Admission::Rejected"));
+        assert!(h[check..ret].contains("StatusCode::BAD_REQUEST.as_u16()"));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_field_answers_in_the_openai_error_shape() {
+        let resp = super::rejected_field_response("m", "bad_words");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["param"], "bad_words");
+        assert_eq!(v["error"]["code"], "unsupported_parameter");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("`bad_words`") && msg.contains("`m`"), "{msg}");
     }
 
     #[test]

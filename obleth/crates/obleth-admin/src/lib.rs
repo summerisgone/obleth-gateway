@@ -277,6 +277,10 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/models/:id/reasoning", put(set_model_reasoning))
         .route("/api/v1/models/:id/listing", put(set_model_listing))
         .route(
+            "/api/v1/models/:id/rejected-request-fields",
+            put(set_model_rejected_request_fields),
+        )
+        .route(
             "/api/v1/model-families",
             get(list_model_families).post(create_model_family),
         )
@@ -1095,6 +1099,12 @@ pub struct CreateModel {
     /// model cannot start deprecated or retired.
     #[serde(default)]
     pub status: Option<obleth_config::ModelStatus>,
+    /// Top-level request body fields this model's backend cannot handle. A
+    /// request carrying any of them (also inside `extra_body`) is refused
+    /// with 400 before it is sent. Case-sensitive; at most 32; `model` cannot
+    /// be one. Omitted = none.
+    #[serde(default)]
+    pub rejected_request_fields: Option<Vec<String>>,
 }
 
 /// One variant in a model write: a name that resolves to the model with extra
@@ -1212,6 +1222,10 @@ pub struct UpdateModel {
     /// Name the scoring backend serves, if not `upstream_model`. Empty clears.
     #[serde(default)]
     pub verify_upstream_model: Option<String>,
+    /// Replaces the request fields the model refuses; omitted leaves them
+    /// unchanged and `[]` removes them all.
+    #[serde(default)]
+    pub rejected_request_fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1391,6 +1405,16 @@ pub struct SetModelStatus {
     /// replacement.
     #[serde(default)]
     pub redirect: Option<bool>,
+}
+
+/// The request fields a model refuses, written whole.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetModelRejectedRequestFields {
+    /// Top-level request body fields the model's backend cannot handle. A
+    /// request carrying any of them (also inside `extra_body`) is refused
+    /// with 400 before it is sent. Case-sensitive; at most 32; `model` cannot
+    /// be one. `[]` refuses nothing.
+    pub rejected_request_fields: Vec<String>,
 }
 
 /// Whether the discovery endpoints advertise a model.
@@ -1943,6 +1967,10 @@ pub struct ModelRouteView {
     /// unlisted model is still served by name. Set with
     /// `PUT /api/v1/models/{id}/listing`.
     pub listed: bool,
+    /// Top-level request body fields refused with 400 before dispatch,
+    /// because the model's backend cannot handle them. Set with
+    /// `PUT /api/v1/models/{id}/rejected-request-fields`.
+    pub rejected_request_fields: Vec<String>,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -2113,6 +2141,7 @@ impl From<ModelRoute> for ModelRouteView {
             lifecycle,
             reasoning,
             listed,
+            rejected_request_fields,
             description,
             upstream_model,
             api_base,
@@ -2170,6 +2199,7 @@ impl From<ModelRoute> for ModelRouteView {
             lifecycle,
             reasoning,
             listed,
+            rejected_request_fields,
             description,
             upstream_model,
             api_base,
@@ -5001,11 +5031,16 @@ async fn get_usage_logs(
     let entries = rows
         .into_iter()
         .map(|row| {
+            // The live name when the key or tenant still exists, else the one
+            // recorded on the row, so a deleted key's requests keep their name.
             let tenant_name = tenant_names
                 .get(&row.tenant_id)
                 .cloned()
-                .unwrap_or_default();
-            let (key_name, key_prefix) = key_meta.get(&row.key_id).cloned().unwrap_or_default();
+                .unwrap_or_else(|| row.recorded_tenant_name.clone());
+            let (key_name, key_prefix) = key_meta
+                .get(&row.key_id)
+                .cloned()
+                .unwrap_or_else(|| (row.recorded_key_name.clone(), String::new()));
             let has_trace = traced.contains(&row.request_id);
             UsageLogEntry {
                 row,
@@ -6865,6 +6900,13 @@ async fn create_model(
         }
     }
     reject_family_name(&state, &body.model_name, "model name").await?;
+    let rejected_request_fields = body
+        .rejected_request_fields
+        .as_deref()
+        .map(obleth_config::validate_rejected_request_fields)
+        .transpose()
+        .map_err(AdminError::BadRequest)?
+        .unwrap_or_default();
     let aliases = validate_aliases(
         &state,
         body.aliases.as_deref().unwrap_or_default(),
@@ -6957,6 +6999,15 @@ async fn create_model(
     } else {
         model
     };
+    // Set the same way, before the first publish.
+    let model = if rejected_request_fields.is_empty() {
+        model
+    } else {
+        state
+            .store
+            .set_model_rejected_request_fields(model.id, &rejected_request_fields)
+            .await?
+    };
     // Staged the same way, before the first publish.
     let model = if initial_status == obleth_config::ModelStatus::Staged {
         let lifecycle = obleth_config::ModelLifecycle {
@@ -7039,6 +7090,12 @@ async fn update_model(
     }
     validate_verify_api_base(&state, body.verify_api_base.as_deref()).await?;
     let existing = state.store.get_model(id).await?;
+    let rejected_request_fields = body
+        .rejected_request_fields
+        .as_deref()
+        .map(obleth_config::validate_rejected_request_fields)
+        .transpose()
+        .map_err(AdminError::BadRequest)?;
     let api_key = body.api_key.as_deref().or(existing.api_key.as_deref());
     let quantization = match body.quantization.as_deref() {
         Some(q) => validate_quantization(q)?,
@@ -7145,6 +7202,15 @@ async fn update_model(
             &variants,
         )
         .await?;
+    let model = match rejected_request_fields {
+        Some(fields) if fields != model.rejected_request_fields => {
+            state
+                .store
+                .set_model_rejected_request_fields(id, &fields)
+                .await?
+        }
+        _ => model,
+    };
     if model_health::probe_config_changed(&existing, &model) {
         // The old failure streak / alert state describe a configuration that
         // no longer exists; reset so the scheduler re-verifies immediately.
@@ -7421,6 +7487,41 @@ async fn set_model_listing(
             serde_json::json!({
                 "model_name": model.model_name,
                 "listed": body.listed,
+            }),
+        )
+        .await?;
+    Ok(Json(model.into()))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/models/{id}/rejected-request-fields", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = SetModelRejectedRequestFields,
+    responses((status = 200, body = ModelRouteView), (status = 400), (status = 404))
+)]
+async fn set_model_rejected_request_fields(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetModelRejectedRequestFields>,
+) -> Result<Json<ModelRouteView>> {
+    let fields = obleth_config::validate_rejected_request_fields(&body.rejected_request_fields)
+        .map_err(AdminError::BadRequest)?;
+    let model = state
+        .store
+        .set_model_rejected_request_fields(id, &fields)
+        .await?;
+    sync_model(&state, &model).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_model_rejected_request_fields",
+            "model",
+            &id.to_string(),
+            serde_json::json!({
+                "model_name": model.model_name,
+                "rejected_request_fields": model.rejected_request_fields,
             }),
         )
         .await?;
@@ -8900,6 +9001,7 @@ fn resolved_model_of(
         lifecycle: model.lifecycle.clone(),
         reasoning: model.reasoning.clone(),
         listed: model.listed,
+        rejected_request_fields: model.rejected_request_fields.clone(),
         description: model.description.clone(),
         variants: model.variants.clone(),
         upstream_model: model.upstream_model.clone(),
@@ -9388,6 +9490,118 @@ mod tests {
             .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
             .body(axum::body::Body::from(body.to_string()))
             .expect("build request")
+    }
+
+    /// Rejected request fields go through create, update, their own endpoint
+    /// and the read views, checked and normalized on every write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn rejected_request_fields_round_trip_through_the_api() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let name = format!("rrf-{}", Uuid::new_v4());
+        let base = serde_json::json!({
+            "model_name": name,
+            "upstream_model": "served-model",
+            "api_base": "http://127.0.0.1:9/v1",
+        });
+
+        let mut bad = base.clone();
+        bad["rejected_request_fields"] = serde_json::json!(["model"]);
+        let (status, body) = send(&t.app, json_request("POST", "/api/v1/models", bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let mut create = base.clone();
+        create["rejected_request_fields"] = serde_json::json!([" bad_words ", "bad_words"]);
+        let (status, created) = send(&t.app, json_request("POST", "/api/v1/models", create)).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(
+            created["rejected_request_fields"],
+            serde_json::json!(["bad_words"])
+        );
+        let id = created["id"].as_str().unwrap().to_string();
+
+        // Omitted on update leaves the list alone.
+        let (status, updated) = send(
+            &t.app,
+            json_request("PUT", &format!("/api/v1/models/{id}"), base.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(
+            updated["rejected_request_fields"],
+            serde_json::json!(["bad_words"])
+        );
+
+        let mut replace = base.clone();
+        replace["rejected_request_fields"] = serde_json::json!(["logit_bias", "bad_words"]);
+        let (status, updated) = send(
+            &t.app,
+            json_request("PUT", &format!("/api/v1/models/{id}"), replace),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(
+            updated["rejected_request_fields"],
+            serde_json::json!(["logit_bias", "bad_words"])
+        );
+
+        let path = format!("/api/v1/models/{id}/rejected-request-fields");
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &path,
+                serde_json::json!({"rejected_request_fields": ["model"]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, set) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &path,
+                serde_json::json!({"rejected_request_fields": ["bad_words"]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{set}");
+        assert_eq!(
+            set["rejected_request_fields"],
+            serde_json::json!(["bad_words"])
+        );
+        let (status, read) = send(
+            &t.app,
+            json_request(
+                "GET",
+                &format!("/api/v1/models/{id}"),
+                serde_json::Value::Null,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(
+            read["rejected_request_fields"],
+            serde_json::json!(["bad_words"])
+        );
+        let (status, cleared) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &path,
+                serde_json::json!({"rejected_request_fields": []}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cleared}");
+        assert_eq!(cleared["rejected_request_fields"], serde_json::json!([]));
+
+        t.store
+            .delete_model(created["id"].as_str().unwrap().parse().unwrap())
+            .await
+            .ok();
     }
 
     /// The discovered mode's fields go through create, update and the
@@ -11222,6 +11436,7 @@ mod tests {
             ("/api/v1/tenants/{id}/tracing", "put"),
             ("/api/v1/usage/logs/{request_id}/spans", "get"),
             ("/api/v1/models/{id}/managed/provision-error", "patch"),
+            ("/api/v1/models/{id}/rejected-request-fields", "put"),
         ] {
             assert!(
                 doc["paths"][path][method].is_object(),
@@ -11887,6 +12102,7 @@ mod tests {
             lifecycle: Default::default(),
             reasoning: Default::default(),
             listed: true,
+            rejected_request_fields: Vec::new(),
             variants: Vec::new(),
             description: String::new(),
             upstream_model: name.to_string(),
