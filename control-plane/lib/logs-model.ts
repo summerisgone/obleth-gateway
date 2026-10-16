@@ -16,7 +16,19 @@ export const LOG_WINDOWS = [
 
 export type LogWindowId = (typeof LOG_WINDOWS)[number]["id"];
 
-export const REQUEST_TYPES = ["chat", "completion", "responses", "embedding", "audio", "image", "video", "rerank", "moderation", "search", "other"] as const;
+/**
+ * The request types the gateway records for client traffic. The Type menu
+ * also lists any other type the log has shown (`typeOptions`), so a new
+ * endpoint is filterable before this list learns about it.
+ */
+export const REQUEST_TYPES = ["chat", "completion", "responses", "messages", "verdict", "embedding", "audio", "image", "video", "rerank", "moderation", "search", "other"] as const;
+
+/** The Type menu: the known types, then any others the log has shown, then the current one. */
+export function typeOptions(seen: Iterable<string>, current = ""): string[] {
+  const out: string[] = [...REQUEST_TYPES];
+  for (const t of [...seen, current]) if (t && !out.includes(t)) out.push(t);
+  return out;
+}
 
 export interface LogFilters {
   /** A preset window, or `custom` with `sinceMs`/`untilMs` (a drag on the chart). */
@@ -26,9 +38,12 @@ export interface LogFilters {
   status: "" | "success" | "error";
   /** One exact HTTP status, as text ("" for any). */
   statusCode: string;
+  /** `model`, `tenantId` and `keyId` each hold one value, or several joined by commas (a `*` search). */
   model: string;
   tenantId: string;
   keyId: string;
+  /** The `*` pattern a list in `model`, `tenantId` or `keyId` came from, for its label. */
+  patterns?: Partial<Record<MatchField, string>>;
   requestType: string;
   sessionId: string;
   /** Request id prefix, from the search box's free text. */
@@ -44,6 +59,7 @@ export const DEFAULT_LOG_FILTERS: LogFilters = {
   model: "",
   tenantId: "",
   keyId: "",
+  patterns: {},
   requestType: "",
   sessionId: "",
   requestId: "",
@@ -96,6 +112,24 @@ export function filtersActive(f: LogFilters): boolean {
 // The search box
 // ---------------------------------------------------------------------------
 
+export type MatchField = "model" | "tenantId" | "keyId";
+
+/** Most values a `*` search may match; the gateway takes up to 200 per filter. */
+export const MAX_MATCHES = 100;
+
+/** The values in a filter field that may hold a list. */
+export const listOf = (v: string): string[] => (v ? v.split(",") : []);
+
+/** A case-insensitive test for `pattern`, where `*` stands for any run of characters. */
+export function globTest(pattern: string): (s: string) => boolean {
+  const literal = (part: string) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp("^" + pattern.trim().split("*").map(literal).join(".*") + "$", "i");
+  return (s) => re.test(s);
+}
+
+/** A request id is hex and dashes; any other word in the search box is a name. */
+const REQUEST_ID_TEXT = /^[0-9a-f-]+$/i;
+
 export interface Named { id: string; name: string }
 export interface KeyOption { id: string; name: string; prefix: string; tenantId: string }
 
@@ -107,21 +141,64 @@ export interface SearchLookups {
 
 /**
  * Turn `status:error model:glm-5-3 team:cs-teaching 7c1e` into filters.
- * Teams and keys resolve by name (or key prefix), case-insensitively; a name
- * that matches nothing comes back in `unknown` so the box can say so. Free
- * text is a request-id prefix.
+ * Teams and keys resolve by name (or key prefix), case-insensitively. In
+ * `model:`, `team:` and `key:` a `*` stands for any run of characters and
+ * picks every match (`key:jlee379*`). A bare word with a `*`, or one that
+ * cannot be a request id, is looked up as a key, then a team, then a model;
+ * one without a `*` matches names that start with it. Hex is a request-id
+ * prefix. A token that matches nothing comes back in `unknown`, and one that
+ * matches more than `MAX_MATCHES` in `tooBroad`, so the box can say so.
  */
-export function parseSearch(text: string, lookups: SearchLookups): { patch: Partial<LogFilters>; unknown: string[] } {
+export function parseSearch(text: string, lookups: SearchLookups): { patch: Partial<LogFilters>; unknown: string[]; tooBroad: string[] } {
   const patch: Partial<LogFilters> = {};
+  const patterns: Partial<Record<MatchField, string>> = {};
   const unknown: string[] = [];
+  const tooBroad: string[] = [];
   const free: string[] = [];
   const lower = (s: string) => s.trim().toLowerCase();
+
+  // Each finder returns the matching values of its field (and, for keys,
+  // their teams); `null` when nothing matches.
+  type Found = { field: MatchField; values: string[]; tenants?: string[] };
+  const findModels = (pattern: string): Found | null => {
+    const test = globTest(pattern);
+    const values = lookups.models.filter(test);
+    return values.length ? { field: "model", values } : null;
+  };
+  const findTeams = (pattern: string): Found | null => {
+    const test = globTest(pattern);
+    const values = lookups.tenants.filter((t) => test(t.name)).map((t) => t.id);
+    return values.length ? { field: "tenantId", values } : null;
+  };
+  const findKeys = (pattern: string): Found | null => {
+    const test = globTest(pattern);
+    const keys = lookups.keys.filter((k) => test(k.prefix) || (!!k.name && test(k.name)));
+    return keys.length ? { field: "keyId", values: keys.map((k) => k.id), tenants: [...new Set(keys.map((k) => k.tenantId))] } : null;
+  };
+  const apply = (token: string, pattern: string, found: Found | null) => {
+    if (!found) return unknown.push(token);
+    if (found.values.length > MAX_MATCHES) return tooBroad.push(token);
+    patch[found.field] = found.values.join(",");
+    patterns[found.field] = found.values.length > 1 ? pattern : undefined;
+    // A key search sets its team when every match shares one, and lifts a
+    // team filter that would hide some of them.
+    if (found.tenants) {
+      patch.tenantId = found.tenants.length === 1 ? found.tenants[0] : "";
+      patterns.tenantId = undefined;
+    }
+  };
+
   for (const token of text.trim().split(/\s+/).filter(Boolean)) {
     const colon = token.indexOf(":");
     const key = colon > 0 ? token.slice(0, colon).toLowerCase() : "";
     const value = colon > 0 ? token.slice(colon + 1) : token;
     if (!key || !value) {
-      free.push(token);
+      if (value.includes("*") || !REQUEST_ID_TEXT.test(value)) {
+        // An exact name first, then names that start with the word.
+        const tries = value.includes("*") ? [value] : [value, `${value}*`];
+        const pattern = tries.find((t) => findKeys(t) ?? findTeams(t) ?? findModels(t)) ?? value;
+        apply(token, pattern, findKeys(pattern) ?? findTeams(pattern) ?? findModels(pattern));
+      } else free.push(token);
       continue;
     }
     if (key === "status") {
@@ -131,22 +208,15 @@ export function parseSearch(text: string, lookups: SearchLookups): { patch: Part
       else if (["ok", "success", "succeeded"].includes(v)) patch.status = "success";
       else unknown.push(token);
     } else if (key === "model") {
-      const m = lookups.models.find((x) => lower(x) === lower(value));
-      if (m) patch.model = m;
-      else unknown.push(token);
+      apply(token, value, findModels(value));
     } else if (key === "team" || key === "tenant") {
-      const t = lookups.tenants.find((x) => lower(x.name) === lower(value));
-      if (t) patch.tenantId = t.id;
-      else unknown.push(token);
+      apply(token, value, findTeams(value));
     } else if (key === "key") {
-      const k = lookups.keys.find((x) => lower(x.prefix) === lower(value) || lower(x.name) === lower(value));
-      if (k) {
-        patch.keyId = k.id;
-        patch.tenantId = k.tenantId;
-      } else unknown.push(token);
+      apply(token, value, findKeys(value));
     } else if (key === "type") {
-      const t = REQUEST_TYPES.find((x) => x === lower(value));
-      if (t) patch.requestType = t;
+      // Any label the gateway records, known here or not.
+      const t = lower(value);
+      if (/^[a-z][a-z0-9_]*$/.test(t)) patch.requestType = t;
       else unknown.push(token);
     } else if (key === "session") {
       patch.sessionId = value;
@@ -157,7 +227,31 @@ export function parseSearch(text: string, lookups: SearchLookups): { patch: Part
     }
   }
   if (free.length) patch.requestId = free.join("");
-  return { patch, unknown };
+  // Each field this search set, with its pattern or `undefined`: merge it
+  // over the current patterns (`withPatterns`).
+  if (Object.keys(patterns).length) patch.patterns = patterns;
+  return { patch, unknown, tooBroad };
+}
+
+/** `patch` applied to `f`, its `patterns` merged in rather than replacing them. */
+export function withPatterns(f: LogFilters, patch: Partial<LogFilters>): Partial<LogFilters> {
+  return patch.patterns ? { ...patch, patterns: { ...f.patterns, ...patch.patterns } } : patch;
+}
+
+/**
+ * The patch that sets one of the list fields to a single value from a menu
+ * or a facet, dropping that field's `*` pattern.
+ */
+export function pickOne(f: LogFilters, field: MatchField, value: string): Partial<LogFilters> {
+  return { [field]: value, patterns: { ...f.patterns, [field]: undefined } };
+}
+
+/** How a list field reads in its menu: the pattern and how many it matched. */
+export function listLabel(f: LogFilters, field: MatchField, noun: string): string | null {
+  const values = listOf(f[field]);
+  if (values.length < 2) return null;
+  const pattern = f.patterns?.[field];
+  return `${pattern ? `${pattern} · ` : ""}${values.length} ${noun}`;
 }
 
 // ---------------------------------------------------------------------------

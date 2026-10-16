@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { HTTP_REASONS, type LogFilters } from "@/lib/logs-model";
+import { HTTP_REASONS, listOf, pickOne, type LogFilters, type MatchField } from "@/lib/logs-model";
 import type { UsageLogFacet, UsageLogFacets } from "@/lib/obleth";
 import { compact } from "@/lib/overview-model";
 import { cn } from "@/lib/utils";
@@ -77,6 +77,10 @@ export function Facets({ facets, filters, onPatch, loading }: { facets: UsageLog
   }
   const empty = facets.models.length === 0;
   const toggle = (key: keyof LogFilters, value: string) => onPatch({ [key]: filters[key] === value ? "" : value } as Partial<LogFilters>);
+  // Model, team and key may hold a `*` search's list: a line in it shows as
+  // picked, and clicking it narrows the list to that one value.
+  const inList = (key: MatchField, value: string) => listOf(filters[key]).includes(value);
+  const pick = (key: MatchField, value: string) => onPatch(pickOne(filters, key, filters[key] === value ? "" : value));
   return (
     <section aria-label={failuresOnly ? "Failures by" : "What's in this window"} className="rounded-xl border border-border bg-card px-[18px] pb-3 pt-3.5">
       <div className="flex items-baseline justify-between pb-2.5">
@@ -119,9 +123,9 @@ export function Facets({ facets, filters, onPatch, loading }: { facets: UsageLog
               onPick={(f) => toggle("statusCode", f.value)}
               failuresOnly={failuresOnly}
             />
-            <List title="Model" facets={facets.models} label={(f) => f.value || "(none)"} active={(f) => filters.model === f.value} onPick={(f) => toggle("model", f.value)} mono failuresOnly={failuresOnly} />
-            <List title="Team" facets={facets.tenants} label={(f) => f.label || `${f.value.slice(0, 8)}…`} active={(f) => filters.tenantId === f.value} onPick={(f) => onPatch(filters.tenantId === f.value ? { tenantId: "", keyId: "" } : { tenantId: f.value, keyId: "" })} failuresOnly={failuresOnly} />
-            <List title="Key" facets={facets.keys} label={(f) => f.label || `${f.value.slice(0, 8)}…`} active={(f) => filters.keyId === f.value} onPick={(f) => toggle("keyId", f.value)} failuresOnly={failuresOnly} />
+            <List title="Model" facets={facets.models} label={(f) => f.value || "(none)"} active={(f) => inList("model", f.value)} onPick={(f) => pick("model", f.value)} mono failuresOnly={failuresOnly} />
+            <List title="Team" facets={facets.tenants} label={(f) => f.label || `${f.value.slice(0, 8)}…`} active={(f) => inList("tenantId", f.value)} onPick={(f) => onPatch({ ...pickOne(filters, "tenantId", filters.tenantId === f.value ? "" : f.value), keyId: "" })} failuresOnly={failuresOnly} />
+            <List title="Key" facets={facets.keys} label={(f) => f.label || `${f.value.slice(0, 8)}…`} active={(f) => inList("keyId", f.value)} onPick={(f) => pick("keyId", f.value)} failuresOnly={failuresOnly} />
             <List title="Type" facets={facets.request_types} label={(f) => f.value || "other"} active={(f) => filters.requestType === f.value} onPick={(f) => toggle("requestType", f.value)} failuresOnly={failuresOnly} />
           </div>
         </div>

@@ -113,16 +113,57 @@ pub fn parse_key_ids(raw: Option<&str>) -> Result<Vec<Uuid>, uuid::Error> {
     }
 }
 
+/// Most values one request-log filter takes as a comma-separated list.
+pub const MAX_LOG_FILTER_VALUES: usize = 200;
+
+/// A request-log filter given as one value or several joined by commas
+/// (`a,b,c`); a row matches any of them. Empty entries are ignored, so a
+/// trailing comma is harmless. A bad entry, or more than
+/// [`MAX_LOG_FILTER_VALUES`], fails the whole query.
+fn comma_list<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let Some(raw) = Option::<String>::deserialize(de)? else {
+        return Ok(Vec::new());
+    };
+    let values = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.parse::<T>().map_err(serde::de::Error::custom))
+        .collect::<Result<Vec<T>, _>>()?;
+    if values.len() > MAX_LOG_FILTER_VALUES {
+        return Err(serde::de::Error::custom(format!(
+            "at most {MAX_LOG_FILTER_VALUES} values per filter"
+        )));
+    }
+    Ok(values)
+}
+
 /// Filters for the raw per-request log feed (`GET /api/v1/usage/logs`). This is
 /// the only read that returns individual `usage` rows rather than an aggregate,
 /// and it powers the live request-log view in the control plane.
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct UsageLogQuery {
+    /// One tenant id, or several joined by commas.
+    #[serde(default, deserialize_with = "comma_list")]
     #[schema(value_type = Option<String>)]
-    pub tenant_id: Option<Uuid>,
+    #[param(value_type = Option<String>)]
+    pub tenant_id: Vec<Uuid>,
+    /// One key id, or several joined by commas (`a,b,c`), so a search can
+    /// match every key whose name fits a pattern.
+    #[serde(default, deserialize_with = "comma_list")]
     #[schema(value_type = Option<String>)]
-    pub key_id: Option<Uuid>,
-    pub model: Option<String>,
+    #[param(value_type = Option<String>)]
+    pub key_id: Vec<Uuid>,
+    /// One model, or several joined by commas.
+    #[serde(default, deserialize_with = "comma_list")]
+    #[schema(value_type = Option<String>)]
+    #[param(value_type = Option<String>)]
+    pub model: Vec<String>,
     /// Coarse request class (`chat`, `embedding`, `audio`, ...).
     pub request_type: Option<String>,
     pub session_id: Option<String>,
@@ -234,18 +275,11 @@ fn log_filter_sql(q: &UsageLogQuery, since: i64) -> (String, Vec<LogBind>) {
         sql.push_str(" and ts_ms <= ?");
         binds.push(LogBind::Int(until));
     }
-    if let Some(tid) = q.tenant_id {
-        sql.push_str(" and tenant_id = toUUID(?)");
-        binds.push(LogBind::Text(tid.to_string()));
-    }
-    if let Some(kid) = q.key_id {
-        sql.push_str(" and key_id = toUUID(?)");
-        binds.push(LogBind::Text(kid.to_string()));
-    }
-    if let Some(model) = &q.model {
-        sql.push_str(" and model = ?");
-        binds.push(LogBind::Text(model.clone()));
-    }
+    let tenants: Vec<String> = q.tenant_id.iter().map(Uuid::to_string).collect();
+    let keys: Vec<String> = q.key_id.iter().map(Uuid::to_string).collect();
+    any_of(&mut sql, &mut binds, "tenant_id", "toUUID(?)", &tenants);
+    any_of(&mut sql, &mut binds, "key_id", "toUUID(?)", &keys);
+    any_of(&mut sql, &mut binds, "model", "?", &q.model);
     if let Some(rt) = &q.request_type {
         sql.push_str(" and request_type = ?");
         binds.push(LogBind::Text(rt.clone()));
@@ -280,6 +314,29 @@ fn log_filter_sql(q: &UsageLogQuery, since: i64) -> (String, Vec<LogBind>) {
         sql.push_str(&traced_only_filter(since, q.until_ms));
     }
     (sql, binds)
+}
+
+/// `and {column} = …` for one value, `and {column} in (…)` for several,
+/// nothing for none; `placeholder` is how each bound value is read.
+fn any_of(
+    sql: &mut String,
+    binds: &mut Vec<LogBind>,
+    column: &str,
+    placeholder: &str,
+    values: &[String],
+) {
+    match values {
+        [] => {}
+        [one] => {
+            sql.push_str(&format!(" and {column} = {placeholder}"));
+            binds.push(LogBind::Text(one.clone()));
+        }
+        many => {
+            let list = vec![placeholder; many.len()].join(", ");
+            sql.push_str(&format!(" and {column} in ({list})"));
+            binds.extend(many.iter().cloned().map(LogBind::Text));
+        }
+    }
 }
 
 fn bind_log_filters(
@@ -1762,9 +1819,9 @@ mod alias_tests {
 
     fn log_query() -> UsageLogQuery {
         UsageLogQuery {
-            tenant_id: None,
-            key_id: None,
-            model: None,
+            tenant_id: Vec::new(),
+            key_id: Vec::new(),
+            model: Vec::new(),
             request_type: None,
             session_id: None,
             device_id: None,
@@ -1788,9 +1845,9 @@ mod alias_tests {
         let (sql, binds) = log_filter_sql(&log_query(), 0);
         assert_eq!(sql.matches('?').count(), binds.len());
         let full = UsageLogQuery {
-            tenant_id: Some(Uuid::nil()),
-            key_id: Some(Uuid::nil()),
-            model: Some("m".into()),
+            tenant_id: vec![Uuid::nil()],
+            key_id: vec![Uuid::nil()],
+            model: vec!["m".into()],
             request_type: Some("chat".into()),
             session_id: Some("s".into()),
             device_id: Some("d".into()),
@@ -1808,6 +1865,28 @@ mod alias_tests {
         assert!(sql.contains("status_code >= 400"));
         assert!(sql.contains("status_code = 502"));
         assert!(sql.contains("FROM spans"));
+    }
+
+    #[test]
+    fn log_filters_take_comma_lists() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let q: UsageLogQuery = serde_json::from_value(serde_json::json!({
+            "key_id": format!("{a}, {b},"),
+            "model": "glm-5-3",
+        }))
+        .expect("parses");
+        assert_eq!(q.key_id, vec![a, b]);
+        assert!(q.tenant_id.is_empty());
+        let (sql, binds) = log_filter_sql(&q, 0);
+        assert!(sql.contains(" and key_id in (toUUID(?), toUUID(?))"));
+        assert!(sql.contains(" and model = ?"));
+        assert_eq!(sql.matches('?').count(), binds.len());
+
+        let bad = serde_json::json!({ "key_id": format!("{a},not-a-uuid") });
+        assert!(serde_json::from_value::<UsageLogQuery>(bad).is_err());
+        let many = vec![a.to_string(); MAX_LOG_FILTER_VALUES + 1].join(",");
+        let too_many = serde_json::json!({ "key_id": many });
+        assert!(serde_json::from_value::<UsageLogQuery>(too_many).is_err());
     }
 
     #[test]
@@ -1886,7 +1965,7 @@ mod alias_tests {
     fn log_failures_count_only_failures_and_keep_the_filters() {
         let (filter, binds) = log_filter_sql(
             &UsageLogQuery {
-                model: Some("m".into()),
+                model: vec!["m".into()],
                 ..log_query()
             },
             0,
