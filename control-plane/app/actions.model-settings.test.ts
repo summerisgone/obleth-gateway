@@ -78,6 +78,16 @@ describe("saving a model's settings", () => {
     expect(obleth.updateModel).not.toHaveBeenCalled();
   });
 
+  it("sends the rejected request fields only when the form has them", async () => {
+    mockAdmin();
+    const obleth = gateway();
+    const { saveModelSettingsAction } = await import("./actions");
+    await saveModelSettingsAction(form({ sections: "model", rejected_request_fields: "bad_words\n logit_bias ,\n" }));
+    expect(obleth.updateModel.mock.calls[0][1].rejected_request_fields).toEqual(["bad_words", "logit_bias"]);
+    await saveModelSettingsAction(form({ sections: "model", description: "new" }));
+    expect("rejected_request_fields" in obleth.updateModel.mock.calls[1][1]).toBe(false);
+  });
+
   it("keeps the route switch, the stored key, and every group the form leaves out", async () => {
     mockAdmin();
     const obleth = gateway();

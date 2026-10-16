@@ -1313,6 +1313,7 @@ function modelSettingsBody(formData: FormData, current: ModelRoute) {
     model_type: text("model_type", current.model_type),
     quantization: text("quantization", current.quantization),
     ...(has("aliases") ? { aliases: aliasesFromForm(formData) } : {}),
+    ...(has("rejected_request_fields") ? { rejected_request_fields: namesFromForm(formData, "rejected_request_fields") } : {}),
     ...(has("variants") ? { variants: variantsFromForm(formData) } : {}),
     upstream_model: text("upstream_model", current.upstream_model),
     api_base: text("api_base", current.api_base),
@@ -2453,7 +2454,12 @@ function tagsFromForm(formData: FormData): string[] {
 // trimming, de-duplication, and collision checks, so a name rejected there
 // surfaces as a save error rather than being silently dropped here.
 function aliasesFromForm(formData: FormData): string[] {
-  return String(formData.get("aliases") ?? "")
+  return namesFromForm(formData, "aliases");
+}
+
+// A textarea of names, one per line (commas also accepted), as a list.
+function namesFromForm(formData: FormData, field: string): string[] {
+  return String(formData.get(field) ?? "")
     .split(/[\n,]/)
     .map((a) => a.trim())
     .filter((a) => a.length > 0);

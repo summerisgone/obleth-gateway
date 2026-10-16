@@ -135,6 +135,12 @@ pub struct ManifestModel {
     /// leaves the stored value alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listed: Option<bool>,
+    /// Top-level request fields the model's backend cannot handle; a request
+    /// carrying one is refused with 400 before dispatch. Replaced as a whole
+    /// when present; absent leaves the stored list alone. An invalid list is
+    /// rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_request_fields: Option<Vec<String>>,
     /// Serving format from the fixed `QUANTIZATIONS` vocabulary. An
     /// unrecognized value is rejected rather than silently defaulted, on the
     /// same reasoning as `model_type`.
@@ -309,6 +315,7 @@ pub struct ModelConfig {
     pub variants: Vec<ModelVariant>,
     pub reasoning: crate::reasoning::ModelReasoning,
     pub listed: bool,
+    pub rejected_request_fields: Vec<String>,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -364,6 +371,7 @@ impl Default for ModelConfig {
             variants: Vec::new(),
             reasoning: Default::default(),
             listed: true,
+            rejected_request_fields: Vec::new(),
             upstream_model: String::new(),
             api_base: String::new(),
             api_key: None,
@@ -420,6 +428,7 @@ impl From<&ModelRoute> for ModelConfig {
             variants: m.variants.clone(),
             reasoning: m.reasoning.clone(),
             listed: m.listed,
+            rejected_request_fields: m.rejected_request_fields.clone(),
             upstream_model: m.upstream_model.clone(),
             api_base: m.api_base.clone(),
             api_key: m.api_key.clone(),
@@ -487,6 +496,10 @@ impl ModelConfig {
         note(self.variants != other.variants, "variants");
         note(self.reasoning != other.reasoning, "reasoning");
         note(self.listed != other.listed, "listed");
+        note(
+            self.rejected_request_fields != other.rejected_request_fields,
+            "rejected_request_fields",
+        );
         note(
             self.upstream_model != other.upstream_model,
             "upstream_model",
@@ -896,6 +909,10 @@ pub fn resolve_model(
     if let Some(listed) = entry.listed {
         next.listed = listed;
     }
+    if let Some(raw) = &entry.rejected_request_fields {
+        next.rejected_request_fields = crate::types::validate_rejected_request_fields(raw)
+            .map_err(|e| reject(format!("rejected_request_fields: {e}")))?;
+    }
     if let Some(r) = &entry.reasoning {
         r.validate()
             .map_err(|e| reject(format!("reasoning: {e}")))?;
@@ -1163,6 +1180,10 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
             .then(|| m.reasoning.clone()),
         // Only an unlisted model says so, keeping older files' shape.
         listed: (!m.listed).then_some(false),
+        // Only a model that refuses something says so, keeping older files'
+        // shape.
+        rejected_request_fields: (!m.rejected_request_fields.is_empty())
+            .then(|| m.rejected_request_fields.clone()),
         upstream_model: Some(m.upstream_model.clone()),
         api_base: Some(m.api_base.clone()),
         api_key: None,
@@ -1225,6 +1246,7 @@ mod tests {
             lifecycle: Default::default(),
             reasoning: Default::default(),
             listed: true,
+            rejected_request_fields: Vec::new(),
             variants: Vec::new(),
             description: "original".into(),
             upstream_model: "upstream/original".into(),
@@ -1566,6 +1588,28 @@ mod tests {
         hidden.listed = false;
         assert_eq!(model_to_manifest_entry(&hidden).listed, Some(false));
         assert_eq!(model_to_manifest_entry(&existing).listed, None);
+
+        // `rejected_request_fields` is replaced when present, checked, and
+        // exported only when non-empty.
+        let mut refuse = entry("m");
+        refuse.rejected_request_fields = Some(vec![" bad_words ".into(), "bad_words".into()]);
+        let r = resolve_model(&refuse, Some(&existing), &[]).unwrap();
+        assert_eq!(r.config.rejected_request_fields, vec!["bad_words"]);
+        assert!(r
+            .changed_fields
+            .contains(&"rejected_request_fields".to_string()));
+        refuse.rejected_request_fields = Some(vec!["model".into()]);
+        assert!(resolve_model(&refuse, Some(&existing), &[]).is_err());
+        let mut refusing = route("m");
+        refusing.rejected_request_fields = vec!["bad_words".into()];
+        assert_eq!(
+            model_to_manifest_entry(&refusing).rejected_request_fields,
+            Some(vec!["bad_words".to_string()])
+        );
+        assert_eq!(
+            model_to_manifest_entry(&existing).rejected_request_fields,
+            None
+        );
 
         assert_eq!(model_to_manifest_entry(&existing).reasoning, None);
         assert_eq!(

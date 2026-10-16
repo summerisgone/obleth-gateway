@@ -218,6 +218,8 @@ export interface ModelRoute {
   reasoning?: ModelReasoning;
   /** Whether /v1/models and /model/info offer the model; it is served by name either way. Missing on older gateways (listed). */
   listed?: boolean;
+  /** Request body fields refused with a 400 before dispatch, because the model's server cannot handle them. Missing on older gateways (none). */
+  rejected_request_fields?: string[];
   description: string;
   upstream_model: string;
   api_base: string;

@@ -412,6 +412,12 @@ pub struct ModelRoute {
     /// payloads as listed.
     #[serde(default = "default_true")]
     pub listed: bool,
+    /// Top-level request body fields this model's backend cannot handle. A
+    /// request carrying any of them (or carrying one inside `extra_body`) is
+    /// refused with 400 before it is sent. Case-sensitive JSON keys; empty by
+    /// default. `#[serde(default)]` reads older payloads as "none".
+    #[serde(default)]
+    pub rejected_request_fields: Vec<String>,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -671,6 +677,11 @@ pub struct ResolvedModel {
     /// payloads deserializable as "listed".
     #[serde(default = "default_true")]
     pub listed: bool,
+    /// See [`ModelRoute::rejected_request_fields`]. Read per request.
+    /// `#[serde(default)]` keeps older cached payloads deserializable as
+    /// "none".
+    #[serde(default)]
+    pub rejected_request_fields: Vec<String>,
     /// See [`ModelRoute::description`]. Carried so the discovery endpoints
     /// can say what a model is for. `#[serde(default)]` keeps older cached
     /// payloads deserializable as "no description".
@@ -3268,6 +3279,90 @@ where
     out
 }
 
+/// Maximum request fields one model may refuse.
+pub const MAX_REJECTED_REQUEST_FIELDS: usize = 32;
+
+/// Longest request field name accepted in a model's rejected list.
+pub const MAX_REJECTED_REQUEST_FIELD_LEN: usize = 128;
+
+/// Fields every request needs, so refusing one would refuse every request.
+const UNREJECTABLE_REQUEST_FIELDS: &[&str] = &["model"];
+
+/// Check and normalize a model's rejected request fields: names trimmed,
+/// empty entries dropped, duplicates removed, order kept. Names stay
+/// case-sensitive, as JSON keys are. Too many names, a name that is too long,
+/// or one every request needs (`model`) is an error.
+pub fn validate_rejected_request_fields<I, S>(fields: I) -> Result<Vec<String>, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<String> = Vec::new();
+    for field in fields {
+        let f = field.as_ref().trim();
+        if f.is_empty() || out.iter().any(|o| o == f) {
+            continue;
+        }
+        if f.len() > MAX_REJECTED_REQUEST_FIELD_LEN {
+            return Err(format!(
+                "rejected request field '{f}' is longer than {MAX_REJECTED_REQUEST_FIELD_LEN} characters"
+            ));
+        }
+        if UNREJECTABLE_REQUEST_FIELDS.contains(&f) {
+            return Err(format!(
+                "'{f}' cannot be a rejected request field: every request needs it"
+            ));
+        }
+        out.push(f.to_string());
+    }
+    if out.len() > MAX_REJECTED_REQUEST_FIELDS {
+        return Err(format!(
+            "at most {MAX_REJECTED_REQUEST_FIELDS} rejected request fields per model"
+        ));
+    }
+    Ok(out)
+}
+
+/// The lenient form of [`validate_rejected_request_fields`] for stored
+/// values: anything it would refuse is dropped instead.
+pub fn normalize_rejected_request_fields<I, S>(fields: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<String> = Vec::new();
+    for field in fields {
+        let f = field.as_ref().trim();
+        if f.is_empty()
+            || f.len() > MAX_REJECTED_REQUEST_FIELD_LEN
+            || UNREJECTABLE_REQUEST_FIELDS.contains(&f)
+            || out.iter().any(|o| o == f)
+            || out.len() >= MAX_REJECTED_REQUEST_FIELDS
+        {
+            continue;
+        }
+        out.push(f.to_string());
+    }
+    out
+}
+
+/// The first of `fields` a request body carries, at the top level or inside
+/// an `extra_body` object (which some clients send as is), or `None`.
+pub fn rejected_request_field<'a>(
+    body: &serde_json::Value,
+    fields: &'a [String],
+) -> Option<&'a str> {
+    if fields.is_empty() {
+        return None;
+    }
+    let obj = body.as_object()?;
+    let extra = obj.get("extra_body").and_then(serde_json::Value::as_object);
+    fields
+        .iter()
+        .find(|f| obj.contains_key(f.as_str()) || extra.is_some_and(|e| e.contains_key(f.as_str())))
+        .map(String::as_str)
+}
+
 // ---- config backup / restore ------------------------------------------------
 
 /// File-format discriminator for config backups.
@@ -3459,6 +3554,10 @@ pub struct ModelBackup {
     /// every model as listed.
     #[serde(default = "default_true")]
     pub listed: bool,
+    /// `#[serde(default)]`: a backup taken before the list existed restores
+    /// every model as refusing nothing.
+    #[serde(default)]
+    pub rejected_request_fields: Vec<String>,
     #[serde(default)]
     pub description: String,
     pub upstream_model: String,
@@ -4397,6 +4496,59 @@ mod tests {
     }
 
     #[test]
+    fn rejected_request_fields_are_trimmed_deduped_and_checked() {
+        assert_eq!(
+            validate_rejected_request_fields([" bad_words ", "", "bad_words", "Bad_Words"])
+                .unwrap(),
+            vec!["bad_words".to_string(), "Bad_Words".to_string()]
+        );
+        assert!(validate_rejected_request_fields(["model"]).is_err());
+        assert!(
+            validate_rejected_request_fields(["x".repeat(MAX_REJECTED_REQUEST_FIELD_LEN + 1)])
+                .is_err()
+        );
+        let many: Vec<String> = (0..MAX_REJECTED_REQUEST_FIELDS + 1)
+            .map(|i| format!("f{i}"))
+            .collect();
+        assert!(validate_rejected_request_fields(&many).is_err());
+        // The stored form drops what validation refuses instead of failing.
+        assert_eq!(
+            normalize_rejected_request_fields(["model", " bad_words", "bad_words"]),
+            vec!["bad_words".to_string()]
+        );
+        assert_eq!(
+            normalize_rejected_request_fields(&many).len(),
+            MAX_REJECTED_REQUEST_FIELDS
+        );
+    }
+
+    #[test]
+    fn rejected_request_field_finds_top_level_and_extra_body_keys() {
+        let fields = vec!["bad_words".to_string(), "logit_bias".to_string()];
+        let plain = serde_json::json!({"model": "m", "messages": [], "temperature": 0});
+        assert_eq!(rejected_request_field(&plain, &fields), None);
+        let top = serde_json::json!({"model": "m", "logit_bias": {}, "bad_words": ["x"]});
+        assert_eq!(rejected_request_field(&top, &fields), Some("bad_words"));
+        let extra = serde_json::json!({"model": "m", "extra_body": {"logit_bias": {}}});
+        assert_eq!(rejected_request_field(&extra, &fields), Some("logit_bias"));
+        // Keys are case-sensitive, and a field named only inside a message
+        // or a nested object other than `extra_body` is not a request field.
+        let nested = serde_json::json!({
+            "model": "m",
+            "Bad_Words": ["x"],
+            "messages": [{"role": "user", "content": "hi", "bad_words": ["x"]}],
+            "metadata": {"bad_words": "x"}
+        });
+        assert_eq!(rejected_request_field(&nested, &fields), None);
+        // Nothing configured refuses nothing, whatever the body.
+        assert_eq!(rejected_request_field(&top, &[]), None);
+        assert_eq!(
+            rejected_request_field(&serde_json::Value::Null, &fields),
+            None
+        );
+    }
+
+    #[test]
     fn addressable_names_lists_the_canonical_name_first() {
         let mut model = resolved_fixture();
         assert_eq!(
@@ -4616,6 +4768,7 @@ mod tests {
             lifecycle: Default::default(),
             reasoning: Default::default(),
             listed: true,
+            rejected_request_fields: Vec::new(),
             variants: Vec::new(),
             upstream_model: "glm-5-3-mxfp4".into(),
             api_base: "http://upstream/v1".into(),
