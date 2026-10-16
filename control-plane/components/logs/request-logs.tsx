@@ -18,16 +18,21 @@ import {
   fillHistogram,
   filtersActive,
   isFailure,
+  listLabel,
+  listOf,
   LOG_WINDOWS,
   loadViews,
   logParams,
   parseSearch,
-  REQUEST_TYPES,
+  pickOne,
   storeViews,
   timeSplit,
   tokens,
+  typeOptions,
   when,
   windowRange,
+  withPatterns,
+  MAX_MATCHES,
   type HistogramBucket,
   type KeyOption,
   type LogFilters,
@@ -215,6 +220,13 @@ export function RequestLogs({
     refetchInterval: live ? 30_000 : false,
     placeholderData: keepPreviousData,
   });
+  // Every type the log has shown this visit, so the Type menu keeps
+  // offering them while a filter narrows the facets.
+  const [seenTypes, setSeenTypes] = useState<string[]>([]);
+  useEffect(() => {
+    const types = facets.data?.request_types.map((t) => t.value).filter(Boolean) ?? [];
+    setSeenTypes((seen) => (types.every((t) => seen.includes(t)) ? seen : [...new Set([...seen, ...types])]));
+  }, [facets.data]);
   const top = head.data?.[0];
   // Paused: count what has arrived since, without moving the list.
   const newer = useQuery({
@@ -253,10 +265,14 @@ export function RequestLogs({
   }
 
   function runSearch() {
-    const { patch: p, unknown } = parseSearch(draft, { tenants, keys, models });
-    if (Object.keys(p).length) patch(p);
-    setSearchNote(unknown.length ? `Didn't recognise ${unknown.join(", ")}. Try model:, team:, key:, status:, type: or session:.` : null);
-    if (!unknown.length) setDraft("");
+    const { patch: p, unknown, tooBroad } = parseSearch(draft, { tenants, keys, models });
+    if (Object.keys(p).length) patch(withPatterns(filters, p));
+    const notes = [
+      ...(unknown.length ? [`Didn't recognise ${unknown.join(", ")}. Try model:, team:, key:, status:, type: or session:, with * for any characters (key:jlee379*).`] : []),
+      ...(tooBroad.length ? [`${tooBroad.join(", ")} matches more than ${MAX_MATCHES}. Narrow it down.`] : []),
+    ];
+    setSearchNote(notes.length ? notes.join(" ") : null);
+    if (!notes.length) setDraft("");
   }
 
   const openIndex = rows.findIndex((r) => r.request_id === openId);
@@ -270,7 +286,13 @@ export function RequestLogs({
   }, [rows]);
 
   const tenantName = new Map(tenants.map((t) => [t.id, t.name]));
-  const teamKeys = filters.tenantId ? keys.filter((k) => k.tenantId === filters.tenantId) : keys;
+  const teams = listOf(filters.tenantId);
+  const teamKeys = teams.length ? keys.filter((k) => teams.includes(k.tenantId)) : keys;
+  // A `*` search's list shows in its menu as one choice: the pattern and its count.
+  const listOption = (field: "model" | "tenantId" | "keyId", noun: string) => {
+    const label = listLabel(filters, field, noun);
+    return label ? [{ value: filters[field], label }] : [];
+  };
   const at = (t: number) => new Date(t).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   const sameDay = new Date(range.since).toDateString() === new Date(range.until).toDateString();
   const winLabel = filters.window === "custom" ? `between ${at(range.since)} and ${sameDay ? new Date(range.until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : at(range.until)}` : `in the last ${{ "15m": "15 minutes", "1h": "hour", "24h": "24 hours", "7d": "7 days", "30d": "30 days" }[filters.window]}`;
@@ -343,7 +365,7 @@ export function RequestLogs({
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") runSearch(); if (e.key === "Escape") setDraft(""); }}
-              placeholder="Request ID, or model:, team:, key:, status: (error, ok or a code), type:, session:"
+              placeholder="Request ID, a key or team name, or model:, team:, key:, status:, type:, session: (* for any characters)"
               aria-label="Search requests"
               className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground"
             />
@@ -359,10 +381,10 @@ export function RequestLogs({
         {searchNote && <p className="text-xs text-foreground">{searchNote}</p>}
         <div className="flex flex-wrap items-center gap-2">
           <Select aria-label="Status" value={filters.status} onValueChange={(v) => patch({ status: v as LogFilters["status"] })} className={cn("h-8 w-auto min-w-[8.5rem] text-[12.5px]", filters.status && "border-foreground")} options={[{ value: "", label: "Any status" }, { value: "success", label: "Succeeded" }, { value: "error", label: "Failed" }]} />
-          <Select aria-label="Model" value={filters.model} onValueChange={(v) => patch({ model: v })} searchPlaceholder="Find a model" className={cn("h-8 w-auto min-w-[9rem] text-[12.5px]", filters.model && "border-foreground")} options={[{ value: "", label: "Any model" }, ...models.map((m) => ({ value: m, label: m }))]} />
-          <Select aria-label="Team" value={filters.tenantId} onValueChange={(v) => patch({ tenantId: v, keyId: "" })} searchPlaceholder="Find a team" className={cn("h-8 w-auto min-w-[9rem] text-[12.5px]", filters.tenantId && "border-foreground")} options={[{ value: "", label: "Any team" }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]} />
-          <Select aria-label="Key" value={filters.keyId} onValueChange={(v) => { const k = keys.find((x) => x.id === v); patch({ keyId: v, ...(k ? { tenantId: k.tenantId } : {}) }); }} searchPlaceholder="Find a key" className={cn("h-8 w-auto min-w-[8rem] text-[12.5px]", filters.keyId && "border-foreground")} options={[{ value: "", label: "Any key" }, ...teamKeys.slice(0, 500).map((k) => ({ value: k.id, label: `${k.name || k.prefix}`, hint: filters.tenantId ? k.prefix : `${k.prefix} · ${tenantName.get(k.tenantId) ?? ""}` }))]} />
-          <Select aria-label="Type" value={filters.requestType} onValueChange={(v) => patch({ requestType: v })} className={cn("h-8 w-auto min-w-[7.5rem] text-[12.5px]", filters.requestType && "border-foreground")} options={[{ value: "", label: "Any type" }, ...REQUEST_TYPES.map((t) => ({ value: t, label: t }))]} />
+          <Select aria-label="Model" value={filters.model} onValueChange={(v) => patch(pickOne(filters, "model", v))} searchPlaceholder="Find a model" className={cn("h-8 w-auto min-w-[9rem] text-[12.5px]", filters.model && "border-foreground")} options={[{ value: "", label: "Any model" }, ...listOption("model", "models"), ...models.map((m) => ({ value: m, label: m }))]} />
+          <Select aria-label="Team" value={filters.tenantId} onValueChange={(v) => patch({ ...pickOne(filters, "tenantId", v), keyId: "" })} searchPlaceholder="Find a team" className={cn("h-8 w-auto min-w-[9rem] text-[12.5px]", filters.tenantId && "border-foreground")} options={[{ value: "", label: "Any team" }, ...listOption("tenantId", "teams"), ...tenants.map((t) => ({ value: t.id, label: t.name }))]} />
+          <Select aria-label="Key" value={filters.keyId} onValueChange={(v) => { const k = keys.find((x) => x.id === v); patch({ ...pickOne(filters, "keyId", v), ...(k ? { tenantId: k.tenantId } : {}) }); }} searchPlaceholder="Find a key" className={cn("h-8 w-auto min-w-[8rem] text-[12.5px]", filters.keyId && "border-foreground")} options={[{ value: "", label: "Any key" }, ...listOption("keyId", "keys"), ...teamKeys.slice(0, 500).map((k) => ({ value: k.id, label: `${k.name || k.prefix}`, hint: teams.length === 1 ? k.prefix : `${k.prefix} · ${tenantName.get(k.tenantId) ?? ""}` }))]} />
+          <Select aria-label="Type" value={filters.requestType} onValueChange={(v) => patch({ requestType: v })} className={cn("h-8 w-auto min-w-[7.5rem] text-[12.5px]", filters.requestType && "border-foreground")} options={[{ value: "", label: "Any type" }, ...typeOptions(seenTypes, filters.requestType).map((t) => ({ value: t, label: t }))]} />
           <Toggle on={filters.tracedOnly} onClick={() => patch({ tracedOnly: !filters.tracedOnly })}>Traced only</Toggle>
           <Toggle on={filters.includeInternal} onClick={() => patch({ includeInternal: !filters.includeInternal })}>Include health checks</Toggle>
           {filters.statusCode && <Chip active onClear={() => patch({ statusCode: "" })}>HTTP <span className="font-mono">{filters.statusCode}</span></Chip>}
