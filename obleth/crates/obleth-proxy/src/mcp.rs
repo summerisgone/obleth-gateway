@@ -15,8 +15,9 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, Request, Response, StatusCode};
 use futures_util::StreamExt;
-use obleth_config::ResolvedMcpServer;
+use obleth_config::{ResolvedKey, ResolvedMcpServer, UsageRecord};
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::proxy::{bearer, error_json, forward_headers, has_path_traversal};
 use crate::state::AppState;
@@ -42,52 +43,177 @@ pub fn record_call(state: &AppState, server: &str, tool: bool, ok: bool, ms: u64
     });
 }
 
-/// Handle `/mcp/{server}` and `/mcp/{server}/{*rest}`.
+/// The ledger's `request_type` for a client's call through `/mcp/<name>`.
+pub const MCP_REQUEST_TYPE: &str = "mcp";
+
+/// One client call through `/mcp/<name>` as a usage row, so it shows in the
+/// request log beside model traffic: the server's name in `model`, admission
+/// `direct` (MCP calls skip fair-share), the HTTP status, and the time until
+/// the server's response headers, since an MCP session can stream long after.
+/// No tokens or cost: obleth does not price MCP calls. The client's
+/// `mcp-session-id` groups a session's calls.
+fn mcp_usage_record(
+    key: &ResolvedKey,
+    request_id: Uuid,
+    server: &str,
+    session_id: Option<&str>,
+    device_id: &str,
+    status_code: u16,
+    total_ms: u32,
+) -> UsageRecord {
+    UsageRecord {
+        request_id,
+        tenant_id: key.tenant_id,
+        key_id: key.key_id,
+        model: server.to_string(),
+        admission: "direct".to_string(),
+        weight: key.weight,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        estimated_tokens: 0,
+        queue_wait_ms: 0,
+        ttft_ms: 0,
+        total_ms,
+        status_code,
+        cache_status: "off".to_string(),
+        cost_usd: 0.0,
+        energy_wh: 0.0,
+        energy_cost_usd: 0.0,
+        co2_g: 0.0,
+        ts_ms: chrono::Utc::now().timestamp_millis(),
+        session_id: session_id.unwrap_or_default().to_string(),
+        session_id_source: if session_id.is_some() {
+            "client"
+        } else {
+            "none"
+        }
+        .to_string(),
+        // Synthetic tenants' traffic is `benchmark`, as on every endpoint.
+        request_type: if key.synthetic {
+            obleth_config::BENCHMARK_REQUEST_TYPE
+        } else {
+            MCP_REQUEST_TYPE
+        }
+        .to_string(),
+        device_id: device_id.to_string(),
+        end_user: String::new(),
+        parent_request_id: Uuid::nil(),
+        model_variant: String::new(),
+        reasoning_effort: String::new(),
+        reasoning_effort_requested: String::new(),
+        model_family: String::new(),
+        key_name: key.key_name.clone(),
+        tenant_name: key.tenant_name.clone(),
+        streamed: false,
+    }
+}
+
+/// Handle `/mcp/{server}` and `/mcp/{server}/{*rest}`. Every answer after
+/// authentication carries its `x-obleth-request-id`, the id of its row in the
+/// request log.
 #[tracing::instrument(skip_all, name = "mcp_request", fields(server = %params.server))]
 pub async fn mcp_handler(
     State(state): State<AppState>,
     Path(params): Path<McpPath>,
     req: Request<Body>,
 ) -> Response<Body> {
+    let request_id = Uuid::new_v4();
+    let (mut resp, logged) = handle(&state, params, req, request_id).await;
+    if logged {
+        if let Ok(value) = header::HeaderValue::from_str(&request_id.to_string()) {
+            resp.headers_mut()
+                .entry("x-obleth-request-id")
+                .or_insert(value);
+        }
+    }
+    resp
+}
+
+/// The call itself, and whether it reached the ledger (it does once the
+/// credential is known).
+async fn handle(
+    state: &AppState,
+    params: McpPath,
+    req: Request<Body>,
+    request_id: Uuid,
+) -> (Response<Body>, bool) {
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
 
     // ---- reject path traversal in the `*rest` segment before any upstream work ----
     if let Some(rest) = params.rest.as_deref() {
         if has_path_traversal(rest) {
-            return error_json(StatusCode::BAD_REQUEST, "invalid request path");
+            return (
+                error_json(StatusCode::BAD_REQUEST, "invalid request path"),
+                false,
+            );
         }
     }
 
     // ---- auth: same bearer credential the data plane accepts, JWT or
     // secret key (`crate::jwt_auth::authenticate_credential`) ----
     let Some(secret) = bearer(&headers) else {
-        return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
-    };
-    let resolved = match crate::jwt_auth::authenticate_credential(&state, &secret).await {
-        Ok(cred) => cred.resolved,
-        Err(resp) => return resp,
-    };
-    // Same gate as the data plane: disabled key, inactive tenant, schedule.
-    if let Err(resp) = crate::proxy::gate_resolved_key(&state, &resolved) {
-        return resp;
-    }
-
-    // ---- resolve the registered MCP server ----
-    let Some(server) = resolve_mcp(&state, &params.server).await else {
-        return error_json(
-            StatusCode::NOT_FOUND,
-            &format!("mcp server '{}' is not registered", params.server),
+        return (
+            error_json(StatusCode::UNAUTHORIZED, "missing bearer token"),
+            false,
         );
     };
+    let (resolved, device_id) = match crate::jwt_auth::authenticate_credential(state, &secret).await
+    {
+        Ok(cred) => (cred.resolved, cred.device_id),
+        Err(resp) => return (resp, false),
+    };
+    // Same gate as the data plane: disabled key, inactive tenant, schedule.
+    if let Err(resp) = crate::proxy::gate_resolved_key(state, &resolved) {
+        return (resp, false);
+    }
+
+    // From here every answer is a row in the ledger. Internal keys are not
+    // recorded, as in `finalize`.
+    let session_id = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let started = std::time::Instant::now();
+    let ledger = |server: &str, status: StatusCode| {
+        if resolved.internal {
+            return;
+        }
+        state.telemetry.record(mcp_usage_record(
+            &resolved,
+            request_id,
+            server,
+            session_id.as_deref(),
+            &device_id,
+            status.as_u16(),
+            started.elapsed().as_millis() as u32,
+        ));
+    };
+
+    // ---- resolve the registered MCP server ----
+    let Some(server) = resolve_mcp(state, &params.server).await else {
+        ledger(&params.server, StatusCode::NOT_FOUND);
+        let msg = format!("mcp server '{}' is not registered", params.server);
+        return (error_json(StatusCode::NOT_FOUND, &msg), true);
+    };
     if !server.enabled {
-        return error_json(StatusCode::FORBIDDEN, "mcp server is disabled");
+        ledger(&server.name, StatusCode::FORBIDDEN);
+        return (
+            error_json(StatusCode::FORBIDDEN, "mcp server is disabled"),
+            true,
+        );
     }
 
     // ---- forward upstream ----
     let body_bytes = match axum::body::to_bytes(body, MCP_BODY_LIMIT).await {
         Ok(b) => b,
-        Err(_) => return error_json(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+        Err(_) => {
+            ledger(&server.name, StatusCode::PAYLOAD_TOO_LARGE);
+            let resp = error_json(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+            return (resp, true);
+        }
     };
     let url = build_mcp_url(
         &server.upstream_url,
@@ -101,7 +227,6 @@ pub async fn mcp_handler(
         }
     }
 
-    let started = std::time::Instant::now();
     let upstream = state
         .http
         .request(parts.method, &url)
@@ -123,13 +248,15 @@ pub async fn mcp_handler(
             );
             state.metrics.record_mcp(&server.name, 502);
             record_call(
-                &state,
+                state,
                 &server.name,
                 false,
                 false,
                 started.elapsed().as_millis() as u64,
             );
-            return error_json(StatusCode::BAD_GATEWAY, "mcp upstream request failed");
+            ledger(&server.name, StatusCode::BAD_GATEWAY);
+            let resp = error_json(StatusCode::BAD_GATEWAY, "mcp upstream request failed");
+            return (resp, true);
         }
     };
 
@@ -146,12 +273,13 @@ pub async fn mcp_handler(
     }
     state.metrics.record_mcp(&server.name, status.as_u16());
     record_call(
-        &state,
+        state,
         &server.name,
         false,
         !status.is_server_error(),
         started.elapsed().as_millis() as u64,
     );
+    ledger(&server.name, status);
 
     // Forward the upstream response headers, dropping only what the re-stream
     // invalidates. MCP streamable-HTTP servers carry protocol state in
@@ -180,9 +308,10 @@ pub async fn mcp_handler(
         .bytes_stream()
         .map(|chunk| chunk.map_err(std::io::Error::other));
 
-    builder
+    let resp = builder
         .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"));
+    (resp, true)
 }
 
 #[derive(serde::Deserialize)]
@@ -235,7 +364,58 @@ fn build_mcp_url(base: &str, rest: Option<&str>, query: Option<&str>) -> String 
 
 #[cfg(test)]
 mod tests {
-    use super::build_mcp_url;
+    use super::{build_mcp_url, mcp_usage_record, MCP_REQUEST_TYPE};
+    use uuid::Uuid;
+
+    #[test]
+    fn an_mcp_call_is_a_request_log_row() {
+        let mut key = crate::boons::test_support::test_key();
+        key.key_name = "jlee379-cli".into();
+        let id = Uuid::new_v4();
+        let row = mcp_usage_record(&key, id, "github", Some("sess-1"), "", 200, 85);
+        assert_eq!(row.request_id, id);
+        assert_eq!(row.request_type, MCP_REQUEST_TYPE);
+        assert_eq!(
+            (row.model.as_str(), row.admission.as_str()),
+            ("github", "direct")
+        );
+        assert_eq!((row.status_code, row.total_ms, row.ttft_ms), (200, 85, 0));
+        assert_eq!(
+            (row.session_id.as_str(), row.session_id_source.as_str()),
+            ("sess-1", "client")
+        );
+        assert_eq!(
+            (row.input_tokens, row.output_tokens, row.cost_usd),
+            (0, 0, 0.0)
+        );
+        assert_eq!(row.key_name, "jlee379-cli");
+        assert!(!row.streamed);
+
+        let row = mcp_usage_record(&key, id, "github", None, "", 502, 3);
+        assert_eq!(
+            (row.session_id.as_str(), row.session_id_source.as_str()),
+            ("", "none")
+        );
+        key.synthetic = true;
+        let row = mcp_usage_record(&key, id, "github", None, "", 200, 3);
+        assert_eq!(row.request_type, obleth_config::BENCHMARK_REQUEST_TYPE);
+    }
+
+    #[test]
+    fn every_mcp_answer_after_the_key_gate_reaches_the_ledger() {
+        // Pinned at the source level for the same reason as the key gate
+        // test below. Past the gate, each of the four early answers (404, 403,
+        // 413, 502) and the server's own answer records its row, and none is
+        // handed back as unlogged.
+        let src = include_str!("mcp.rs");
+        let handler = &src[..src.find("\nmod tests {").expect("the test module")];
+        let logged = &handler[handler
+            .find("From here every answer is a row in the ledger")
+            .expect("the marker")..];
+        assert_eq!(logged.matches("return (").count(), 4);
+        assert_eq!(logged.matches("ledger(&").count(), 5);
+        assert!(!logged.contains(", false)"));
+    }
 
     #[test]
     fn mcp_handler_applies_the_full_key_gate() {
@@ -250,10 +430,10 @@ mod tests {
             .find("authenticate_credential(")
             .expect("the auth call");
         let gate = handler
-            .find("crate::proxy::gate_resolved_key(&state, &resolved)")
+            .find("crate::proxy::gate_resolved_key(state, &resolved)")
             .expect("the MCP handler must call gate_resolved_key");
         let upstream = handler
-            .find("resolve_mcp(&state")
+            .find("resolve_mcp(state")
             .expect("the server lookup");
         assert!(
             auth < gate && gate < upstream,

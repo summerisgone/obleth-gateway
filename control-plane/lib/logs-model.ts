@@ -21,7 +21,7 @@ export type LogWindowId = (typeof LOG_WINDOWS)[number]["id"];
  * also lists any other type the log has shown (`typeOptions`), so a new
  * endpoint is filterable before this list learns about it.
  */
-export const REQUEST_TYPES = ["chat", "completion", "responses", "messages", "verdict", "embedding", "audio", "image", "video", "rerank", "moderation", "search", "other"] as const;
+export const REQUEST_TYPES = ["chat", "completion", "responses", "messages", "verdict", "embedding", "audio", "image", "video", "rerank", "moderation", "search", "mcp", "other"] as const;
 
 /** The Type menu: the known types, then any others the log has shown, then the current one. */
 export function typeOptions(seen: Iterable<string>, current = ""): string[] {
@@ -349,6 +349,8 @@ const HELPER_PURPOSES: Record<string, string> = {
   tool_loop: "tool loop turn",
   image_generation_boon: "image generation",
   web_search_boon: "web search",
+  // Not a helper: a client's call through /mcp/<server>, its server in `model`.
+  mcp: "MCP server call",
 };
 
 /** What a helper call was for, in a few words; any other type as recorded. */
