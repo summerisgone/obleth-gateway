@@ -868,6 +868,8 @@ export interface UsageLogEntry {
   model_variant?: string;
   /** The model family the client named; `model` is the member that answered. Absent from older gateways. */
   model_family?: string;
+  /** Whether the reply was relayed as an event stream. Only a streamed reply has a first token: `ttft_ms` is 0 on the others. Rows from before the gateway recorded it read false and may still hold a first-token time equal to the whole reply. Absent from older gateways. */
+  streamed?: boolean;
   /** The reasoning effort served (none, low, medium, high), "unsupported" when it was removed, or empty when it went through as sent. Absent from older gateways. */
   reasoning_effort?: string;
   /** The reasoning effort the caller asked for, or empty. Absent from older gateways. */

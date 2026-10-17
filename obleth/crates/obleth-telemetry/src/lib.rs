@@ -97,6 +97,7 @@ struct UsageRow<'a> {
     model_family: &'a str,
     key_name: &'a str,
     tenant_name: &'a str,
+    streamed: bool,
 }
 
 impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
@@ -134,6 +135,7 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             model_family: &r.model_family,
             key_name: &r.key_name,
             tenant_name: &r.tenant_name,
+            streamed: r.streamed,
         }
     }
 }
@@ -767,6 +769,7 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             model_family String DEFAULT '',
             key_name String DEFAULT '',
             tenant_name String DEFAULT '',
+            streamed Bool DEFAULT false,
             ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms),
             INDEX idx_ts_ms ts_ms TYPE minmax GRANULARITY 4
         ) ENGINE = MergeTree()
@@ -891,6 +894,12 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             .execute()
             .await?;
     }
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS streamed Bool DEFAULT false"
+        ))
+        .execute()
+        .await?;
     // Required for `insert_deduplication_token` on a non-replicated table: an
     // insert that timed out after committing is replayed from the WAL with the
     // same token, and ClickHouse discards the duplicate.
@@ -1233,6 +1242,7 @@ mod conv_tests {
             model_family: String::new(),
             key_name: String::new(),
             tenant_name: String::new(),
+            streamed: false,
         }
     }
 
@@ -1460,6 +1470,7 @@ mod conv_tests {
             model_family: String::new(),
             key_name: String::new(),
             tenant_name: String::new(),
+            streamed: false,
         };
         let row = UsageRow::from(&rec);
         assert_eq!(row.session_id_source, "derived");
@@ -1501,6 +1512,7 @@ mod conv_tests {
             model_family: String::new(),
             key_name: String::new(),
             tenant_name: String::new(),
+            streamed: false,
         };
         rec.energy_wh = 1.5;
         rec.energy_cost_usd = 0.0002;
@@ -1558,6 +1570,19 @@ mod conv_tests {
             (row.key_name, row.tenant_name),
             ("alice-notebook-1700000000000", "research")
         );
+    }
+
+    #[test]
+    fn usage_row_says_whether_the_reply_streamed() {
+        let mut rec = record();
+        assert!(!UsageRow::from(&rec).streamed);
+        rec.streamed = true;
+        assert!(UsageRow::from(&rec).streamed);
+        // A WAL record written before the field existed replays as buffered.
+        let mut old = serde_json::to_value(&rec).expect("serializes");
+        old.as_object_mut().expect("object").remove("streamed");
+        let replayed: UsageRecord = serde_json::from_value(old).expect("replays");
+        assert!(!replayed.streamed);
     }
 }
 

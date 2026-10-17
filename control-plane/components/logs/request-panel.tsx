@@ -278,7 +278,7 @@ export function RequestPanel({
           <Fact label="Cost" mono>{cost(row.cost_usd)}</Fact>
           <Fact label="Energy" mono>{row.energy_wh > 0 ? `${row.energy_wh.toFixed(2)} Wh · ${row.co2_g.toFixed(2)} g CO₂` : "—"}</Fact>
           <Fact label="Waited for a slot" mono>{duration(row.queue_wait_ms)}</Fact>
-          <Fact label="First token" mono>{row.ttft_ms > 0 ? duration(row.ttft_ms) : "—"}</Fact>
+          <Fact label="First token" mono>{row.ttft_ms > 0 ? duration(row.ttft_ms) : row.streamed === false ? "Not streamed" : "—"}</Fact>
           <Fact label="Total" mono>{duration(row.total_ms)}</Fact>
           <Fact label="Type">{helperPurpose(row.request_type)}</Fact>
           {row.model_family && (

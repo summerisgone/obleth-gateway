@@ -1333,6 +1333,7 @@ fn helper_usage_record(
         model_family: String::new(),
         key_name: key.key_name.clone(),
         tenant_name: key.tenant_name.clone(),
+        streamed: false,
     }
 }
 

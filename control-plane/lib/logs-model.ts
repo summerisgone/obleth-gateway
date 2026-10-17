@@ -281,7 +281,7 @@ export const isFailure = (row: Pick<UsageLogEntry, "status_code">) => row.status
 /**
  * A request's time as wait for a slot, then up to the first token, then the
  * rest. The first token is measured from arrival, so it includes the wait; a
- * non-streamed reply's first token is its last.
+ * reply that was not streamed has none (`ttft_ms` 0), so it is wait and rest.
  */
 export function timeSplit(row: Pick<UsageLogEntry, "queue_wait_ms" | "ttft_ms" | "total_ms">) {
   const total = Math.max(row.total_ms, 0);

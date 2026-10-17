@@ -264,6 +264,11 @@ pub struct UsageLogRow {
     pub recorded_key_name: String,
     #[serde(skip_serializing)]
     pub recorded_tenant_name: String,
+    /// Whether the reply was relayed to the client as an event stream. Only
+    /// a streamed reply has a first token: `ttft_ms` is 0 on the others
+    /// (rows written before this column existed read false here and may
+    /// still carry a first-token time equal to the whole reply).
+    pub streamed: bool,
 }
 
 /// A bind value for the request-log filters, in placeholder order.
@@ -369,7 +374,7 @@ const USAGE_LOG_SELECT: &str =
      cached_input_tokens, queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
      energy_wh, energy_cost_usd, co2_g, parent_request_id, model_variant, \
      reasoning_effort, reasoning_effort_requested, model_family, \
-     key_name as recorded_key_name, tenant_name as recorded_tenant_name \
+     key_name as recorded_key_name, tenant_name as recorded_tenant_name, streamed \
      from usage";
 
 /// Read individual `usage` rows newest-first, honoring the supplied filters and
@@ -1959,6 +1964,7 @@ mod alias_tests {
                 "model_family",
                 "recorded_key_name",
                 "recorded_tenant_name",
+                "streamed",
             ]
         );
     }

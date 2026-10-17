@@ -1223,6 +1223,8 @@ async fn run_pipeline(
         reasoning_effort: String::new(),
         reasoning_effort_requested: String::new(),
         model_family: String::new(),
+        // Set once the upstream answers.
+        streamed: false,
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -2821,6 +2823,11 @@ async fn run_pipeline(
             Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "video create failed"),
         };
     }
+
+    // Only a reply relayed as an event stream has a first token to time; see
+    // `finalize`.
+    let mut accounting = accounting;
+    accounting.meta.streamed = relays_event_stream(&content_type_str);
 
     // Extract guardrails policy for log_only output scanning (evaluated after stream drains).
     let scan_policy = resolved
@@ -6067,6 +6074,9 @@ pub(crate) struct RequestMeta {
     pub(crate) reasoning_effort_requested: String,
     /// The model family the client called by name, else empty.
     pub(crate) model_family: String,
+    /// Whether the reply is relayed to the client as an event stream, known
+    /// once the upstream answers; see `UsageRecord::streamed`.
+    pub(crate) streamed: bool,
 }
 
 /// The name a response cache entry is keyed by.
@@ -6387,6 +6397,24 @@ fn fnv1a_continue(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Whether an upstream reply with this content type reaches the client as it
+/// is produced: an event stream, rather than one body sent when it is done.
+fn relays_event_stream(content_type: &str) -> bool {
+    content_type.contains("text/event-stream")
+}
+
+/// The first-token time a request records. A first token is timed only on a
+/// reply streamed to the client as it is produced: a buffered reply's first
+/// byte arrives with its last, so its "first token" would be its whole
+/// duration and skew every latency figure built on it.
+fn recorded_ttft(streamed: bool, ttft_ms: u32) -> u32 {
+    if streamed {
+        ttft_ms
+    } else {
+        0
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finalize(
     state: &AppState,
@@ -6407,6 +6435,7 @@ pub(crate) fn finalize(
     cost_usd: f64,
     energy: crate::energy::EnergyFigures,
 ) {
+    let ttft_ms = recorded_ttft(meta.streamed, ttft_ms);
     state
         .metrics
         .record_request(admission.as_str(), status_code, input_tokens, output_tokens);
@@ -6450,6 +6479,7 @@ pub(crate) fn finalize(
         model_family: meta.model_family.clone(),
         key_name: resolved.key_name.clone(),
         tenant_name: resolved.tenant_name.clone(),
+        streamed: meta.streamed,
     });
 }
 
@@ -8832,6 +8862,18 @@ mod tests {
     }
 
     #[test]
+    fn only_a_streamed_reply_records_a_first_token() {
+        assert!(super::relays_event_stream("text/event-stream"));
+        assert!(super::relays_event_stream(
+            "text/event-stream; charset=utf-8"
+        ));
+        assert!(!super::relays_event_stream("application/json"));
+        assert_eq!(super::recorded_ttft(true, 420), 420);
+        // A buffered reply's first byte is its last: no first token.
+        assert_eq!(super::recorded_ttft(false, 34_800), 0);
+    }
+
+    #[test]
     fn request_meta_carries_device_id_into_usage_record() {
         let meta = RequestMeta {
             session_id: String::new(),
@@ -8843,6 +8885,7 @@ mod tests {
             reasoning_effort: String::new(),
             reasoning_effort_requested: String::new(),
             model_family: String::new(),
+            streamed: false,
         };
         assert_eq!(meta.device_id, "dev-1");
     }
@@ -9237,6 +9280,7 @@ mod lifecycle_tests {
             reasoning_effort: String::new(),
             reasoning_effort_requested: String::new(),
             model_family: String::new(),
+            streamed: false,
         };
         super::record_called_name(&mut meta, Some("acme"), Some("acme"));
         assert_eq!(meta.model_family, "acme");

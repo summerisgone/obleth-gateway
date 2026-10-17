@@ -1221,6 +1221,12 @@ pub struct UsageRecord {
     pub key_name: String,
     #[serde(default)]
     pub tenant_name: String,
+    /// Whether the reply reached the client as the upstream produced it (an
+    /// event stream). `ttft_ms` is measured only then: a buffered reply's
+    /// first byte is its last, so it records 0 there. `#[serde(default)]`
+    /// keeps older WAL records replayable.
+    #[serde(default)]
+    pub streamed: bool,
 }
 
 /// Runtime-configurable retention for the raw per-request `usage` ledger.
