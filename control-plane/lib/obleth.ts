@@ -1686,6 +1686,7 @@ export interface EnergySettingsView {
   power_query: string;
   model_power_query: string;
   model_power_label: string;
+  model_requests_query: string;
   poll_interval_secs: number;
   energy_cost_per_kwh: number;
   carbon_g_per_kwh: number;
@@ -1698,6 +1699,7 @@ export interface UpdateEnergySettings {
   power_query?: string;
   model_power_query?: string;
   model_power_label?: string;
+  model_requests_query?: string;
   poll_interval_secs?: number;
   energy_cost_per_kwh?: number;
   carbon_g_per_kwh?: number;
@@ -1709,6 +1711,7 @@ export interface EnergyTestQuery {
   power_query: string;
   model_power_query: string;
   model_power_label: string;
+  model_requests_query: string;
 }
 
 export interface ModelPowerMatch {
@@ -1725,6 +1728,7 @@ export interface EnergyTestResult {
     series: number;
     matched: ModelPowerMatch[];
     unmatched_series: string[];
+    requests_in_progress?: number;
   };
 }
 

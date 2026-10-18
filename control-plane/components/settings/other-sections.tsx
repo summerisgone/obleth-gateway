@@ -20,6 +20,7 @@ export function EnergySection({ settings }: { settings: EnergySettingsView }) {
   const [url, setUrl] = useState(settings.prometheus_url);
   const [modelQuery, setModelQuery] = useState(settings.model_power_query);
   const [label, setLabel] = useState(settings.model_power_label);
+  const [requestsQuery, setRequestsQuery] = useState(settings.model_requests_query);
   const [query, setQuery] = useState(settings.power_query);
   const [testing, start] = useTransition();
   const [result, setResult] = useState<{ ok: boolean; lines: string[] } | null>(null);
@@ -27,7 +28,7 @@ export function EnergySection({ settings }: { settings: EnergySettingsView }) {
   function test() {
     setResult(null);
     start(async () => {
-      const res = await testEnergyQueryAction({ prometheus_url: url.trim(), power_query: query.trim(), model_power_query: modelQuery.trim(), model_power_label: label.trim() });
+      const res = await testEnergyQueryAction({ prometheus_url: url.trim(), power_query: query.trim(), model_power_query: modelQuery.trim(), model_power_label: label.trim(), model_requests_query: requestsQuery.trim() });
       if (!res.ok) return setResult({ ok: false, lines: [res.error] });
       setResult(res.data ? describeEnergyTest(res.data) : { ok: false, lines: ["The query ran but returned no data."] });
     });
@@ -58,6 +59,22 @@ export function EnergySection({ settings }: { settings: EnergySettingsView }) {
           className={queryClass}
         />
         <span className="inline-flex items-center gap-1.5"><span className="text-xs text-muted-foreground">Model label</span><TextField name="energy.model_power_label" label="Model label" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="model" mono className="w-40" /></span>
+      </Setting>
+      <Setting
+        label="Requests per model"
+        hint="Optional. If other clients also send requests to your model servers, a query that returns how many requests each model's servers are handling, with the same label. Power is then split across all of them, not only this gateway's."
+        fields={["energy.model_requests_query"]}
+      >
+        <textarea
+          name="energy.model_requests_query"
+          aria-label="Requests per model query"
+          rows={2}
+          value={requestsQuery}
+          onChange={(e) => setRequestsQuery(e.target.value)}
+          placeholder="sum by (model) (requests_running)"
+          spellCheck={false}
+          className={queryClass}
+        />
       </Setting>
       <Setting
         label="Power per node"

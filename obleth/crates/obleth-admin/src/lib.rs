@@ -3826,6 +3826,7 @@ pub struct EnergySettingsView {
     pub power_query: String,
     pub model_power_query: String,
     pub model_power_label: String,
+    pub model_requests_query: String,
     pub poll_interval_secs: u64,
     pub energy_cost_per_kwh: f64,
     pub carbon_g_per_kwh: f64,
@@ -3840,6 +3841,7 @@ impl EnergySettingsView {
             power_query: s.power_query.clone(),
             model_power_query: s.model_power_query.clone(),
             model_power_label: s.model_label().to_string(),
+            model_requests_query: s.model_requests_query.clone(),
             poll_interval_secs: s.poll_interval_secs,
             energy_cost_per_kwh: s.energy_cost_per_kwh,
             carbon_g_per_kwh: s.carbon_g_per_kwh,
@@ -3866,6 +3868,10 @@ pub struct UpdateEnergySettings {
     /// leave unchanged; empty resets it to `model`.
     #[serde(default)]
     pub model_power_label: Option<String>,
+    /// PromQL returning requests in progress per model on its servers.
+    /// Omit to leave unchanged; empty counts only the gateway's requests.
+    #[serde(default)]
+    pub model_requests_query: Option<String>,
     /// Poll cadence in seconds. Omit/zero leaves unchanged.
     #[serde(default)]
     pub poll_interval_secs: Option<u64>,
@@ -3906,6 +3912,11 @@ fn merge_energy_settings(
             .as_deref()
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| existing.model_power_label.clone()),
+        model_requests_query: body
+            .model_requests_query
+            .as_deref()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| existing.model_requests_query.clone()),
         poll_interval_secs: body
             .poll_interval_secs
             .filter(|n| *n > 0)
@@ -3964,6 +3975,7 @@ async fn put_energy_settings(
                 "power_query": settings.power_query,
                 "model_power_query": settings.model_power_query,
                 "model_power_label": settings.model_label(),
+                "model_requests_query": settings.model_requests_query,
                 "poll_interval_secs": settings.poll_interval_secs,
                 "energy_cost_per_kwh": settings.energy_cost_per_kwh,
                 "carbon_g_per_kwh": settings.carbon_g_per_kwh,
@@ -3986,6 +3998,9 @@ pub struct TestEnergyQuery {
     /// The label naming the model in the per-model query's result.
     #[serde(default)]
     pub model_power_label: String,
+    /// Requests in progress per model on its servers, labelled the same way.
+    #[serde(default)]
+    pub model_requests_query: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -4008,6 +4023,10 @@ pub struct ModelPowerTest {
     pub matched: Vec<ModelPowerMatch>,
     /// Series no registered model matches.
     pub unmatched_series: Vec<String>,
+    /// Requests in progress across every series of the requests query, when
+    /// it was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requests_in_progress: Option<f64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -4049,6 +4068,7 @@ fn model_power_test(
             .filter(|k| !used.contains(*k))
             .cloned()
             .collect(),
+        requests_in_progress: None,
     }
 }
 
@@ -4097,7 +4117,15 @@ async fn test_energy_query(
             .await
             .map_err(AdminError::BadRequest)?;
         let models = state.store.list_models().await?;
-        result.models = Some(model_power_test(&series, &models));
+        let mut test = model_power_test(&series, &models);
+        let rq = body.model_requests_query.trim();
+        if !rq.is_empty() {
+            let requests = crate::energy_probe::instant_vector(&http, base, rq, label)
+                .await
+                .map_err(|e| AdminError::BadRequest(format!("requests query: {e}")))?;
+            test.requests_in_progress = Some(requests.values().sum());
+        }
+        result.models = Some(test);
     }
     Ok(Json(result))
 }
@@ -11958,6 +11986,7 @@ mod tests {
             power_query: "node_power_watts".into(),
             model_power_query: String::new(),
             model_power_label: String::new(),
+            model_requests_query: String::new(),
             poll_interval_secs: 30,
             energy_cost_per_kwh: 0.12,
             carbon_g_per_kwh: 400.0,
@@ -12008,6 +12037,7 @@ mod tests {
             power_query: Some("watts".into()),
             model_power_query: Some(" sum by (model) (w) ".into()),
             model_power_label: None,
+            model_requests_query: None,
             poll_interval_secs: None,
             energy_cost_per_kwh: Some(0.15),
             carbon_g_per_kwh: None,

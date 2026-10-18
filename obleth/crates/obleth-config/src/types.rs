@@ -1418,6 +1418,12 @@ pub struct EnergySettings {
     /// The label in `model_power_query`'s result that names the model.
     #[serde(default = "default_model_power_label")]
     pub model_power_label: String,
+    /// Optional PromQL returning how many requests each model's servers are
+    /// handling, labelled like `model_power_query`. Set it when clients
+    /// other than this gateway share the servers: a model's power is then
+    /// split across the larger of the gateway's count and this one.
+    #[serde(default)]
+    pub model_requests_query: String,
     /// Poll cadence in seconds.
     #[serde(default = "default_energy_poll_interval_secs")]
     pub poll_interval_secs: u64,

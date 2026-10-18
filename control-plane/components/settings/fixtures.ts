@@ -41,7 +41,7 @@ export function settingsData(over: Partial<SettingsData> = {}): SettingsData {
     boons: boons(),
     compressor: null,
     knowledge: { enabled: false } as KnowledgeSettingsView,
-    energy: { enabled: false, prometheus_url: "", power_query: "", model_power_query: "", model_power_label: "model", poll_interval_secs: 60, energy_cost_per_kwh: 0, carbon_g_per_kwh: 0, pue: 1 } as EnergySettingsView,
+    energy: { enabled: false, prometheus_url: "", power_query: "", model_power_query: "", model_power_label: "model", model_requests_query: "", poll_interval_secs: 60, energy_cost_per_kwh: 0, carbon_g_per_kwh: 0, pue: 1 } as EnergySettingsView,
     charo: { enabled: true, brain_model: "north-mini-code", tools_enabled: { run_benchmark: true }, bench_max_concurrency: 40, bench_max_duration_s: 120, bench_max_requests: 500 } as CharoSettingsView,
     retention: { days: 180, configured: false },
     slurm: { enabled: false, provisioner_running: true } as SlurmSettingsView,

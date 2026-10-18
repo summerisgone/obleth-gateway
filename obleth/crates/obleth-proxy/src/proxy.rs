@@ -9657,6 +9657,7 @@ mod lifecycle_tests {
             power_query: "watts".into(),
             model_power_query: String::new(),
             model_power_label: String::new(),
+            model_requests_query: String::new(),
             poll_interval_secs: 60,
             energy_cost_per_kwh: 0.10,
             carbon_g_per_kwh: 400.0,

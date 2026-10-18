@@ -289,6 +289,9 @@ export function describeEnergyTest(result: EnergyTestResult): { ok: boolean; lin
     lines.push(m.matched.length
       ? `${m.matched.length} of your models match a series, e.g. ${m.matched.slice(0, 3).map((x) => `${x.model} (${kw(x.watts)})`).join(", ")}.`
       : "None of your models match a series. The label has to carry a model's name, its Service, or its upstream model.");
+    if (m.requests_in_progress !== undefined) {
+      lines.push(`The servers report ${Math.round(m.requests_in_progress)} requests in progress, from every client.`);
+    }
     if (m.unmatched_series.length) {
       const shown = m.unmatched_series.slice(0, 5).join(", ");
       const more = m.unmatched_series.length > 5 ? ` and ${m.unmatched_series.length - 5} more` : "";

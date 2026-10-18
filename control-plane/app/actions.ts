@@ -2118,6 +2118,7 @@ export async function saveSettingsAction(formData: FormData): Promise<SettingsSa
         power_query: String(g("energy", "power_query") ?? "").trim(),
         model_power_query: String(g("energy", "model_power_query") ?? "").trim(),
         model_power_label: trimmed(g("energy", "model_power_label")),
+        model_requests_query: String(g("energy", "model_requests_query") ?? "").trim(),
         poll_interval_secs: num("energy", "poll_interval_secs"),
         energy_cost_per_kwh: num("energy", "energy_cost_per_kwh"),
         carbon_g_per_kwh: num("energy", "carbon_g_per_kwh"),

@@ -77,12 +77,14 @@ describe("the settings model", () => {
         series: 8,
         matched: [{ model: "a", series: "a", watts: 70_000 }, { model: "b", series: "up-b", watts: 29_000 }],
         unmatched_series: ["c", "d", "e", "f", "g", "h"],
+        requests_in_progress: 41.6,
       },
     });
     expect(both.ok).toBe(true);
     expect(both.lines).toEqual([
       "Per model: 298.0 kW across 8 series right now.",
       "2 of your models match a series, e.g. a (70.0 kW), b (29.0 kW).",
+      "The servers report 42 requests in progress, from every client.",
       "No model matches c, d, e, f, g and 1 more; their power is not charged to anyone.",
       "Per node: 414.0 kW across 165 nodes right now.",
     ]);

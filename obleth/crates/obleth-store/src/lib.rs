@@ -8744,6 +8744,7 @@ mod tests {
             power_query: "node_power_watts".into(),
             model_power_query: "sum by (model) (model_power_watts)".into(),
             model_power_label: "model".into(),
+            model_requests_query: "sum by (model) (running_requests)".into(),
             poll_interval_secs: 30,
             energy_cost_per_kwh: 0.12,
             carbon_g_per_kwh: 400.0,
