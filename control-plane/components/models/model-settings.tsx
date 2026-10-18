@@ -401,8 +401,8 @@ export function ModelSettings({
           <Setting
             id="set-energy"
             label="Energy slots per node"
-            hint="0 turns energy accounting off for this model."
-            help="How many of this model's requests one node serves at once when fully loaded (replicas per node × concurrent sequences per replica). Node power is split across this many slots."
+            hint="Only used when Settings → Energy has no power of this model's own. 0 leaves it out."
+            help="How many of this model's requests one node serves at once when fully loaded (replicas per node × concurrent sequences per replica). Node power is split across this many slots. A model with its own measured power ignores this."
             fields={["energy_slots_per_node"]}
             was={{ field: "energy_slots_per_node" }}
           >

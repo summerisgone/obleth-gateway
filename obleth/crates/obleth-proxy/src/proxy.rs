@@ -1740,7 +1740,6 @@ async fn run_pipeline(
         .map(|r| (r.input_cost_per_token, r.output_cost_per_token))
         .unwrap_or((0.0, 0.0));
     let modality_cost = compute_modality_cost(route.as_deref(), &json);
-    let energy_slots = route.as_ref().map(|r| r.energy_slots_per_node).unwrap_or(0);
 
     // ---- response cache (exact-match, before admission so hits cost nothing) ----
     // Tool-loop answers depend on live tool results (e.g. a web search), so a
@@ -1933,6 +1932,8 @@ async fn run_pipeline(
     let admission = admitted.admission;
     let permit = admitted.permit;
     let queue_wait_ms = admitted.waited.as_millis() as u32;
+    // Energy is metered from admission: queue time is never charged.
+    let request_energy = state.energy.request(route.as_deref());
     let admission_ms = (crate::tracer::now_ms() - admission_start) as u32;
     if let Some(ref mut t) = tracer {
         t.record(
@@ -2220,7 +2221,7 @@ async fn run_pipeline(
         in_cost_rate,
         out_cost_rate,
         modality_cost,
-        energy_slots,
+        energy: request_energy,
         holds: TermHolds {
             tenant: tenant_term_held,
             key: key_term_held,
@@ -3572,15 +3573,16 @@ pub(crate) fn estimated_cost(
         + modality_cost
 }
 
-/// Frozen `(cost_usd, energy)` for a settled request. Energy is wall-time
-/// slot-share, so a request that held a slot is charged it even when it
-/// produced nothing billable; only the token-priced cost is waived then.
+/// Frozen `(cost_usd, energy)` for a settled request. Energy follows the
+/// time the request was served, so a request that held a slot is charged it
+/// even when it produced nothing billable; only the token-priced cost is
+/// waived then.
 fn settled_figures(
     energy: &crate::energy::EnergyEngine,
     billed: bool,
     tokens: (u32, u32),
     rates: (f64, f64, f64),
-    energy_slots: i64,
+    request_energy: &crate::energy::RequestEnergy,
     total_ms: u32,
     queue_wait_ms: u32,
 ) -> (f64, crate::energy::EnergyFigures) {
@@ -3592,7 +3594,7 @@ fn settled_figures(
     };
     (
         cost_usd,
-        energy.compute(energy_slots, total_ms, queue_wait_ms),
+        energy.figures(request_energy, total_ms, queue_wait_ms),
     )
 }
 
@@ -3903,7 +3905,7 @@ pub(crate) struct StreamAccounting {
     pub(crate) in_cost_rate: f64,
     pub(crate) out_cost_rate: f64,
     pub(crate) modality_cost: f64,
-    pub(crate) energy_slots: i64,
+    pub(crate) energy: crate::energy::RequestEnergy,
     pub(crate) holds: TermHolds,
 }
 
@@ -4015,7 +4017,7 @@ impl StreamAccounting {
             self.in_cost_rate,
             self.out_cost_rate,
             self.modality_cost,
-            self.energy_slots,
+            &self.energy,
             cache_enabled.then_some((key.as_str(), ttl, content_type.as_str(), body)),
             self.holds,
             billed,
@@ -4058,7 +4060,7 @@ async fn settle_inner(
     in_cost_rate: f64,
     out_cost_rate: f64,
     modality_cost: f64,
-    energy_slots: i64,
+    request_energy: &crate::energy::RequestEnergy,
     cache_put: Option<(&str, i64, &str, String)>,
     holds: TermHolds,
     billed: bool,
@@ -4128,15 +4130,16 @@ async fn settle_inner(
     // Frozen request cost: per-token rates (captured at admission) plus any
     // per-request modality surcharge. Computed once and used for both the
     // term-budget commit and the persisted usage ledger so they agree.
-    // Frozen energy figures: slot-share of live cluster power over serving
-    // time (queue wait excluded). Zeros when accounting is off. Frozen like
-    // `cost_usd` so later settings edits never rewrite history.
+    // Frozen energy figures: the request's share of its model's measured
+    // power, or the slot share of node power, over serving time (queue wait
+    // excluded). Zeros when accounting is off. Frozen like `cost_usd` so
+    // later settings edits never rewrite history.
     let (cost_usd, energy) = settled_figures(
         &state.energy,
         billed,
         (input_tokens, output_tokens),
         (in_cost_rate, out_cost_rate, modality_cost),
-        energy_slots,
+        request_energy,
         total_ms,
         queue_wait_ms,
     );
@@ -9652,6 +9655,8 @@ mod lifecycle_tests {
             enabled: true,
             prometheus_url: "http://prom".into(),
             power_query: "watts".into(),
+            model_power_query: String::new(),
+            model_power_label: String::new(),
             poll_interval_secs: 60,
             energy_cost_per_kwh: 0.10,
             carbon_g_per_kwh: 400.0,
@@ -9663,12 +9668,23 @@ mod lifecycle_tests {
             at_ms: 0,
         });
         // A 503 that produced nothing but held a slot for 2 s.
+        let slots = crate::energy::RequestEnergy {
+            slots: 8,
+            ticket: None,
+        };
         let (cost, figures) =
-            settled_figures(&energy, false, (0, 0), (0.01, 0.02, 0.5), 8, 2_000, 0);
+            settled_figures(&energy, false, (0, 0), (0.01, 0.02, 0.5), &slots, 2_000, 0);
         assert_eq!(cost, 0.0, "no billable output, no cost");
         assert!(figures.energy_wh > 0.0, "slot time is still energy");
-        let (billed_cost, _) =
-            settled_figures(&energy, true, (100, 50), (0.01, 0.02, 0.5), 8, 2_000, 0);
+        let (billed_cost, _) = settled_figures(
+            &energy,
+            true,
+            (100, 50),
+            (0.01, 0.02, 0.5),
+            &slots,
+            2_000,
+            0,
+        );
         assert!((billed_cost - 2.5).abs() < 1e-9);
     }
 

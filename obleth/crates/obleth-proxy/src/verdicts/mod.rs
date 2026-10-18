@@ -831,7 +831,6 @@ async fn handler_inner(
     }
 
     let (in_cost_rate, out_cost_rate) = (route.input_cost_per_token, route.output_cost_per_token);
-    let energy_slots = route.energy_slots_per_node;
 
     // ---- fairshare admission: ONE permit covers the whole fan-out ----
     // Bounded by the same `OBLETH_ADMISSION_TIMEOUT_SECS` wrapper the
@@ -902,6 +901,7 @@ async fn handler_inner(
     let admission = admitted.admission;
     let permit = admitted.permit;
     let queue_wait_ms = admitted.waited.as_millis() as u32;
+    let request_energy = state.energy.request(Some(&route));
     if let Some(ref mut t) = tracer {
         t.record(
             "admission",
@@ -1109,7 +1109,7 @@ async fn handler_inner(
         in_cost_rate,
         out_cost_rate,
         modality_cost: 0.0,
-        energy_slots,
+        energy: request_energy,
         holds: proxy::TermHolds {
             tenant: tenant_term_held,
             key: key_term_held,

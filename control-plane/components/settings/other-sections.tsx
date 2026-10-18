@@ -11,46 +11,79 @@ import { Pill } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import type { CharoSettingsView, CompressorStatusView, EnergySettingsView, ModelRoute, SlurmSettingsView, UsageRetentionView } from "@/lib/obleth";
-import { describeResync } from "@/lib/settings-model";
+import { describeEnergyTest, describeResync } from "@/lib/settings-model";
 import { cn } from "@/lib/utils";
 
 /** Reads power from Prometheus to put watts, cost and CO₂ on Reports and the Overview. */
 export function EnergySection({ settings }: { settings: EnergySettingsView }) {
   const [on, setOn] = useState(settings.enabled);
   const [url, setUrl] = useState(settings.prometheus_url);
+  const [modelQuery, setModelQuery] = useState(settings.model_power_query);
+  const [label, setLabel] = useState(settings.model_power_label);
   const [query, setQuery] = useState(settings.power_query);
   const [testing, start] = useTransition();
-  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const [result, setResult] = useState<{ ok: boolean; lines: string[] } | null>(null);
+  const hasQuery = !!(modelQuery.trim() || query.trim());
   function test() {
     setResult(null);
     start(async () => {
-      const res = await testEnergyQueryAction(url.trim(), query.trim());
-      if (!res.ok) return setResult({ ok: false, text: res.error });
-      setResult(res.data && res.data.node_count ? { ok: true, text: `${(res.data.cluster_watts / 1000).toFixed(1)} kW across ${res.data.node_count} node${res.data.node_count === 1 ? "" : "s"} right now.` } : { ok: false, text: "The query ran but returned no data." });
+      const res = await testEnergyQueryAction({ prometheus_url: url.trim(), power_query: query.trim(), model_power_query: modelQuery.trim(), model_power_label: label.trim() });
+      if (!res.ok) return setResult({ ok: false, lines: [res.error] });
+      setResult(res.data ? describeEnergyTest(res.data) : { ok: false, lines: ["The query ran but returned no data."] });
     });
   }
+  const queryClass = "w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-[12.5px] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
   return (
     <SettingsCard id="energy" title="Energy" description="Reads power from Prometheus to put watts, cost and CO₂ on Reports and the Overview." action={<Pill><Glyph glyph={settings.enabled ? "on" : "off"} className="h-[7px] w-[7px]" />{settings.enabled ? "On" : "Off"}</Pill>}>
       <Setting id="set-energy" label="Energy" hint="Off, no energy numbers are shown anywhere." fields={["energy.enabled"]} was={{ field: "energy.enabled", checkbox: true }}>
         <Switch name="energy.enabled" label="Energy on" checked={on} onChange={setOn} />
       </Setting>
-      <Setting label="Prometheus" hint="Its URL and a PromQL query that returns watts per node." fields={["energy.prometheus_url", "energy.power_query"]}>
+      <Setting label="Prometheus" hint="Where the gateway reads power from." fields={["energy.prometheus_url"]}>
         <TextField name="energy.prometheus_url" label="Prometheus URL" type="url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="http://prometheus.monitoring:9090" mono />
+      </Setting>
+      <Setting
+        label="Power per model"
+        hint="A query that returns watts for each model. A model's power is split between the requests it is serving at the time, across every gateway replica."
+        help="The label names the model: its name, its capacity Service, or its upstream model. Time a model sits idle is charged to nobody."
+        fields={["energy.model_power_query", "energy.model_power_label"]}
+      >
+        <textarea
+          name="energy.model_power_query"
+          aria-label="Power per model query"
+          rows={3}
+          value={modelQuery}
+          onChange={(e) => setModelQuery(e.target.value)}
+          placeholder="sum by (model) (model_power_watts)"
+          spellCheck={false}
+          className={queryClass}
+        />
+        <span className="inline-flex items-center gap-1.5"><span className="text-xs text-muted-foreground">Model label</span><TextField name="energy.model_power_label" label="Model label" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="model" mono className="w-40" /></span>
+      </Setting>
+      <Setting
+        label="Power per node"
+        hint="For models with no power of their own above: a query that returns watts for each node. The average node is split into each model's energy slots."
+        fields={["energy.power_query"]}
+      >
         <textarea
           name="energy.power_query"
-          aria-label="Power query"
+          aria-label="Power per node query"
           rows={2}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="sum by (instance) (node_power_watts)"
           spellCheck={false}
-          className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-[12.5px] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          className={queryClass}
         />
+      </Setting>
+      <Setting label="Test" hint="Runs what's typed above, before you save, and shows which of your models it covers.">
         <div className="flex flex-wrap items-center gap-3">
-          <Button type="button" variant="outline" size="sm" disabled={testing || !url.trim() || !query.trim()} onClick={test}>{testing ? "Testing…" : "Test the query"}</Button>
-          <span className="text-xs text-muted-foreground">Uses what's typed here, before you save.</span>
+          <Button type="button" variant="outline" size="sm" disabled={testing || !url.trim() || !hasQuery} onClick={test}>{testing ? "Testing…" : "Test the queries"}</Button>
         </div>
-        {result && <p role="status" className={cn("text-[12.5px]", !result.ok && "font-medium")}>{result.text}</p>}
+        {result && (
+          <div role="status" className={cn("space-y-1 text-[12.5px]", !result.ok && "font-medium")}>
+            {result.lines.map((line) => <p key={line}>{line}</p>)}
+          </div>
+        )}
       </Setting>
       <Setting label="Costs" hint="How often power is read, what a kWh costs, grams of CO₂ per kWh, and the data centre's PUE." fields={["energy.poll_interval_secs", "energy.energy_cost_per_kwh", "energy.carbon_g_per_kwh", "energy.pue"]}>
         <div className="flex flex-wrap items-center gap-3">

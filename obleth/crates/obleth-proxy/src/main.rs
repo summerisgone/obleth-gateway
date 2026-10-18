@@ -492,6 +492,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     energy::spawn_energy_poller(energy.clone(), http.clone(), alerts.clone());
+    energy::spawn_energy_in_flight_sync(energy.clone(), fairshare.clone());
 
     // Keep the in-process knowledge index fresh: unchanged collections reuse
     // their existing `Arc` (see `refresh_once`), so this is cheap once the

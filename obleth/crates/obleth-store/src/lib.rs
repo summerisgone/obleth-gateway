@@ -8742,6 +8742,8 @@ mod tests {
             enabled: true,
             prometheus_url: "http://prom:9090".into(),
             power_query: "node_power_watts".into(),
+            model_power_query: "sum by (model) (model_power_watts)".into(),
+            model_power_label: "model".into(),
             poll_interval_secs: 30,
             energy_cost_per_kwh: 0.12,
             carbon_g_per_kwh: 400.0,

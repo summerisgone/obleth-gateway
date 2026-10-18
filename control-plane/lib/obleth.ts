@@ -1684,6 +1684,8 @@ export interface EnergySettingsView {
   enabled: boolean;
   prometheus_url: string;
   power_query: string;
+  model_power_query: string;
+  model_power_label: string;
   poll_interval_secs: number;
   energy_cost_per_kwh: number;
   carbon_g_per_kwh: number;
@@ -1694,15 +1696,36 @@ export interface UpdateEnergySettings {
   enabled?: boolean;
   prometheus_url?: string;
   power_query?: string;
+  model_power_query?: string;
+  model_power_label?: string;
   poll_interval_secs?: number;
   energy_cost_per_kwh?: number;
   carbon_g_per_kwh?: number;
   pue?: number;
 }
 
+export interface EnergyTestQuery {
+  prometheus_url: string;
+  power_query: string;
+  model_power_query: string;
+  model_power_label: string;
+}
+
+export interface ModelPowerMatch {
+  model: string;
+  series: string;
+  watts: number;
+}
+
 export interface EnergyTestResult {
   cluster_watts: number;
   node_count: number;
+  models?: {
+    total_watts: number;
+    series: number;
+    matched: ModelPowerMatch[];
+    unmatched_series: string[];
+  };
 }
 
 export interface ChannelResult {
@@ -2810,10 +2833,10 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  testEnergyQuery: (prometheus_url: string, power_query: string) =>
+  testEnergyQuery: (query: EnergyTestQuery) =>
     api<EnergyTestResult>("/settings/energy/test", {
       method: "POST",
-      body: JSON.stringify({ prometheus_url, power_query }),
+      body: JSON.stringify(query),
     }),
   getSlurmSettings: reactCache(() => api<SlurmSettingsView>("/settings/slurm")),
   setSlurmSettings: (body: UpdateSlurmSettings, options?: AuditOptions) =>

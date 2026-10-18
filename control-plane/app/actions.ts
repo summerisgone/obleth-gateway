@@ -15,6 +15,7 @@ import type {
   ConfigBackup,
   CharoSettingsView,
   CompressionPolicy,
+  EnergyTestQuery,
   EnergyTestResult,
   GuardrailsPolicy,
   ModelImportReport,
@@ -2115,6 +2116,8 @@ export async function saveSettingsAction(formData: FormData): Promise<SettingsSa
         enabled: g("energy", "enabled") === "on",
         prometheus_url: trimmed(g("energy", "prometheus_url")),
         power_query: String(g("energy", "power_query") ?? "").trim(),
+        model_power_query: String(g("energy", "model_power_query") ?? "").trim(),
+        model_power_label: trimmed(g("energy", "model_power_label")),
         poll_interval_secs: num("energy", "poll_interval_secs"),
         energy_cost_per_kwh: num("energy", "energy_cost_per_kwh"),
         carbon_g_per_kwh: num("energy", "carbon_g_per_kwh"),
@@ -2123,6 +2126,7 @@ export async function saveSettingsAction(formData: FormData): Promise<SettingsSa
       if (body.poll_interval_secs !== undefined && body.poll_interval_secs < 10) return fail(section, "Poll at most every 10 seconds.");
       if (body.pue !== undefined && body.pue < 1) return fail(section, "PUE is 1 or more.");
       if (body.enabled && !body.prometheus_url) return fail(section, "Energy needs a Prometheus URL.");
+      if (body.enabled && !body.power_query && !body.model_power_query) return fail(section, "Energy needs a power query, per model or per node.");
       res = await setEnergySettingsAction(body);
     } else if (section === "assistant") {
       const limits = ["bench_max_concurrency", "bench_max_duration_s", "bench_max_requests"].map((k) => num("assistant", k));
@@ -2289,12 +2293,11 @@ export async function setEnergySettingsAction(
 }
 
 export async function testEnergyQueryAction(
-  prometheusUrl: string,
-  powerQuery: string,
+  query: EnergyTestQuery,
 ): Promise<ActionResult & { data?: EnergyTestResult }> {
   await requireAdmin();
   try {
-    const data = await obleth.testEnergyQuery(prometheusUrl, powerQuery);
+    const data = await obleth.testEnergyQuery(query);
     return { ok: true, data };
   } catch (e) {
     return actionError(e);
