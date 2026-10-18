@@ -868,6 +868,8 @@ export interface UsageLogEntry {
   model_variant?: string;
   /** The model family the client named; `model` is the member that answered. Absent from older gateways. */
   model_family?: string;
+  /** Whether the reply was relayed as an event stream. Only a streamed reply has a first token: `ttft_ms` is 0 on the others. Rows from before the gateway recorded it read false and may still hold a first-token time equal to the whole reply. Absent from older gateways. */
+  streamed?: boolean;
   /** The reasoning effort served (none, low, medium, high), "unsupported" when it was removed, or empty when it went through as sent. Absent from older gateways. */
   reasoning_effort?: string;
   /** The reasoning effort the caller asked for, or empty. Absent from older gateways. */
@@ -1682,6 +1684,9 @@ export interface EnergySettingsView {
   enabled: boolean;
   prometheus_url: string;
   power_query: string;
+  model_power_query: string;
+  model_power_label: string;
+  model_requests_query: string;
   poll_interval_secs: number;
   energy_cost_per_kwh: number;
   carbon_g_per_kwh: number;
@@ -1692,15 +1697,39 @@ export interface UpdateEnergySettings {
   enabled?: boolean;
   prometheus_url?: string;
   power_query?: string;
+  model_power_query?: string;
+  model_power_label?: string;
+  model_requests_query?: string;
   poll_interval_secs?: number;
   energy_cost_per_kwh?: number;
   carbon_g_per_kwh?: number;
   pue?: number;
 }
 
+export interface EnergyTestQuery {
+  prometheus_url: string;
+  power_query: string;
+  model_power_query: string;
+  model_power_label: string;
+  model_requests_query: string;
+}
+
+export interface ModelPowerMatch {
+  model: string;
+  series: string;
+  watts: number;
+}
+
 export interface EnergyTestResult {
   cluster_watts: number;
   node_count: number;
+  models?: {
+    total_watts: number;
+    series: number;
+    matched: ModelPowerMatch[];
+    unmatched_series: string[];
+    requests_in_progress?: number;
+  };
 }
 
 export interface ChannelResult {
@@ -2808,10 +2837,10 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  testEnergyQuery: (prometheus_url: string, power_query: string) =>
+  testEnergyQuery: (query: EnergyTestQuery) =>
     api<EnergyTestResult>("/settings/energy/test", {
       method: "POST",
-      body: JSON.stringify({ prometheus_url, power_query }),
+      body: JSON.stringify(query),
     }),
   getSlurmSettings: reactCache(() => api<SlurmSettingsView>("/settings/slurm")),
   setSlurmSettings: (body: UpdateSlurmSettings, options?: AuditOptions) =>

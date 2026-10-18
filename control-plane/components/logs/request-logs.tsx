@@ -136,7 +136,7 @@ function Row({ row, selected, onOpen, now }: { row: UsageLogEntry; selected: boo
       </td>
       <td className="whitespace-nowrap py-2 pr-3 text-right font-mono text-[12px]">{tokens(row.input_tokens)} → {tokens(row.output_tokens)}</td>
       <td className="py-2 pr-3">
-        <div className="flex items-center gap-2.5" title={`waited ${duration(t.wait)} · first token after ${duration(t.wait + t.first)} · ${duration(t.total)} in all`}>
+        <div className="flex items-center gap-2.5" title={row.ttft_ms > 0 ? `waited ${duration(t.wait)} · first token after ${duration(t.wait + t.first)} · ${duration(t.total)} in all` : `waited ${duration(t.wait)} · ${duration(t.total)} in all${row.streamed === false ? " · not streamed" : ""}`}>
           <span className="flex h-1.5 min-w-[6rem] flex-1 overflow-hidden rounded-full bg-muted/50">
             <span className="bg-muted-foreground/40" style={{ width: pct(t.wait) }} />
             <span className="bg-muted-foreground" style={{ width: pct(t.first) }} />

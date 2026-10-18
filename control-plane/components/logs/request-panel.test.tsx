@@ -223,6 +223,16 @@ describe("the request panel", () => {
     expect(fact("Reasoning effort")).toBeNull();
   });
 
+  it("says a buffered reply has no first token rather than timing its last", async () => {
+    await show(entry({ streamed: false, ttft_ms: 0 }));
+    expect(fact("First token")!.textContent).toBe("Not streamed");
+    await show(entry({ request_id: "a1000000-0000-0000-0000-000000000000", streamed: true, ttft_ms: 400 }));
+    expect(fact("First token")!.textContent).toBe("400 ms");
+    // A row from a gateway that did not record it.
+    await show(entry({ request_id: "a2000000-0000-0000-0000-000000000000", ttft_ms: 0 }));
+    expect(fact("First token")!.textContent).toBe("—");
+  });
+
   it("lists the helper calls a client request made, oldest first, each linked to its own row", async () => {
     helpers = [check, draft];
     await show(entry());

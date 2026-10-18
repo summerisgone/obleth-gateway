@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { alerts, boons, model, readiness, router } from "@/components/settings/fixtures";
-import { ROUTER_PROFILES, SPEC_PROFILES, boonSummary, describeResync, modelsAsking, needsYou, routerProfileOf, routerValues, sectionOfField, specProfileOf, specValues } from "./settings-model";
+import { ROUTER_PROFILES, SPEC_PROFILES, boonSummary, describeEnergyTest, describeResync, modelsAsking, needsYou, routerProfileOf, routerValues, sectionOfField, specProfileOf, specValues } from "./settings-model";
 
 const base = { alerts: alerts(), boons: boons(), knowledge: null, models: [], readiness: readiness(), slurm: null, compressor: null, router: router() };
 
@@ -66,5 +66,34 @@ describe("the settings model", () => {
 
   it("describes a cache reconcile in words", () => {
     expect(describeResync({ keys: 3, models: 1, mcp_servers: 0, keys_pruned: 0, model_names_pruned: 0, mcp_servers_pruned: 0 })).toContain("3 keys");
+  });
+
+  it("says what an energy test found, per model and per node", () => {
+    const both = describeEnergyTest({
+      cluster_watts: 414_000,
+      node_count: 165,
+      models: {
+        total_watts: 298_000,
+        series: 8,
+        matched: [{ model: "a", series: "a", watts: 70_000 }, { model: "b", series: "up-b", watts: 29_000 }],
+        unmatched_series: ["c", "d", "e", "f", "g", "h"],
+        requests_in_progress: 41.6,
+      },
+    });
+    expect(both.ok).toBe(true);
+    expect(both.lines).toEqual([
+      "Per model: 298.0 kW across 8 series right now.",
+      "2 of your models match a series, e.g. a (70.0 kW), b (29.0 kW).",
+      "The servers report 42 requests in progress, from every client.",
+      "No model matches c, d, e, f, g and 1 more; their power is not charged to anyone.",
+      "Per node: 414.0 kW across 165 nodes right now.",
+    ]);
+  });
+
+  it("flags a per-model query that matches no model", () => {
+    const none = describeEnergyTest({ cluster_watts: 0, node_count: 0, models: { total_watts: 100, series: 1, matched: [], unmatched_series: ["x"] } });
+    expect(none.ok).toBe(false);
+    expect(none.lines[1]).toContain("None of your models match");
+    expect(describeEnergyTest({ cluster_watts: 0, node_count: 0 })).toEqual({ ok: false, lines: ["The query ran but returned no data."] });
   });
 });

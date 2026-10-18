@@ -1223,6 +1223,8 @@ async fn run_pipeline(
         reasoning_effort: String::new(),
         reasoning_effort_requested: String::new(),
         model_family: String::new(),
+        // Set once the upstream answers.
+        streamed: false,
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -1738,7 +1740,6 @@ async fn run_pipeline(
         .map(|r| (r.input_cost_per_token, r.output_cost_per_token))
         .unwrap_or((0.0, 0.0));
     let modality_cost = compute_modality_cost(route.as_deref(), &json);
-    let energy_slots = route.as_ref().map(|r| r.energy_slots_per_node).unwrap_or(0);
 
     // ---- response cache (exact-match, before admission so hits cost nothing) ----
     // Tool-loop answers depend on live tool results (e.g. a web search), so a
@@ -1931,6 +1932,8 @@ async fn run_pipeline(
     let admission = admitted.admission;
     let permit = admitted.permit;
     let queue_wait_ms = admitted.waited.as_millis() as u32;
+    // Energy is metered from admission: queue time is never charged.
+    let request_energy = state.energy.request(route.as_deref());
     let admission_ms = (crate::tracer::now_ms() - admission_start) as u32;
     if let Some(ref mut t) = tracer {
         t.record(
@@ -2218,7 +2221,7 @@ async fn run_pipeline(
         in_cost_rate,
         out_cost_rate,
         modality_cost,
-        energy_slots,
+        energy: request_energy,
         holds: TermHolds {
             tenant: tenant_term_held,
             key: key_term_held,
@@ -2821,6 +2824,11 @@ async fn run_pipeline(
             Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "video create failed"),
         };
     }
+
+    // Only a reply relayed as an event stream has a first token to time; see
+    // `finalize`.
+    let mut accounting = accounting;
+    accounting.meta.streamed = relays_event_stream(&content_type_str);
 
     // Extract guardrails policy for log_only output scanning (evaluated after stream drains).
     let scan_policy = resolved
@@ -3565,15 +3573,16 @@ pub(crate) fn estimated_cost(
         + modality_cost
 }
 
-/// Frozen `(cost_usd, energy)` for a settled request. Energy is wall-time
-/// slot-share, so a request that held a slot is charged it even when it
-/// produced nothing billable; only the token-priced cost is waived then.
+/// Frozen `(cost_usd, energy)` for a settled request. Energy follows the
+/// time the request was served, so a request that held a slot is charged it
+/// even when it produced nothing billable; only the token-priced cost is
+/// waived then.
 fn settled_figures(
     energy: &crate::energy::EnergyEngine,
     billed: bool,
     tokens: (u32, u32),
     rates: (f64, f64, f64),
-    energy_slots: i64,
+    request_energy: &crate::energy::RequestEnergy,
     total_ms: u32,
     queue_wait_ms: u32,
 ) -> (f64, crate::energy::EnergyFigures) {
@@ -3585,7 +3594,7 @@ fn settled_figures(
     };
     (
         cost_usd,
-        energy.compute(energy_slots, total_ms, queue_wait_ms),
+        energy.figures(request_energy, total_ms, queue_wait_ms),
     )
 }
 
@@ -3896,7 +3905,7 @@ pub(crate) struct StreamAccounting {
     pub(crate) in_cost_rate: f64,
     pub(crate) out_cost_rate: f64,
     pub(crate) modality_cost: f64,
-    pub(crate) energy_slots: i64,
+    pub(crate) energy: crate::energy::RequestEnergy,
     pub(crate) holds: TermHolds,
 }
 
@@ -4008,7 +4017,7 @@ impl StreamAccounting {
             self.in_cost_rate,
             self.out_cost_rate,
             self.modality_cost,
-            self.energy_slots,
+            &self.energy,
             cache_enabled.then_some((key.as_str(), ttl, content_type.as_str(), body)),
             self.holds,
             billed,
@@ -4051,7 +4060,7 @@ async fn settle_inner(
     in_cost_rate: f64,
     out_cost_rate: f64,
     modality_cost: f64,
-    energy_slots: i64,
+    request_energy: &crate::energy::RequestEnergy,
     cache_put: Option<(&str, i64, &str, String)>,
     holds: TermHolds,
     billed: bool,
@@ -4121,15 +4130,16 @@ async fn settle_inner(
     // Frozen request cost: per-token rates (captured at admission) plus any
     // per-request modality surcharge. Computed once and used for both the
     // term-budget commit and the persisted usage ledger so they agree.
-    // Frozen energy figures: slot-share of live cluster power over serving
-    // time (queue wait excluded). Zeros when accounting is off. Frozen like
-    // `cost_usd` so later settings edits never rewrite history.
+    // Frozen energy figures: the request's share of its model's measured
+    // power, or the slot share of node power, over serving time (queue wait
+    // excluded). Zeros when accounting is off. Frozen like `cost_usd` so
+    // later settings edits never rewrite history.
     let (cost_usd, energy) = settled_figures(
         &state.energy,
         billed,
         (input_tokens, output_tokens),
         (in_cost_rate, out_cost_rate, modality_cost),
-        energy_slots,
+        request_energy,
         total_ms,
         queue_wait_ms,
     );
@@ -6067,6 +6077,9 @@ pub(crate) struct RequestMeta {
     pub(crate) reasoning_effort_requested: String,
     /// The model family the client called by name, else empty.
     pub(crate) model_family: String,
+    /// Whether the reply is relayed to the client as an event stream, known
+    /// once the upstream answers; see `UsageRecord::streamed`.
+    pub(crate) streamed: bool,
 }
 
 /// The name a response cache entry is keyed by.
@@ -6387,6 +6400,24 @@ fn fnv1a_continue(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Whether an upstream reply with this content type reaches the client as it
+/// is produced: an event stream, rather than one body sent when it is done.
+fn relays_event_stream(content_type: &str) -> bool {
+    content_type.contains("text/event-stream")
+}
+
+/// The first-token time a request records. A first token is timed only on a
+/// reply streamed to the client as it is produced: a buffered reply's first
+/// byte arrives with its last, so its "first token" would be its whole
+/// duration and skew every latency figure built on it.
+fn recorded_ttft(streamed: bool, ttft_ms: u32) -> u32 {
+    if streamed {
+        ttft_ms
+    } else {
+        0
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finalize(
     state: &AppState,
@@ -6407,6 +6438,7 @@ pub(crate) fn finalize(
     cost_usd: f64,
     energy: crate::energy::EnergyFigures,
 ) {
+    let ttft_ms = recorded_ttft(meta.streamed, ttft_ms);
     state
         .metrics
         .record_request(admission.as_str(), status_code, input_tokens, output_tokens);
@@ -6450,6 +6482,7 @@ pub(crate) fn finalize(
         model_family: meta.model_family.clone(),
         key_name: resolved.key_name.clone(),
         tenant_name: resolved.tenant_name.clone(),
+        streamed: meta.streamed,
     });
 }
 
@@ -8832,6 +8865,18 @@ mod tests {
     }
 
     #[test]
+    fn only_a_streamed_reply_records_a_first_token() {
+        assert!(super::relays_event_stream("text/event-stream"));
+        assert!(super::relays_event_stream(
+            "text/event-stream; charset=utf-8"
+        ));
+        assert!(!super::relays_event_stream("application/json"));
+        assert_eq!(super::recorded_ttft(true, 420), 420);
+        // A buffered reply's first byte is its last: no first token.
+        assert_eq!(super::recorded_ttft(false, 34_800), 0);
+    }
+
+    #[test]
     fn request_meta_carries_device_id_into_usage_record() {
         let meta = RequestMeta {
             session_id: String::new(),
@@ -8843,6 +8888,7 @@ mod tests {
             reasoning_effort: String::new(),
             reasoning_effort_requested: String::new(),
             model_family: String::new(),
+            streamed: false,
         };
         assert_eq!(meta.device_id, "dev-1");
     }
@@ -9237,6 +9283,7 @@ mod lifecycle_tests {
             reasoning_effort: String::new(),
             reasoning_effort_requested: String::new(),
             model_family: String::new(),
+            streamed: false,
         };
         super::record_called_name(&mut meta, Some("acme"), Some("acme"));
         assert_eq!(meta.model_family, "acme");
@@ -9608,6 +9655,9 @@ mod lifecycle_tests {
             enabled: true,
             prometheus_url: "http://prom".into(),
             power_query: "watts".into(),
+            model_power_query: String::new(),
+            model_power_label: String::new(),
+            model_requests_query: String::new(),
             poll_interval_secs: 60,
             energy_cost_per_kwh: 0.10,
             carbon_g_per_kwh: 400.0,
@@ -9619,12 +9669,23 @@ mod lifecycle_tests {
             at_ms: 0,
         });
         // A 503 that produced nothing but held a slot for 2 s.
+        let slots = crate::energy::RequestEnergy {
+            slots: 8,
+            ticket: None,
+        };
         let (cost, figures) =
-            settled_figures(&energy, false, (0, 0), (0.01, 0.02, 0.5), 8, 2_000, 0);
+            settled_figures(&energy, false, (0, 0), (0.01, 0.02, 0.5), &slots, 2_000, 0);
         assert_eq!(cost, 0.0, "no billable output, no cost");
         assert!(figures.energy_wh > 0.0, "slot time is still energy");
-        let (billed_cost, _) =
-            settled_figures(&energy, true, (100, 50), (0.01, 0.02, 0.5), 8, 2_000, 0);
+        let (billed_cost, _) = settled_figures(
+            &energy,
+            true,
+            (100, 50),
+            (0.01, 0.02, 0.5),
+            &slots,
+            2_000,
+            0,
+        );
         assert!((billed_cost - 2.5).abs() < 1e-9);
     }
 

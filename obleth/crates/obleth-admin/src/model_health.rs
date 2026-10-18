@@ -1462,6 +1462,7 @@ fn build_probe_usage(
         model_family: String::new(),
         key_name: String::new(),
         tenant_name: String::new(),
+        streamed: false,
     }
 }
 

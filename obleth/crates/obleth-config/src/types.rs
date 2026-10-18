@@ -1221,6 +1221,12 @@ pub struct UsageRecord {
     pub key_name: String,
     #[serde(default)]
     pub tenant_name: String,
+    /// Whether the reply reached the client as the upstream produced it (an
+    /// event stream). `ttft_ms` is measured only then: a buffered reply's
+    /// first byte is its last, so it records 0 there. `#[serde(default)]`
+    /// keeps older WAL records replayable.
+    #[serde(default)]
+    pub streamed: bool,
 }
 
 /// Runtime-configurable retention for the raw per-request `usage` ledger.
@@ -1382,6 +1388,10 @@ fn default_pue() -> f64 {
     1.0
 }
 
+fn default_model_power_label() -> String {
+    "model".to_string()
+}
+
 /// System-wide energy & carbon accounting settings, stored as a single
 /// `app_settings` row (key `energy`) like the other global settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1398,6 +1408,22 @@ pub struct EnergySettings {
     /// of this expression, so any exporter (Habana, DCGM, IPMI) works.
     #[serde(default)]
     pub power_query: String,
+    /// Operator-supplied PromQL returning one power series (watts) per
+    /// model, named by the `model_power_label` label. A model whose name,
+    /// capacity Service or upstream model matches a series is charged a
+    /// share of that measured power, split across the requests it is
+    /// serving cluster-wide, instead of the node slot share.
+    #[serde(default)]
+    pub model_power_query: String,
+    /// The label in `model_power_query`'s result that names the model.
+    #[serde(default = "default_model_power_label")]
+    pub model_power_label: String,
+    /// Optional PromQL returning how many requests each model's servers are
+    /// handling, labelled like `model_power_query`. Set it when clients
+    /// other than this gateway share the servers: a model's power is then
+    /// split across the larger of the gateway's count and this one.
+    #[serde(default)]
+    pub model_requests_query: String,
     /// Poll cadence in seconds.
     #[serde(default = "default_energy_poll_interval_secs")]
     pub poll_interval_secs: u64,
@@ -1419,11 +1445,20 @@ impl Default for EnergySettings {
 }
 
 impl EnergySettings {
-    /// True when the feature is on and the Prometheus target is configured.
+    /// True when the feature is on and the Prometheus target is configured
+    /// with at least one of the two queries.
     pub fn active(&self) -> bool {
         self.enabled
             && !self.prometheus_url.trim().is_empty()
-            && !self.power_query.trim().is_empty()
+            && (!self.power_query.trim().is_empty() || !self.model_power_query.trim().is_empty())
+    }
+
+    /// The label naming the model in `model_power_query`'s result.
+    pub fn model_label(&self) -> &str {
+        match self.model_power_label.trim() {
+            "" => "model",
+            label => label,
+        }
     }
 }
 
@@ -4162,6 +4197,20 @@ mod tests {
             ..Default::default()
         };
         assert!(active.active());
+        assert_eq!(s.model_label(), "model");
+        let measured = EnergySettings {
+            enabled: true,
+            prometheus_url: "http://prom:9090".into(),
+            model_power_query: "model_power_watts".into(),
+            model_power_label: " ".into(),
+            ..Default::default()
+        };
+        assert!(measured.active(), "a model query alone is enough");
+        assert_eq!(
+            measured.model_label(),
+            "model",
+            "a blank label reads as the default"
+        );
     }
 
     #[test]

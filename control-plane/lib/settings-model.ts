@@ -3,6 +3,7 @@ import type {
   AutoRouterSettingsView,
   BoonSettingsView,
   CompressorStatusView,
+  EnergyTestResult,
   KnowledgeSettingsView,
   ModelRoute,
   RouterReadinessView,
@@ -273,6 +274,38 @@ function plural(n: number, noun: string): string {
 }
 
 /** What a cache reconcile did, in a sentence. */
+function kw(watts: number): string {
+  return `${(watts / 1000).toFixed(1)} kW`;
+}
+
+/** What a Test of the energy queries found, in sentences. Each entry is one line. */
+export function describeEnergyTest(result: EnergyTestResult): { ok: boolean; lines: string[] } {
+  const lines: string[] = [];
+  let ok = false;
+  const m = result.models;
+  if (m) {
+    ok = m.matched.length > 0;
+    lines.push(`Per model: ${kw(m.total_watts)} across ${m.series} series right now.`);
+    lines.push(m.matched.length
+      ? `${m.matched.length} of your models match a series, e.g. ${m.matched.slice(0, 3).map((x) => `${x.model} (${kw(x.watts)})`).join(", ")}.`
+      : "None of your models match a series. The label has to carry a model's name, its Service, or its upstream model.");
+    if (m.requests_in_progress !== undefined) {
+      lines.push(`The servers report ${Math.round(m.requests_in_progress)} requests in progress, from every client.`);
+    }
+    if (m.unmatched_series.length) {
+      const shown = m.unmatched_series.slice(0, 5).join(", ");
+      const more = m.unmatched_series.length > 5 ? ` and ${m.unmatched_series.length - 5} more` : "";
+      lines.push(`No model matches ${shown}${more}; their power is not charged to anyone.`);
+    }
+  }
+  if (result.node_count) {
+    ok = true;
+    lines.push(`Per node: ${kw(result.cluster_watts)} across ${plural(result.node_count, "node")} right now.`);
+  }
+  if (!lines.length) lines.push("The query ran but returned no data.");
+  return { ok, lines };
+}
+
 export function describeResync(report: { keys: number; models: number; mcp_servers: number; keys_pruned: number; model_names_pruned: number; mcp_servers_pruned: number }): string {
   const republished = `Republished ${plural(report.keys, "key")}, ${plural(report.models, "model")}, and ${plural(report.mcp_servers, "MCP server")}.`;
   const evicted = report.keys_pruned + report.model_names_pruned + report.mcp_servers_pruned;
