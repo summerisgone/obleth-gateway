@@ -7,7 +7,7 @@ use std::env;
 use std::fmt;
 use std::time::Duration;
 
-use crate::{FairshareAlgorithm, VideoJobScope};
+use crate::{FairshareAlgorithm, JobScope};
 
 /// Top-level gateway configuration.
 #[derive(Debug, Clone)]
@@ -129,7 +129,7 @@ pub struct Config {
     /// Who may poll, download, delete and list a video job
     /// (`OBLETH_VIDEO_JOB_SCOPE`): the key that created it (`key`, the
     /// default) or any key of its tenant (`tenant`).
-    pub video_job_scope: VideoJobScope,
+    pub job_scope: JobScope,
 
     /// Settings that were present but invalid and fell back to a safe
     /// default, one message each. Logged at startup once tracing is up (this
@@ -277,7 +277,7 @@ impl Default for RedisTimeouts {
 impl Config {
     pub fn from_env() -> Self {
         let mut warnings = Vec::new();
-        let video_job_scope = video_job_scope(
+        let job_scope = job_scope(
             env::var("OBLETH_VIDEO_JOB_SCOPE").ok().as_deref(),
             &mut warnings,
         );
@@ -357,7 +357,7 @@ impl Config {
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             auto_classifier_timeout_ms: parse_or("OBLETH_AUTO_CLASSIFIER_TIMEOUT_MS", 250),
-            video_job_scope,
+            job_scope,
             warnings,
         }
     }
@@ -388,13 +388,13 @@ fn replica_heartbeat_timing(interval_secs: u64, ttl_secs: u64) -> (Duration, Dur
 /// `OBLETH_VIDEO_JOB_SCOPE`. An unrecognised value falls back to `key`, the
 /// narrower scope, with a warning: a typo must never share every user's jobs
 /// across the tenant.
-fn video_job_scope(raw: Option<&str>, warnings: &mut Vec<String>) -> VideoJobScope {
-    VideoJobScope::parse(raw).unwrap_or_else(|bad| {
+fn job_scope(raw: Option<&str>, warnings: &mut Vec<String>) -> JobScope {
+    JobScope::parse(raw).unwrap_or_else(|bad| {
         warnings.push(format!(
             "OBLETH_VIDEO_JOB_SCOPE={bad:?} is not `key` or `tenant`; using `key` \
              (video jobs private to the key that created them)"
         ));
-        VideoJobScope::Key
+        JobScope::Key
     })
 }
 
@@ -590,25 +590,16 @@ mod tests {
     #[test]
     fn video_job_scope_defaults_to_key_and_falls_back_to_it_with_a_warning() {
         let mut warnings = Vec::new();
-        assert_eq!(video_job_scope(None, &mut warnings), VideoJobScope::Key);
-        assert_eq!(video_job_scope(Some(""), &mut warnings), VideoJobScope::Key);
-        assert_eq!(
-            video_job_scope(Some(" Key "), &mut warnings),
-            VideoJobScope::Key
-        );
-        assert_eq!(
-            video_job_scope(Some("TENANT"), &mut warnings),
-            VideoJobScope::Tenant
-        );
+        assert_eq!(job_scope(None, &mut warnings), JobScope::Key);
+        assert_eq!(job_scope(Some(""), &mut warnings), JobScope::Key);
+        assert_eq!(job_scope(Some(" Key "), &mut warnings), JobScope::Key);
+        assert_eq!(job_scope(Some("TENANT"), &mut warnings), JobScope::Tenant);
         assert!(warnings.is_empty());
-        assert_eq!(
-            video_job_scope(Some("tenants"), &mut warnings),
-            VideoJobScope::Key
-        );
+        assert_eq!(job_scope(Some("tenants"), &mut warnings), JobScope::Key);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("OBLETH_VIDEO_JOB_SCOPE=\"tenants\""));
-        assert_eq!(VideoJobScope::Key.as_str(), "key");
-        assert_eq!(VideoJobScope::Tenant.as_str(), "tenant");
+        assert_eq!(JobScope::Key.as_str(), "key");
+        assert_eq!(JobScope::Tenant.as_str(), "tenant");
     }
 
     #[test]

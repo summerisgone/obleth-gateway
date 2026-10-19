@@ -1,6 +1,8 @@
-//! OpenAI Videos API: job-based video generation.
+//! Job-based generation: the OpenAI Videos API, and 3D meshes in the same
+//! shape.
 //!
-//! Every other modality is one request and one response. A video is a job:
+//! Every other modality is one request and one response. A video or a mesh
+//! takes minutes, so it is a job:
 //!
 //! ```text
 //! POST   /v1/videos               prompt [+ reference image] -> job id
@@ -8,27 +10,38 @@
 //! GET    /v1/videos/{id}/content  the finished video
 //! DELETE /v1/videos/{id}          drop the job and its file
 //! GET    /v1/videos               list jobs
+//!
+//! POST   /v1/meshes               image [+ settings] -> job id
+//! GET    /v1/meshes/{id}          status + progress
+//! GET    /v1/meshes/{id}/content  the finished mesh (binary glTF)
+//! DELETE /v1/meshes/{id}          drop the job and its file
+//! GET    /v1/meshes               list jobs
 //! ```
+//!
+//! Both kinds ([`JobKind`]) are handled identically here; only the path and
+//! the wording differ. A job is recorded with its kind and only ever found
+//! through its own endpoint.
 //!
 //! The create runs down the ordinary pipeline: model resolution (JSON or
 //! multipart), the tenant allowlist, input guardrails on `prompt`, fairshare
 //! admission, budgets, the upstream model-name swap and headers. It is billed
-//! the model's flat `cost_per_video` when it succeeds. What is specific to
-//! video happens after the upstream answers: the job id is recorded against
-//! the model, the tenant, the key, and the base URL that accepted it (see
-//! [`record_create`]) before the id reaches the client.
+//! the model's flat `cost_per_video` (the per-job price, whatever the kind)
+//! when it succeeds. What is specific to jobs happens after the upstream
+//! answers: the job id is recorded against its kind, the model, the tenant,
+//! the key, and the base URL that accepted it (see [`record_create`]) before
+//! the id reaches the client.
 //!
 //! The follow-ups carry the job id and nothing else, so they cannot resolve a
 //! model the usual way. [`handle_follow_up`] reads the record instead: it
 //! routes the call back to the model and base that created the job, answers
 //! "not found" for an id the caller does not own, and passes the upstream
 //! answer through untouched (its status included, for example a not-ready
-//! answer while the video renders), streaming the file rather than buffering
+//! answer while the job renders), streaming the file rather than buffering
 //! it.
 //!
 //! Who owns a job is `OBLETH_VIDEO_JOB_SCOPE` (see [`owner_of`]): by default
 //! the API key that created it, so in a tenant of many users each one sees,
-//! polls, downloads and deletes only their own videos (a JWT caller's identity
+//! polls, downloads and deletes only their own jobs (a JWT caller's identity
 //! key is one per issuer and subject, so this holds for SSO users too).
 //! `tenant` shares every job with all of the tenant's keys. An unknown id,
 //! another tenant's job and another key's job are the same 404, answered
@@ -49,16 +62,46 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use obleth_config::{ResolvedKey, ResolvedModel, VideoJobScope};
-use obleth_store::VideoJobOwner;
+use obleth_config::{JobScope, ResolvedKey, ResolvedModel};
+use obleth_store::JobOwner;
 use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::proxy::{build_upstream_url, error_json, forward_headers, resolve_model, Target};
 use crate::state::AppState;
 
-/// The collection path: `POST` creates a job, `GET` lists them.
+/// The video collection path: `POST` creates a job, `GET` lists them.
 pub(crate) const VIDEOS_PATH: &str = "/v1/videos";
+
+/// The mesh collection path, served exactly like [`VIDEOS_PATH`].
+pub(crate) const MESHES_PATH: &str = "/v1/meshes";
+
+/// Which job-based endpoint a call belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobKind {
+    Video,
+    Mesh,
+}
+
+impl JobKind {
+    const ALL: [JobKind; 2] = [JobKind::Video, JobKind::Mesh];
+
+    /// The collection path.
+    pub(crate) fn path(self) -> &'static str {
+        match self {
+            JobKind::Video => VIDEOS_PATH,
+            JobKind::Mesh => MESHES_PATH,
+        }
+    }
+
+    /// The kind as recorded in the job table, and the word used in messages.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            JobKind::Video => "video",
+            JobKind::Mesh => "mesh",
+        }
+    }
+}
 
 /// Largest create response read to find the job id. A video object is a few
 /// hundred bytes; anything near this is not one.
@@ -96,47 +139,47 @@ const PASSTHROUGH_HEADERS: &[header::HeaderName] = &[
     header::RETRY_AFTER,
 ];
 
-/// The video job table, and only that: the data plane reads no other
+/// The job table, and only that: the data plane reads no other
 /// Postgres state on the request path. Carries the configured
 /// `OBLETH_VIDEO_JOB_SCOPE`, which decides whose jobs a caller may follow up.
 #[derive(Clone)]
-pub struct VideoJobStore {
+pub struct JobStore {
     store: obleth_store::Store,
-    scope: VideoJobScope,
+    scope: JobScope,
 }
 
-impl VideoJobStore {
-    pub fn new(store: obleth_store::Store, scope: VideoJobScope) -> Self {
-        VideoJobStore { store, scope }
+impl JobStore {
+    pub fn new(store: obleth_store::Store, scope: JobScope) -> Self {
+        JobStore { store, scope }
     }
 
     /// The jobs `resolved` may follow up under the configured scope.
-    fn owner_of(&self, resolved: &ResolvedKey) -> VideoJobOwner {
+    fn owner_of(&self, resolved: &ResolvedKey) -> JobOwner {
         owner_of(self.scope, resolved)
     }
 }
 
 /// Whose jobs a caller may poll, download, delete and list.
 ///
-/// Under [`VideoJobScope::Key`] (the default), only the jobs the caller's own
+/// Under [`JobScope::Key`] (the default), only the jobs the caller's own
 /// key created, within its tenant. A disabled key is refused before this is
 /// reached, and a rotated key is a new key id, so neither reaches the old
 /// key's jobs; they expire with their records
-/// (`OBLETH_VIDEO_JOB_RETENTION_HOURS`). Under [`VideoJobScope::Tenant`], any
+/// (`OBLETH_VIDEO_JOB_RETENTION_HOURS`). Under [`JobScope::Tenant`], any
 /// job of the caller's tenant.
 ///
 /// An internal key (a gateway-owned probe) is scoped exactly like any other:
 /// unlike the model allowlist, which it bypasses, ownership is never widened
-/// for it. Probes do not create video jobs, so under `key` scope one sees
+/// for it. Probes do not create jobs, so under `key` scope one sees
 /// none.
-fn owner_of(scope: VideoJobScope, resolved: &ResolvedKey) -> VideoJobOwner {
+fn owner_of(scope: JobScope, resolved: &ResolvedKey) -> JobOwner {
     match scope {
-        VideoJobScope::Key => VideoJobOwner::key(resolved.tenant_id, resolved.key_id),
-        VideoJobScope::Tenant => VideoJobOwner::tenant(resolved.tenant_id),
+        JobScope::Key => JobOwner::key(resolved.tenant_id, resolved.key_id),
+        JobScope::Tenant => JobOwner::tenant(resolved.tenant_id),
     }
 }
 
-/// A follow-up call on the Videos API: anything but the create.
+/// A follow-up call on a job endpoint: anything but the create.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FollowUp<'a> {
     List,
@@ -154,27 +197,33 @@ impl FollowUp<'_> {
     }
 }
 
-/// Classify a request as a Videos API follow-up. `None` for the create
-/// (`POST /v1/videos`) and for every other path, including Videos API calls
-/// this gateway does not serve (which then fall through to the unknown
-/// endpoint guard).
-pub(crate) fn follow_up<'a>(method: &Method, path: &'a str) -> Option<FollowUp<'a>> {
+/// Classify a request as a job follow-up, with the endpoint it is on. `None`
+/// for a create (`POST /v1/videos`, `POST /v1/meshes`) and for every other
+/// path, including job calls this gateway does not serve (which then fall
+/// through to the unknown endpoint guard).
+pub(crate) fn follow_up<'a>(method: &Method, path: &'a str) -> Option<(JobKind, FollowUp<'a>)> {
     let path = path.trim_end_matches('/');
-    if path == VIDEOS_PATH {
-        return (method == Method::GET).then_some(FollowUp::List);
-    }
-    let rest = path.strip_prefix(VIDEOS_PATH)?.strip_prefix('/')?;
-    match rest.split_once('/') {
-        None if method == Method::GET => Some(FollowUp::Retrieve(rest)),
-        None if method == Method::DELETE => Some(FollowUp::Delete(rest)),
-        Some((id, "content")) if method == Method::GET => Some(FollowUp::Content(id)),
-        _ => None,
-    }
+    JobKind::ALL.into_iter().find_map(|kind| {
+        if path == kind.path() {
+            return (method == Method::GET).then_some((kind, FollowUp::List));
+        }
+        let rest = path.strip_prefix(kind.path())?.strip_prefix('/')?;
+        let call = match rest.split_once('/') {
+            None if method == Method::GET => FollowUp::Retrieve(rest),
+            None if method == Method::DELETE => FollowUp::Delete(rest),
+            Some((id, "content")) if method == Method::GET => FollowUp::Content(id),
+            _ => return None,
+        };
+        Some((kind, call))
+    })
 }
 
-/// True for the create call.
-pub(crate) fn is_create(method: &Method, path: &str) -> bool {
-    method == Method::POST && path == VIDEOS_PATH
+/// The kind of job a create call starts; `None` when it is not a create.
+pub(crate) fn is_create(method: &Method, path: &str) -> Option<JobKind> {
+    if method != Method::POST {
+        return None;
+    }
+    JobKind::ALL.into_iter().find(|kind| path == kind.path())
 }
 
 /// A job id this gateway will look up and forward. Ids are the upstream's to
@@ -206,23 +255,27 @@ fn encode_path_segment(s: &str) -> String {
     out
 }
 
-/// The upstream path of a follow-up: the Videos API path, rebuilt with the
+/// The upstream path of a follow-up: the endpoint's path, rebuilt with the
 /// job id encoded as a single segment rather than copied from the client.
-fn follow_up_path(call: FollowUp<'_>) -> String {
+fn follow_up_path(kind: JobKind, call: FollowUp<'_>) -> String {
+    let base = kind.path();
     match call {
-        FollowUp::List => VIDEOS_PATH.to_string(),
+        FollowUp::List => base.to_string(),
         FollowUp::Retrieve(id) | FollowUp::Delete(id) => {
-            format!("{VIDEOS_PATH}/{}", encode_path_segment(id))
+            format!("{base}/{}", encode_path_segment(id))
         }
-        FollowUp::Content(id) => format!("{VIDEOS_PATH}/{}/content", encode_path_segment(id)),
+        FollowUp::Content(id) => format!("{base}/{}/content", encode_path_segment(id)),
     }
 }
 
 /// The not-found answer for an id that is unknown, malformed, or owned by
 /// another tenant (or, under `key` scope, another key). One message for all,
 /// so a caller learns nothing about ids it does not hold.
-fn no_such_job() -> Response<Body> {
-    error_json(StatusCode::NOT_FOUND, "no such video job")
+fn no_such_job(kind: JobKind) -> Response<Body> {
+    error_json(
+        StatusCode::NOT_FOUND,
+        &format!("no such {} job", kind.as_str()),
+    )
 }
 
 /// Record retention, from `OBLETH_VIDEO_JOB_RETENTION_HOURS`.
@@ -235,7 +288,7 @@ fn parse_retention(raw: Option<&str>) -> Duration {
 
 /// Prune job records past their retention, once an hour, on every replica.
 /// Concurrent prunes are harmless: each deletes by age.
-pub(crate) fn spawn_job_pruner(jobs: VideoJobStore) {
+pub(crate) fn spawn_job_pruner(jobs: JobStore) {
     let retention = parse_retention(
         std::env::var("OBLETH_VIDEO_JOB_RETENTION_HOURS")
             .ok()
@@ -248,10 +301,10 @@ pub(crate) fn spawn_job_pruner(jobs: VideoJobStore) {
             let Ok(age) = chrono::Duration::from_std(retention) else {
                 return;
             };
-            match jobs.store.prune_video_jobs(chrono::Utc::now() - age).await {
+            match jobs.store.prune_job_records(chrono::Utc::now() - age).await {
                 Ok(0) => {}
-                Ok(n) => tracing::info!(pruned = n, "pruned expired video job records"),
-                Err(e) => tracing::warn!(error = %e, "video job prune failed"),
+                Ok(n) => tracing::info!(pruned = n, "pruned expired job records"),
+                Err(e) => tracing::warn!(error = %e, "job record prune failed"),
             }
         }
     });
@@ -306,19 +359,26 @@ fn request_timeout(state: &AppState, route: &ResolvedModel) -> Duration {
 /// cannot be followed.
 async fn job_target(
     state: &AppState,
+    kind: JobKind,
     model_name: &str,
     base: &str,
-) -> Result<(std::sync::Arc<ResolvedModel>, Target), (StatusCode, &'static str)> {
+) -> Result<(std::sync::Arc<ResolvedModel>, Target), (StatusCode, String)> {
     let Some(route) = resolve_model(state, model_name).await.filter(|r| r.enabled) else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "the model that created this video job is not available",
+            format!(
+                "the model that created this {} job is not available",
+                kind.as_str()
+            ),
         ));
     };
     let Some(target) = affinity_target(&route, base) else {
         return Err((
             StatusCode::BAD_GATEWAY,
-            "the endpoint that created this video job is no longer configured",
+            format!(
+                "the endpoint that created this {} job is no longer configured",
+                kind.as_str()
+            ),
         ));
     };
     Ok((route, target))
@@ -336,36 +396,43 @@ pub(crate) struct Inbound<'a> {
 pub(crate) async fn handle_follow_up(
     state: &AppState,
     resolved: &ResolvedKey,
+    kind: JobKind,
     call: FollowUp<'_>,
     inbound: Inbound<'_>,
     request_id: Uuid,
 ) -> Response<Body> {
     let Some(id) = call.job_id() else {
-        return list(state, resolved, inbound.headers, request_id).await;
+        return list(state, resolved, kind, inbound.headers, request_id).await;
     };
     if !valid_job_id(id) {
-        return no_such_job();
+        return no_such_job(kind);
     }
-    let owner = state.video_jobs.owner_of(resolved);
-    let job = match state.video_jobs.store.get_video_job(id, owner).await {
+    let owner = state.jobs.owner_of(resolved);
+    let job = match state
+        .jobs
+        .store
+        .get_job_record(kind.as_str(), id, owner)
+        .await
+    {
         Ok(Some(job)) => job,
-        Ok(None) => return no_such_job(),
+        Ok(None) => return no_such_job(kind),
         Err(e) => {
-            tracing::warn!(error = %e, "video job lookup failed");
+            tracing::warn!(error = %e, kind = kind.as_str(), "job lookup failed");
+            // The alert key predates mesh jobs; kept so existing silences hold.
             state.alerts.issue(
                 "video_job_lookup_failed",
-                "Video job lookup failed",
+                "Job lookup failed",
                 format!("tenant `{}` job `{id}`: {e}", resolved.tenant_name),
             );
-            return error_json(StatusCode::SERVICE_UNAVAILABLE, "video job lookup failed");
+            return error_json(StatusCode::SERVICE_UNAVAILABLE, "job lookup failed");
         }
     };
-    let (route, target) = match job_target(state, &job.model_name, &job.upstream_base).await {
+    let (route, target) = match job_target(state, kind, &job.model_name, &job.upstream_base).await {
         Ok(found) => found,
-        Err((status, message)) => return error_json(status, message),
+        Err((status, message)) => return error_json(status, &message),
     };
 
-    let url = build_upstream_url(&target.base, &follow_up_path(call), inbound.query);
+    let url = build_upstream_url(&target.base, &follow_up_path(kind, call), inbound.query);
     let send = state
         .http
         .request(inbound.method.clone(), &url)
@@ -374,7 +441,7 @@ pub(crate) async fn handle_follow_up(
     let upstream = match timeout(request_timeout(state, &route), send).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, job = id, "video follow-up failed");
+            tracing::warn!(error = %e, job = id, "job follow-up failed");
             return error_json(StatusCode::BAD_GATEWAY, "upstream request failed");
         }
         Err(_) => return error_json(StatusCode::GATEWAY_TIMEOUT, "upstream request timed out"),
@@ -387,8 +454,13 @@ pub(crate) async fn handle_follow_up(
     if matches!(call, FollowUp::Delete(_))
         && (status.is_success() || status == StatusCode::NOT_FOUND)
     {
-        if let Err(e) = state.video_jobs.store.delete_video_job(id, owner).await {
-            tracing::warn!(error = %e, job = id, "video job record delete failed");
+        if let Err(e) = state
+            .jobs
+            .store
+            .delete_job_record(kind.as_str(), id, owner)
+            .await
+        {
+            tracing::warn!(error = %e, job = id, "job record delete failed");
         }
     }
 
@@ -396,7 +468,8 @@ pub(crate) async fn handle_follow_up(
 }
 
 /// The upstream response as-is: status, the body's framing and type headers,
-/// and the body streamed chunk by chunk so an mp4 is never held in memory.
+/// and the body streamed chunk by chunk so a video or a mesh is never held in
+/// memory.
 fn passthrough(upstream: reqwest::Response, request_id: Uuid) -> Response<Body> {
     let mut builder = Response::builder().status(upstream.status().as_u16());
     for name in PASSTHROUGH_HEADERS {
@@ -413,8 +486,8 @@ fn passthrough(upstream: reqwest::Response, request_id: Uuid) -> Response<Body> 
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
 }
 
-/// `GET /v1/videos`: the caller's jobs, as the upstream currently reports
-/// them.
+/// `GET /v1/videos` or `GET /v1/meshes`: the caller's jobs of that kind, as
+/// the upstream currently reports them.
 ///
 /// The backend lists every live job on its deployment, whoever made it, so its
 /// listing is filtered down to the ids the caller owns: its own key's jobs
@@ -427,20 +500,21 @@ fn passthrough(upstream: reqwest::Response, request_id: Uuid) -> Response<Body> 
 async fn list(
     state: &AppState,
     resolved: &ResolvedKey,
+    kind: JobKind,
     headers: &HeaderMap,
     request_id: Uuid,
 ) -> Response<Body> {
-    let owner = state.video_jobs.owner_of(resolved);
+    let owner = state.jobs.owner_of(resolved);
     let jobs = match state
-        .video_jobs
+        .jobs
         .store
-        .list_video_jobs(owner, LIST_LIMIT)
+        .list_job_records(kind.as_str(), owner, LIST_LIMIT)
         .await
     {
         Ok(jobs) => jobs,
         Err(e) => {
-            tracing::warn!(error = %e, "video job list failed");
-            return error_json(StatusCode::SERVICE_UNAVAILABLE, "video job lookup failed");
+            tracing::warn!(error = %e, kind = kind.as_str(), "job list failed");
+            return error_json(StatusCode::SERVICE_UNAVAILABLE, "job lookup failed");
         }
     };
     let mut owned: BTreeMap<(String, String), HashSet<String>> = BTreeMap::new();
@@ -453,11 +527,11 @@ async fn list(
 
     let mut data: Vec<serde_json::Value> = Vec::new();
     for ((model_name, base), ids) in owned {
-        let (route, target) = match job_target(state, &model_name, &base).await {
+        let (route, target) = match job_target(state, kind, &model_name, &base).await {
             Ok(found) => found,
-            Err((status, message)) => return error_json(status, message),
+            Err((status, message)) => return error_json(status, &message),
         };
-        let url = build_upstream_url(&target.base, VIDEOS_PATH, "");
+        let url = build_upstream_url(&target.base, kind.path(), "");
         let send = state
             .http
             .get(&url)
@@ -468,11 +542,11 @@ async fn list(
                 .await
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()),
             Ok(Ok(resp)) => {
-                tracing::warn!(status = %resp.status(), model = %model_name, "video list upstream error");
+                tracing::warn!(status = %resp.status(), model = %model_name, "job list upstream error");
                 None
             }
             Ok(Err(e)) => {
-                tracing::warn!(error = %e, model = %model_name, "video list upstream failed");
+                tracing::warn!(error = %e, model = %model_name, "job list upstream failed");
                 None
             }
             Err(_) => None,
@@ -480,7 +554,7 @@ async fn list(
         let Some(listing) = listing else {
             return error_json(
                 StatusCode::BAD_GATEWAY,
-                "could not list video jobs upstream",
+                &format!("could not list {} jobs upstream", kind.as_str()),
             );
         };
         if let Some(items) = listing.get("data").and_then(|d| d.as_array()) {
@@ -540,7 +614,8 @@ impl<T: axum::response::IntoResponse> WithRequestId for T {
 
 /// What the pipeline knows about a successful create, for recording the job.
 pub(crate) struct CreatedJob {
-    pub(crate) jobs: VideoJobStore,
+    pub(crate) kind: JobKind,
+    pub(crate) jobs: JobStore,
     pub(crate) http: reqwest::Client,
     pub(crate) model: String,
     pub(crate) tenant_id: Uuid,
@@ -634,10 +709,10 @@ pub(crate) async fn record_create(job: CreatedJob, upstream: reqwest::Response) 
         .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
         .filter(|id| valid_job_id(id));
     let (Some(body), Some(job_id)) = (body, job_id) else {
-        tracing::warn!(model = %job.model, "video create returned no usable job id");
+        tracing::warn!(model = %job.model, kind = job.kind.as_str(), "job create returned no usable job id");
         return CreateOutcome::Failed {
             status: StatusCode::BAD_GATEWAY,
-            message: "the upstream did not return a video job id",
+            message: "the upstream did not return a job id",
             ttft_ms,
         };
     };
@@ -645,7 +720,8 @@ pub(crate) async fn record_create(job: CreatedJob, upstream: reqwest::Response) 
     match job
         .jobs
         .store
-        .insert_video_job(
+        .insert_job_record(
+            job.kind.as_str(),
             &job_id,
             &job.model,
             job.tenant_id,
@@ -661,8 +737,12 @@ pub(crate) async fn record_create(job: CreatedJob, upstream: reqwest::Response) 
             ttft_ms,
         },
         Err(e) => {
-            tracing::warn!(error = %e, job = %job_id, "video job record failed; cancelling the job");
-            let url = build_upstream_url(&job.target.base, &format!("{VIDEOS_PATH}/{job_id}"), "");
+            tracing::warn!(error = %e, job = %job_id, "job record failed; cancelling the job");
+            let url = build_upstream_url(
+                &job.target.base,
+                &follow_up_path(job.kind, FollowUp::Delete(&job_id)),
+                "",
+            );
             let cancel = job
                 .http
                 .delete(&url)
@@ -673,11 +753,11 @@ pub(crate) async fn record_create(job: CreatedJob, upstream: reqwest::Response) 
                 .map_err(|_| "timed out".to_string())
                 .and_then(|r| r.map_err(|e| e.to_string()))
             {
-                tracing::warn!(error = %e, job = %job_id, "could not cancel an unrecorded video job");
+                tracing::warn!(error = %e, job = %job_id, "could not cancel an unrecorded job");
             }
             CreateOutcome::Failed {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "could not record the video job; it was cancelled, retry the request",
+                message: "could not record the job; it was cancelled, retry the request",
                 ttft_ms,
             }
         }
@@ -690,33 +770,55 @@ mod tests {
 
     #[test]
     fn follow_ups_are_classified_by_method_and_shape() {
+        use JobKind::{Mesh, Video};
         let get = Method::GET;
         let del = Method::DELETE;
         let post = Method::POST;
-        assert_eq!(follow_up(&get, "/v1/videos"), Some(FollowUp::List));
-        assert_eq!(follow_up(&get, "/v1/videos/"), Some(FollowUp::List));
+        assert_eq!(follow_up(&get, "/v1/videos"), Some((Video, FollowUp::List)));
+        assert_eq!(
+            follow_up(&get, "/v1/videos/"),
+            Some((Video, FollowUp::List))
+        );
         assert_eq!(
             follow_up(&get, "/v1/videos/video_abc"),
-            Some(FollowUp::Retrieve("video_abc"))
+            Some((Video, FollowUp::Retrieve("video_abc")))
         );
         assert_eq!(
             follow_up(&get, "/v1/videos/video_abc/content"),
-            Some(FollowUp::Content("video_abc"))
+            Some((Video, FollowUp::Content("video_abc")))
         );
         assert_eq!(
             follow_up(&del, "/v1/videos/video_abc"),
-            Some(FollowUp::Delete("video_abc"))
+            Some((Video, FollowUp::Delete("video_abc")))
         );
-        // The create goes down the pipeline, not here.
+        // Meshes take the same shapes on their own path.
+        assert_eq!(follow_up(&get, "/v1/meshes"), Some((Mesh, FollowUp::List)));
+        assert_eq!(
+            follow_up(&get, "/v1/meshes/mesh_abc"),
+            Some((Mesh, FollowUp::Retrieve("mesh_abc")))
+        );
+        assert_eq!(
+            follow_up(&get, "/v1/meshes/mesh_abc/content"),
+            Some((Mesh, FollowUp::Content("mesh_abc")))
+        );
+        assert_eq!(
+            follow_up(&del, "/v1/meshes/mesh_abc"),
+            Some((Mesh, FollowUp::Delete("mesh_abc")))
+        );
+        // The creates go down the pipeline, not here.
         assert_eq!(follow_up(&post, "/v1/videos"), None);
-        assert!(is_create(&post, "/v1/videos"));
-        assert!(!is_create(&get, "/v1/videos"));
+        assert_eq!(follow_up(&post, "/v1/meshes"), None);
+        assert_eq!(is_create(&post, "/v1/videos"), Some(Video));
+        assert_eq!(is_create(&post, "/v1/meshes"), Some(Mesh));
+        assert_eq!(is_create(&get, "/v1/videos"), None);
+        assert_eq!(is_create(&post, "/v1/meshes/mesh_abc"), None);
         // Calls this gateway does not serve fall through to the unknown
         // endpoint guard.
         assert_eq!(follow_up(&post, "/v1/videos/video_abc/remix"), None);
         assert_eq!(follow_up(&del, "/v1/videos/video_abc/content"), None);
         assert_eq!(follow_up(&get, "/v1/videos/a/b/c"), None);
         assert_eq!(follow_up(&get, "/v1/videosx"), None);
+        assert_eq!(follow_up(&get, "/v1/meshesx/a"), None);
         assert_eq!(follow_up(&get, "/v1/images/generations"), None);
     }
 
@@ -789,11 +891,21 @@ mod tests {
         }
         assert_eq!(encode_path_segment("job:abc"), "job%3Aabc");
         assert_eq!(
-            follow_up_path(FollowUp::Content("job:1")),
+            follow_up_path(JobKind::Video, FollowUp::Content("job:1")),
             "/v1/videos/job%3A1/content"
         );
-        assert_eq!(follow_up_path(FollowUp::Retrieve("v_1")), "/v1/videos/v_1");
-        assert_eq!(follow_up_path(FollowUp::Delete("a.b")), "/v1/videos/a.b");
+        assert_eq!(
+            follow_up_path(JobKind::Video, FollowUp::Retrieve("v_1")),
+            "/v1/videos/v_1"
+        );
+        assert_eq!(
+            follow_up_path(JobKind::Video, FollowUp::Delete("a.b")),
+            "/v1/videos/a.b"
+        );
+        assert_eq!(
+            follow_up_path(JobKind::Mesh, FollowUp::Content("mesh_1")),
+            "/v1/meshes/mesh_1/content"
+        );
     }
 
     #[test]
@@ -855,20 +967,20 @@ mod tests {
         key.key_id = Uuid::new_v4();
         key.tenant_id = Uuid::new_v4();
         assert_eq!(
-            owner_of(VideoJobScope::Key, &key),
-            VideoJobOwner::key(key.tenant_id, key.key_id)
+            owner_of(JobScope::Key, &key),
+            JobOwner::key(key.tenant_id, key.key_id)
         );
         assert_eq!(
-            owner_of(VideoJobScope::Tenant, &key),
-            VideoJobOwner::tenant(key.tenant_id)
+            owner_of(JobScope::Tenant, &key),
+            JobOwner::tenant(key.tenant_id)
         );
         key.internal = true;
         assert_eq!(
-            owner_of(VideoJobScope::Key, &key),
-            VideoJobOwner::key(key.tenant_id, key.key_id),
+            owner_of(JobScope::Key, &key),
+            JobOwner::key(key.tenant_id, key.key_id),
             "an internal key sees only its own jobs, like any other"
         );
-        assert_eq!(VideoJobScope::default(), VideoJobScope::Key);
+        assert_eq!(JobScope::default(), JobScope::Key);
     }
 }
 
@@ -920,6 +1032,7 @@ mod pipeline_tests {
 
     const MP4_FIRST: &[u8] = b"\x00\x00\x00\x18ftypmp42first-chunk";
     const MP4_REST: &[u8] = b"...the-rest-of-the-mp4...";
+    const GLB: &[u8] = b"glTF\x02\x00\x00\x00-binary-gltf";
 
     async fn parse_create(headers: &HeaderMap, body: Bytes) -> SeenCreate {
         let mut seen = SeenCreate {
@@ -951,7 +1064,7 @@ mod pipeline_tests {
                 match name.as_str() {
                     "model" => seen.model = text,
                     "prompt" => seen.prompt = text,
-                    "input_reference" => seen.file_name = file_name,
+                    "input_reference" | "image" => seen.file_name = file_name,
                     _ => {}
                 }
             }
@@ -1080,10 +1193,97 @@ mod pipeline_tests {
                 None => (StatusCode::NOT_FOUND, "no such video job").into_response(),
             }
         }
+        // Meshes: the same job shape on its own path, with `mesh_` ids and a
+        // binary glTF download.
+        async fn create_mesh(
+            State(b): State<Shared>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> axum::response::Response {
+            let seen = parse_create(&headers, body).await;
+            b.creates.lock().unwrap().push(seen.clone());
+            let n = b.next.fetch_add(1, Ordering::SeqCst) + 1;
+            let id = format!("mesh_{}{n}", b.name);
+            let created = 1_000 + n as i64;
+            b.jobs
+                .lock()
+                .unwrap()
+                .insert(id.clone(), ("queued".into(), created));
+            axum::Json(serde_json::json!({
+                "id": id, "object": "mesh", "model": seen.model,
+                "status": "queued", "progress": 0, "created_at": created,
+            }))
+            .into_response()
+        }
+        async fn list_meshes(State(b): State<Shared>) -> axum::response::Response {
+            b.calls.lock().unwrap().push("GET /v1/meshes".into());
+            let data: Vec<serde_json::Value> = b
+                .jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| id.starts_with("mesh_"))
+                .map(|(id, (status, created))| {
+                    serde_json::json!({"id": id, "object": "mesh", "status": status, "created_at": created})
+                })
+                .collect();
+            axum::Json(serde_json::json!({"object": "list", "data": data})).into_response()
+        }
+        async fn retrieve_mesh(
+            State(b): State<Shared>,
+            Path(id): Path<String>,
+        ) -> axum::response::Response {
+            b.calls.lock().unwrap().push(format!("GET /v1/meshes/{id}"));
+            match b.jobs.lock().unwrap().get(&id) {
+                Some((status, created)) => axum::Json(serde_json::json!({
+                    "id": id, "object": "mesh", "status": status, "created_at": created,
+                }))
+                .into_response(),
+                None => (StatusCode::NOT_FOUND, "no such mesh job").into_response(),
+            }
+        }
+        async fn mesh_content(
+            State(b): State<Shared>,
+            Path(id): Path<String>,
+        ) -> axum::response::Response {
+            b.calls
+                .lock()
+                .unwrap()
+                .push(format!("GET /v1/meshes/{id}/content"));
+            let status = b.jobs.lock().unwrap().get(&id).map(|j| j.0.clone());
+            match status.as_deref() {
+                None => (StatusCode::NOT_FOUND, "no such mesh job").into_response(),
+                Some("completed") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "model/gltf-binary")
+                    .header(header::CONTENT_LENGTH, GLB.len())
+                    .body(Body::from(GLB))
+                    .unwrap(),
+                Some(_) => (StatusCode::CONFLICT, "not ready").into_response(),
+            }
+        }
+        async fn delete_mesh(
+            State(b): State<Shared>,
+            Path(id): Path<String>,
+        ) -> axum::response::Response {
+            b.calls
+                .lock()
+                .unwrap()
+                .push(format!("DELETE /v1/meshes/{id}"));
+            match b.jobs.lock().unwrap().remove(&id) {
+                Some(_) => {
+                    axum::Json(serde_json::json!({"id": id, "deleted": true})).into_response()
+                }
+                None => (StatusCode::NOT_FOUND, "no such mesh job").into_response(),
+            }
+        }
         Router::new()
             .route("/v1/videos", post(create).get(list))
             .route("/v1/videos/:id", get(retrieve).delete(delete))
             .route("/v1/videos/:id/content", get(content))
+            .route("/v1/meshes", post(create_mesh).get(list_meshes))
+            .route("/v1/meshes/:id", get(retrieve_mesh).delete(delete_mesh))
+            .route("/v1/meshes/:id/content", get(mesh_content))
             .with_state(backend)
     }
 
@@ -1116,11 +1316,11 @@ mod pipeline_tests {
     /// A real `AppState` on the test datastores under the default `key`
     /// scope, or `None` (skip) without them.
     async fn gateway() -> Option<Gateway> {
-        gateway_with(VideoJobScope::Key).await
+        gateway_with(JobScope::Key).await
     }
 
     /// [`gateway`] under the given `OBLETH_VIDEO_JOB_SCOPE`.
-    async fn gateway_with(scope: VideoJobScope) -> Option<Gateway> {
+    async fn gateway_with(scope: JobScope) -> Option<Gateway> {
         let (Ok(db), Ok(redis_url)) = (
             std::env::var("OBLETH_TEST_DATABASE_URL"),
             std::env::var("OBLETH_TEST_REDIS_URL"),
@@ -1187,7 +1387,7 @@ mod pipeline_tests {
             energy: crate::energy::EnergyEngine::new(Default::default()),
             jwt: None,
             knowledge: Arc::new(crate::knowledge::KnowledgeIndex::new()),
-            video_jobs: VideoJobStore::new(store.clone(), scope),
+            jobs: JobStore::new(store.clone(), scope),
         };
         Some(Gateway {
             state,
@@ -1209,6 +1409,13 @@ mod pipeline_tests {
         route
             .upstream_headers
             .insert("x-route".into(), "video".into());
+        route
+    }
+
+    fn mesh_route(name: &str, base: &str) -> ResolvedModel {
+        let mut route = video_route(name, base);
+        route.upstream_model = "mesh-upstream".into();
+        route.model_type = "mesh".into();
         route
     }
 
@@ -1357,7 +1564,7 @@ mod pipeline_tests {
         // Recorded against the tenant, the key and the base that took it.
         let rec = gw
             .store
-            .get_video_job(&id, VideoJobOwner::tenant(key.tenant_id))
+            .get_job_record("video", &id, JobOwner::tenant(key.tenant_id))
             .await
             .unwrap()
             .expect("recorded");
@@ -1408,7 +1615,7 @@ mod pipeline_tests {
         );
         assert!(gw
             .store
-            .get_video_job(&id, VideoJobOwner::tenant(key.tenant_id))
+            .get_job_record("video", &id, JobOwner::tenant(key.tenant_id))
             .await
             .unwrap()
             .is_some());
@@ -1431,7 +1638,7 @@ mod pipeline_tests {
         );
         assert!(gw
             .store
-            .list_video_jobs(VideoJobOwner::tenant(key.tenant_id), 10)
+            .list_job_records("video", JobOwner::tenant(key.tenant_id), 10)
             .await
             .unwrap()
             .is_empty());
@@ -1503,9 +1710,10 @@ mod pipeline_tests {
         assert!(backend.calls.lock().unwrap().is_empty());
         assert!(gw
             .store
-            .get_video_job(
+            .get_job_record(
+                "video",
                 &id,
-                VideoJobOwner::key(owner_key.tenant_id, owner_key.key_id)
+                JobOwner::key(owner_key.tenant_id, owner_key.key_id)
             )
             .await
             .unwrap()
@@ -1597,7 +1805,7 @@ mod pipeline_tests {
         assert!(!backend.jobs.lock().unwrap().contains_key(&id));
         assert!(gw
             .store
-            .get_video_job(&id, VideoJobOwner::tenant(key.tenant_id))
+            .get_job_record("video", &id, JobOwner::tenant(key.tenant_id))
             .await
             .unwrap()
             .is_none());
@@ -1780,9 +1988,10 @@ mod pipeline_tests {
         // Alice's job and record are intact, and she still reaches both.
         assert!(gw
             .store
-            .get_video_job(
+            .get_job_record(
+                "video",
                 &id,
-                VideoJobOwner::key(alice_key.tenant_id, alice_key.key_id)
+                JobOwner::key(alice_key.tenant_id, alice_key.key_id)
             )
             .await
             .unwrap()
@@ -1813,7 +2022,7 @@ mod pipeline_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn under_tenant_scope_every_key_of_the_tenant_follows_the_job_and_no_other_tenant() {
-        let Some(gw) = gateway_with(VideoJobScope::Tenant).await else {
+        let Some(gw) = gateway_with(JobScope::Tenant).await else {
             return;
         };
         let (backend, base) = spawn_backend("t").await;
@@ -1859,7 +2068,7 @@ mod pipeline_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(gw
             .store
-            .get_video_job(&id, VideoJobOwner::tenant(alice_key.tenant_id))
+            .get_job_record("video", &id, JobOwner::tenant(alice_key.tenant_id))
             .await
             .unwrap()
             .is_none());
@@ -1867,5 +2076,102 @@ mod pipeline_tests {
             gw.get(&alice, &format!("/v1/videos/{id}")).await.status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    fn multipart_mesh_create(model: &str) -> String {
+        format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"seed\"\r\n\r\n42\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"chair.png\"\r\n\
+             Content-Type: image/png\r\n\r\n\x7fPNG-bytes\r\n--{b}--\r\n",
+            b = BOUNDARY
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mesh_job_is_created_followed_and_billed_on_its_own_endpoint() {
+        let Some(gw) = gateway().await else { return };
+        let (backend, base) = spawn_backend("g").await;
+        gw.register(mesh_route("mesh-model", &base)).await;
+        let (secret, key) = gw.tenant(None).await;
+
+        let resp = gw
+            .send(
+                Method::POST,
+                "/v1/meshes",
+                &secret,
+                Some(&multipart_type()),
+                multipart_mesh_create("mesh-model"),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let id = json_of(resp).await["id"]
+            .as_str()
+            .expect("job id")
+            .to_string();
+        assert!(id.starts_with("mesh_"), "{id}");
+
+        // The backend got the upstream model name and the uploaded image.
+        let seen = backend.creates.lock().unwrap()[0].clone();
+        assert_eq!(seen.model, "mesh-upstream");
+        assert_eq!(seen.file_name.as_deref(), Some("chair.png"));
+
+        // Recorded as a mesh job and billed the flat per-job price once.
+        let owner = JobOwner::key(key.tenant_id, key.key_id);
+        let rec = gw.store.get_job_record("mesh", &id, owner).await.unwrap();
+        assert_eq!(rec.map(|r| r.model_name), Some("mesh-model".to_string()));
+        assert!((gw.spent(&key).await - COST).abs() < 1e-9);
+
+        // Followed on its own endpoint; through the video endpoint it does
+        // not exist, and that lookup never reaches the backend.
+        let resp = gw.get(&secret, &format!("/v1/meshes/{id}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_of(resp).await["object"], "mesh");
+        let resp = gw.get(&secret, &format!("/v1/videos/{id}")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_of(resp).await["error"]["message"], "no such video job");
+        assert!(!backend
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("GET /v1/videos")));
+
+        // Listed under meshes only.
+        let listed = json_of(gw.get(&secret, "/v1/meshes").await).await;
+        let ids: Vec<&str> = listed["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|j| j["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec![id.as_str()]);
+        let videos = json_of(gw.get(&secret, "/v1/videos").await).await;
+        assert_eq!(videos["data"].as_array().map(Vec::len), Some(0));
+
+        // The download streams the binary glTF once the job completes.
+        backend.jobs.lock().unwrap().get_mut(&id).unwrap().0 = "completed".into();
+        let resp = gw.get(&secret, &format!("/v1/meshes/{id}/content")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "model/gltf-binary");
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], GLB);
+
+        // Delete drops the job and its record; polls and downloads cost nothing.
+        assert_eq!(
+            gw.delete(&secret, &format!("/v1/meshes/{id}"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert!(gw
+            .store
+            .get_job_record("mesh", &id, owner)
+            .await
+            .unwrap()
+            .is_none());
+        assert!((gw.spent(&key).await - COST).abs() < 1e-9);
     }
 }

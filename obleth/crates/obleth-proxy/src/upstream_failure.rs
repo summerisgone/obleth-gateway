@@ -1332,7 +1332,7 @@ mod pipeline {
             energy: crate::energy::EnergyEngine::new(Default::default()),
             jwt: None,
             knowledge: Arc::new(crate::knowledge::KnowledgeIndex::new()),
-            video_jobs: crate::videos::VideoJobStore::new(store, Default::default()),
+            jobs: crate::jobs::JobStore::new(store, Default::default()),
         };
         Some(Gateway { state, wal_dir })
     }
