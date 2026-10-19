@@ -11,6 +11,11 @@
 //
 // Media may come from blob: URLs: the Playground's Speech mode assembles the
 // audio it streamed in the browser and replays it from an object URL.
+//
+// fetch() may read blob: and data: URLs, which are the browser's own memory,
+// never the network: the 3D viewer loads a downloaded model from an object
+// URL (and three.js fetches the model's embedded textures the same way), and
+// an image handed from Image mode to 3D mode is read back from its URL.
 
 export interface CspOptions {
   development?: boolean;
@@ -25,7 +30,7 @@ export function contentSecurityPolicy(nonce: string, opts: CspOptions = {}): str
     "img-src 'self' data: blob:",
     "media-src 'self' blob:",
     "font-src 'self' data:",
-    "connect-src 'self'",
+    "connect-src 'self' blob: data:",
     "frame-ancestors 'none'",
     "base-uri 'self'",
     "form-action 'self'",

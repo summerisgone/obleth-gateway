@@ -42,6 +42,14 @@ describe("contentSecurityPolicy / media", () => {
   });
 });
 
+describe("contentSecurityPolicy / connect", () => {
+  // The 3D viewer fetches its model, and three.js its embedded textures, from
+  // blob: URLs; with connect-src 'self' alone the browser refuses both.
+  it("lets fetch read same-origin, blob: and data: URLs only", () => {
+    expect(directive(contentSecurityPolicy("n", { development: false }), "connect-src")).toBe("connect-src 'self' blob: data:");
+  });
+});
+
 describe("generateNonce", () => {
   it("returns base64 text that differs per call", () => {
     const a = generateNonce();
