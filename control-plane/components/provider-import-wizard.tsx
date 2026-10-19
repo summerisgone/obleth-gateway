@@ -36,6 +36,7 @@ const MODEL_TYPE_OPTIONS = [
   { value: "audio_speech", label: "Text to speech (TTS)" },
   { value: "image", label: "Image generation" },
   { value: "video", label: "Video generation" },
+  { value: "mesh", label: "3D mesh generation" },
 ] as const;
 
 type Step = "connect" | "select" | "review";

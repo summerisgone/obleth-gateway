@@ -159,6 +159,31 @@ export async function gatewayVoices(
   });
 }
 
+/**
+ * Start a 3D mesh job on the data plane's `/v1/meshes` as the reserved tenant.
+ * The form carries the model, the source image and any settings; the answer is
+ * the job object, not the mesh.
+ */
+export async function gatewayMeshCreate(form: FormData, signal?: AbortSignal): Promise<Response> {
+  const secret = await getControlPlaneKey();
+  return fetch(`${PROXY_BASE}/v1/meshes`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${secret}` },
+    body: form,
+    signal,
+  });
+}
+
+/** GET a mesh job (`/v1/meshes/{id}`) or its file (`/v1/meshes/{id}/content`). */
+export async function gatewayMeshGet(id: string, content: boolean, signal?: AbortSignal): Promise<Response> {
+  const secret = await getControlPlaneKey();
+  const path = `/v1/meshes/${encodeURIComponent(id)}${content ? "/content" : ""}`;
+  return fetch(`${PROXY_BASE}${path}`, {
+    headers: { Authorization: `Bearer ${secret}` },
+    signal,
+  });
+}
+
 async function gatewayPost(
   path: string,
   body: unknown,

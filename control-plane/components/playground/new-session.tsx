@@ -9,6 +9,7 @@ import { MODES } from "./ui";
 const CARDS: Record<string, { blurb: string; example: string }> = {
   compare: { blurb: "Talk to one model, or add up to four and compare their answers side by side.", example: "Which model writes the clearest release notes?" },
   image: { blurb: "Generate images from a prompt, then iterate on size, steps and seed.", example: "Check a new image backend end to end" },
+  mesh: { blurb: "Turn a picture of an object into a textured 3D model you can turn around and download.", example: "Make a game-ready prop from a product photo" },
   speech: { blurb: "Paste some text and hear it read aloud, then try other voices and compare speed and cost.", example: "Hear how a new voice model reads a long paragraph" },
   router: { blurb: "See which model auto would pick for a prompt, and try new weights before applying them.", example: "Why did this request go to the small model?" },
   verdicts: { blurb: "Ask yes/no, choice or score questions about text or JSON and get calibrated answers.", example: "Triage a support ticket into a team and urgency" },

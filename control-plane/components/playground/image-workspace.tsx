@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, Download, Expand, Loader2 } from "lucide-react";
+import { Box, ChevronDown, Download, Expand, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -73,6 +73,7 @@ export function ImageWorkspace({
   loading,
   storageKey,
   settingsOpen = true,
+  onMakeMesh,
 }: {
   session: PlaygroundSession;
   update: (patch: Partial<PlaygroundSession>) => void;
@@ -80,6 +81,8 @@ export function ImageWorkspace({
   loading: boolean;
   storageKey: string;
   settingsOpen?: boolean;
+  /** Open an image in 3D mode; offered only when a 3D model is registered. */
+  onMakeMesh?: (url: string) => void;
 }) {
   const [runs, setRuns] = useState<Run[]>([]);
   const timeline = useRef<HTMLDivElement>(null);
@@ -91,6 +94,7 @@ export function ImageWorkspace({
   const count = session.imageCount ?? 1;
   const busy = runs.some((r) => r.status === "busy");
   const perImage = imageModels.find((m) => m.model_name === target)?.cost_per_image ?? 0;
+  const canMesh = !!onMakeMesh && models.some((m) => m.model_type === "mesh");
 
   // Results are memory-only, so the session export is the only way to keep
   // them; hook into the same event the chat workspaces use. Flattened to the
@@ -250,6 +254,7 @@ export function ImageWorkspace({
                         <figcaption className="absolute inset-x-1.5 top-1.5 flex justify-end gap-1 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
                           <a href={image.url} target="_blank" rel="noreferrer" aria-label="Open full size" title="Open full size" className="inline-flex h-[30px] w-[30px] items-center justify-center rounded-lg bg-background/80 text-foreground"><Expand className="h-3.5 w-3.5" /></a>
                           <a href={image.url} download={`playground-${image.id}.png`} aria-label="Download" title="Download" className="inline-flex h-[30px] w-[30px] items-center justify-center rounded-lg bg-background/80 text-foreground"><Download className="h-3.5 w-3.5" /></a>
+                          {canMesh && <button type="button" onClick={() => onMakeMesh?.(image.url)} aria-label="Make 3D" title="Make a 3D model from this image" className="inline-flex h-[30px] items-center gap-1 rounded-lg bg-background/80 px-2 text-[11.5px] text-foreground"><Box className="h-3.5 w-3.5" />3D</button>}
                         </figcaption>
                         {image.seed !== undefined && (
                           <button type="button" onClick={() => update({ imageSeed: image.seed })} className="absolute bottom-1.5 left-1.5 h-[26px] rounded-md bg-background/80 px-2 text-[11.5px] opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100">Use this seed</button>

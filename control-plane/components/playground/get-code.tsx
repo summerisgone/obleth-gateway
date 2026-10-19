@@ -13,6 +13,7 @@ import { Segmented, modelLabel } from "./ui";
 type Lang = "curl" | "python" | "javascript";
 
 const SPEECH_PATH = "/v1/audio/speech";
+const MESH_PATH = "/v1/meshes";
 
 /** The conversations the open chat lanes hold right now, keyed by lane index. */
 function liveLanes(sessionId: string): Map<number, Conversation> {
@@ -40,6 +41,19 @@ export function requestFor(session: PlaygroundSession, lane: number, lanes: Map<
         ...(session.imageSteps !== undefined ? { steps: session.imageSteps } : {}),
         ...(session.imageSeed !== undefined ? { seed: session.imageSeed } : {}),
       },
+    };
+  }
+  if (session.mode === "mesh") {
+    return {
+      path: MESH_PATH,
+      body: {
+        model: session.meshModel ?? "MESH_MODEL",
+        resolution: session.meshResolution ?? "1024",
+        faces: session.meshFaces ?? 500_000,
+        texture_size: session.meshTexture ?? 2048,
+        ...(session.meshSeed !== undefined ? { seed: session.meshSeed } : {}),
+      },
+      note: "A job: start it with the image, poll until it completes, then download the .glb.",
     };
   }
   if (session.mode === "speech") {
@@ -155,6 +169,25 @@ export function speechSnippet(lang: Lang, gatewayBase: string, body: Record<stri
   return `import { createWriteStream } from "node:fs";\nimport { Readable } from "node:stream";\nimport { pipeline } from "node:stream/promises";\n\nconst response = await fetch("${url}", {\n  method: "POST",\n  headers: {\n    Authorization: \`Bearer \${process.env.OBLETH_API_KEY}\`,\n    "Content-Type": "application/json",\n  },\n  body: JSON.stringify(${json.replace(/\n/g, "\n  ")}),\n});\nif (!response.ok) throw new Error(await response.text());\nawait pipeline(Readable.fromWeb(response.body), createWriteStream("speech.wav"));`;
 }
 
+/**
+ * A mesh is a job with an image upload, so its snippets send a multipart form,
+ * poll the job, and save the binary glTF once it completes.
+ */
+export function meshSnippet(lang: Lang, gatewayBase: string, body: Record<string, unknown>): string {
+  const url = `${gatewayBase}${MESH_PATH}`;
+  const fields = Object.entries(body);
+  if (lang === "curl") {
+    const form = fields.map(([k, v]) => `  -F ${k}=${String(v)} \\`).join("\n");
+    return `# 1. Start the job; the answer has its id\ncurl ${url} \\\n  -H "Authorization: Bearer $OBLETH_API_KEY" \\\n${form}\n  -F image=@object.png\n\n# 2. Poll until "status" is "completed"\ncurl ${url}/$JOB_ID -H "Authorization: Bearer $OBLETH_API_KEY"\n\n# 3. Download the model\ncurl ${url}/$JOB_ID/content -H "Authorization: Bearer $OBLETH_API_KEY" -o model.glb`;
+  }
+  if (lang === "python") {
+    const data = `{\n${fields.map(([k, v]) => `        ${JSON.stringify(k)}: ${JSON.stringify(String(v))},`).join("\n")}\n    }`;
+    return `import os\nimport time\nimport requests\n\nurl = "${url}"\nheaders = {"Authorization": f"Bearer {os.environ['OBLETH_API_KEY']}"}\n\nwith open("object.png", "rb") as image:\n    job = requests.post(url, headers=headers, files={"image": image}, data=${data}).json()\n\nwhile job["status"] not in ("completed", "failed"):\n    time.sleep(5)\n    job = requests.get(f"{url}/{job['id']}", headers=headers).json()\n    print(job["status"], job.get("progress"))\n\nif job["status"] == "completed":\n    model = requests.get(f"{url}/{job['id']}/content", headers=headers)\n    with open("model.glb", "wb") as f:\n        f.write(model.content)`;
+  }
+  const form = fields.map(([k, v]) => `form.set(${JSON.stringify(k)}, ${JSON.stringify(String(v))});`).join("\n");
+  return `import { openAsBlob } from "node:fs";\nimport { writeFile } from "node:fs/promises";\n\nconst url = "${url}";\nconst headers = { Authorization: \`Bearer \${process.env.OBLETH_API_KEY}\` };\n\nconst form = new FormData();\n${form}\nform.set("image", await openAsBlob("object.png"), "object.png");\nlet job = await (await fetch(url, { method: "POST", headers, body: form })).json();\n\nwhile (job.status !== "completed" && job.status !== "failed") {\n  await new Promise((r) => setTimeout(r, 5000));\n  job = await (await fetch(\`\${url}/\${job.id}\`, { headers })).json();\n  console.log(job.status, job.progress);\n}\n\nif (job.status === "completed") {\n  const model = await fetch(\`\${url}/\${job.id}/content\`, { headers });\n  await writeFile("model.glb", Buffer.from(await model.arrayBuffer()));\n}`;
+}
+
 /** "Get code": the session's current request as something to paste into a terminal or a program. */
 export function GetCode({ open, onOpenChange, session, gatewayBase }: {
   open: boolean; onOpenChange: (open: boolean) => void; session: PlaygroundSession; gatewayBase: string;
@@ -178,7 +211,7 @@ export function GetCode({ open, onOpenChange, session, gatewayBase }: {
   const assistantOnly = chat && choices.length === 0;
   const { path, body, note } = requestFor(session, lane, lanes);
   const base = gatewayBase.replace(/\/$/, "");
-  const code = path === SPEECH_PATH ? speechSnippet(lang, base, body) : snippet(lang, `${base}${path}`, body);
+  const code = path === SPEECH_PATH ? speechSnippet(lang, base, body) : path === MESH_PATH ? meshSnippet(lang, base, body) : snippet(lang, `${base}${path}`, body);
   const copy = () => void navigator.clipboard.writeText(code).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }).catch(() => {});
 
   return (

@@ -21,7 +21,7 @@ export type LogWindowId = (typeof LOG_WINDOWS)[number]["id"];
  * also lists any other type the log has shown (`typeOptions`), so a new
  * endpoint is filterable before this list learns about it.
  */
-export const REQUEST_TYPES = ["chat", "completion", "responses", "messages", "verdict", "embedding", "audio", "image", "video", "rerank", "moderation", "search", "mcp", "other"] as const;
+export const REQUEST_TYPES = ["chat", "completion", "responses", "messages", "verdict", "embedding", "audio", "image", "video", "mesh", "rerank", "moderation", "search", "mcp", "other"] as const;
 
 /** The Type menu: the known types, then any others the log has shown, then the current one. */
 export function typeOptions(seen: Iterable<string>, current = ""): string[] {

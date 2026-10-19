@@ -29,12 +29,13 @@ import { parseTagLevel, TAG_LEVEL_LABELS } from "@/lib/utils";
 // Types and where a model runs
 // ---------------------------------------------------------------------------
 
-export type TypeGroup = "chat" | "image" | "video" | "audio" | "embedding" | "search";
+export type TypeGroup = "chat" | "image" | "video" | "mesh" | "audio" | "embedding" | "search";
 
 export const TYPE_GROUPS: { value: TypeGroup; label: string }[] = [
   { value: "chat", label: "Chat" },
   { value: "image", label: "Image" },
   { value: "video", label: "Video" },
+  { value: "mesh", label: "3D" },
   { value: "audio", label: "Audio" },
   { value: "embedding", label: "Embed" },
   { value: "search", label: "Search" },
@@ -42,7 +43,7 @@ export const TYPE_GROUPS: { value: TypeGroup; label: string }[] = [
 
 export function typeGroup(type: string): TypeGroup {
   if (type === "audio_transcription" || type === "audio_speech") return "audio";
-  if (type === "image" || type === "video" || type === "embedding" || type === "search") return type;
+  if (type === "image" || type === "video" || type === "mesh" || type === "embedding" || type === "search") return type;
   return "chat";
 }
 
@@ -53,6 +54,7 @@ export const MODEL_TYPE_NAMES: Record<string, string> = {
   audio_speech: "Text to speech",
   image: "Image",
   video: "Video",
+  mesh: "3D mesh",
   search: "Web search",
 };
 
@@ -136,6 +138,8 @@ export function priceLabel(model: Pick<ModelRoute, "model_type" | "input_cost_pe
       return model.cost_per_image > 0 ? `${money(model.cost_per_image)} / image` : null;
     case "video":
       return model.cost_per_video > 0 ? `${money(model.cost_per_video)} / video` : null;
+    case "mesh":
+      return model.cost_per_video > 0 ? `${money(model.cost_per_video)} / mesh` : null;
     case "audio_speech":
       return model.cost_per_character > 0 ? `${perM(model.cost_per_character)} / 1M chars` : null;
     case "audio_transcription":
@@ -276,7 +280,7 @@ export function sortRows(rows: ModelRow[], sort: ModelSort): ModelRow[] {
 }
 
 export function groupCounts(rows: ModelRow[]): Record<TypeGroup | "all", number> {
-  const counts = { all: rows.length, chat: 0, image: 0, video: 0, audio: 0, embedding: 0, search: 0 };
+  const counts = { all: rows.length, chat: 0, image: 0, video: 0, mesh: 0, audio: 0, embedding: 0, search: 0 };
   for (const r of rows) counts[r.group] += 1;
   return counts;
 }

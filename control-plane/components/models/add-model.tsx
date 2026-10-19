@@ -27,6 +27,7 @@ export function guessModelType(upstream: string): string {
   if (/whisper|asr|transcri|parakeet/.test(s)) return "audio_transcription";
   if (/tts|speech|kokoro|voice/.test(s)) return "audio_speech";
   if (/wan-?\d|video|hunyuanvideo|ltx|mochi/.test(s)) return "video";
+  if (/trellis|hunyuan3d|triposr|instantmesh|mesh/.test(s)) return "mesh";
   if (/flux|sdxl|stable-diffusion|diffusion|dall-?e|imagen|qwen-image/.test(s)) return "image";
   if (/searx/.test(s)) return "search";
   return "chat";
@@ -103,6 +104,7 @@ const PRICE_FIELDS: Record<string, { name: string; label: string; perMillion: bo
   embedding: [{ name: "input_cost_per_token", label: "Input per 1M tokens", perMillion: true }],
   image: [{ name: "cost_per_image", label: "Per image", perMillion: false }],
   video: [{ name: "cost_per_video", label: "Per video", perMillion: false }],
+  mesh: [{ name: "cost_per_video", label: "Per mesh", perMillion: false }],
   audio_speech: [{ name: "cost_per_character", label: "Per 1M characters", perMillion: true }],
   audio_transcription: [{ name: "cost_per_audio_second", label: "Per audio second", perMillion: false }],
 };

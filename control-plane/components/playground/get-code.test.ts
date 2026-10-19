@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Conversation } from "@/lib/charo/conversation";
 import type { PlaygroundSession } from "./playground";
-import { requestFor, snippet, speechSnippet } from "./get-code";
+import { meshSnippet, requestFor, snippet, speechSnippet } from "./get-code";
 
 const base: PlaygroundSession = { id: "s1", title: "t", mode: "compare", models: ["llama"], generation: { systemPrompt: "" } };
 const lanes = (messages: Conversation["messages"]) => new Map([[0, { messages, activeTarget: null, targetStart: null }]]);
@@ -93,5 +93,24 @@ describe("Get code", () => {
     const js = speechSnippet("javascript", "https://gw", body);
     expect(js).toContain('fetch("https://gw/v1/audio/speech"');
     expect(js).toContain('pipeline(Readable.fromWeb(response.body), createWriteStream("speech.wav"))');
+  });
+
+  it("builds a mesh job from the 3D draft: upload, poll, then download", () => {
+    const session = { id: "s", title: "t", mode: "mesh" as const, models: ["charo"], generation: { systemPrompt: "" }, meshModel: "trellis", meshResolution: "512" as const, meshSeed: 3 };
+    const { path, body } = requestFor(session, 0, new Map());
+    expect(path).toBe("/v1/meshes");
+    expect(body).toEqual({ model: "trellis", resolution: "512", faces: 500_000, texture_size: 2048, seed: 3 });
+
+    const curl = meshSnippet("curl", "https://gw", body);
+    expect(curl).toContain("-F model=trellis");
+    expect(curl).toContain("-F image=@object.png");
+    expect(curl).toContain("https://gw/v1/meshes/$JOB_ID/content");
+    const py = meshSnippet("python", "https://gw", body);
+    expect(py).toContain('files={"image": image}');
+    expect(py).toContain('"resolution": "512"');
+    expect(py).toContain('open("model.glb", "wb")');
+    const js = meshSnippet("javascript", "https://gw", body);
+    expect(js).toContain('form.set("model", "trellis");');
+    expect(js).toContain('await writeFile("model.glb"');
   });
 });

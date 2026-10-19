@@ -201,7 +201,7 @@ export function buildFleet(
 /** Friendly names for the model types a registry uses, for the fleet's filter chips. */
 export function modelTypeLabel(type: string): string {
   const labels: Record<string, string> = {
-    chat: "Chat", completion: "Chat", image: "Image", video: "Video", embedding: "Embed", embeddings: "Embed",
+    chat: "Chat", completion: "Chat", image: "Image", video: "Video", mesh: "3D", embedding: "Embed", embeddings: "Embed",
     rerank: "Rerank", audio_transcription: "Audio", audio_speech: "Audio", transcription: "Audio", speech: "Audio", tts: "Audio",
   };
   return labels[type] ?? type.replace(/[_-]+/g, " ").replace(/^\w/, (c) => c.toUpperCase());
