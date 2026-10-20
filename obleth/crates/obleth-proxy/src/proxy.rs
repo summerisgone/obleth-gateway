@@ -6338,8 +6338,9 @@ pub(crate) fn resolve_conversation(
     }
 }
 
-/// Maximum seed text hashed; bounds work on huge system prompts. The same
-/// leading bytes are replayed every turn, so capping stays stable.
+/// Maximum seed text hashed per part (system/developer text, first user
+/// message); bounds work on huge prompts. The same leading bytes are replayed
+/// every turn, so capping stays stable.
 const SEED_CAP: usize = 8 * 1024;
 
 /// Build the stable conversation seed: leading system/developer message text up
@@ -6351,9 +6352,14 @@ fn conversation_seed(json: &serde_json::Value) -> Option<String> {
     for msg in messages {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         match role {
-            "system" | "developer" => push_capped(&mut seed, &message_text(msg.get("content"))),
+            "system" | "developer" => {
+                push_capped(&mut seed, &message_text(msg.get("content")), SEED_CAP)
+            }
             "user" => {
-                push_capped(&mut seed, &message_text(msg.get("content")));
+                // Own budget: agents share one long system prompt, and the first
+                // user message is often the only text that tells sessions apart.
+                let limit = seed.len() + usize::from(!seed.is_empty()) + SEED_CAP;
+                push_capped(&mut seed, &message_text(msg.get("content")), limit);
                 break; // first user turn closes the seed
             }
             _ => {}
@@ -6366,16 +6372,16 @@ fn conversation_seed(json: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Append up to the seed cap, with a separator so adjacent messages can't merge
-/// into a colliding blob.
-fn push_capped(seed: &mut String, text: &str) {
-    if seed.len() >= SEED_CAP || text.is_empty() {
+/// Append until the seed reaches `limit` bytes, with a separator so adjacent
+/// messages can't merge into a colliding blob.
+fn push_capped(seed: &mut String, text: &str, limit: usize) {
+    if seed.len() >= limit || text.is_empty() {
         return;
     }
     if !seed.is_empty() {
         seed.push('\u{1f}'); // unit separator
     }
-    let room = SEED_CAP - seed.len();
+    let room = limit - seed.len();
     if text.len() <= room {
         seed.push_str(text);
     } else {
@@ -8777,6 +8783,30 @@ mod tests {
         let b = resolve_conversation(&HeaderMap::new(), &turn3, tid, true);
         assert_eq!(a.source.as_str(), "derived");
         assert_eq!(a.value, b.value, "same seed across turns must hash equal");
+    }
+
+    #[test]
+    fn derived_separates_sessions_behind_a_long_system_prompt() {
+        let tid = Uuid::nil();
+        let system = "x".repeat(12 * 1024);
+        let open = |task: &str| {
+            serde_json::json!({"messages":[
+                {"role":"system","content":system},
+                {"role":"user","content":task}
+            ]})
+        };
+        let a1 = resolve_conversation(&HeaderMap::new(), &open("read crate alpha"), tid, true);
+        let b1 = resolve_conversation(&HeaderMap::new(), &open("read crate beta"), tid, true);
+        assert_ne!(a1.value, b1.value, "first user message must reach the hash");
+        let a3 = serde_json::json!({"messages":[
+            {"role":"system","content":system},
+            {"role":"user","content":"read crate alpha"},
+            {"role":"assistant","content":"reading"},
+            {"role":"tool","content":"fn main() {}"},
+            {"role":"user","content":"now summarize"}
+        ]});
+        let a3 = resolve_conversation(&HeaderMap::new(), &a3, tid, true);
+        assert_eq!(a1.value, a3.value, "same conversation keeps its id");
     }
 
     #[test]
