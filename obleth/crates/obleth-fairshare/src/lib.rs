@@ -51,6 +51,7 @@
 //! scheduler's housekeeping timer, which also drops queued waiters whose
 //! caller has gone.
 
+mod affinity;
 mod algorithm;
 mod capacity;
 pub mod history;
@@ -82,7 +83,7 @@ use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-use obleth_config::{Admission, FairshareAlgorithm};
+use obleth_config::{Admission, FairshareAlgorithm, SessionAffinityConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -323,6 +324,8 @@ pub struct AdmitRequest {
     pub cost: u32,
     /// Set when `key` is an end user's derived key (see [`EndUser`]).
     pub end_user: Option<EndUser>,
+    /// The conversation this request is a step of, for session affinity.
+    pub session: Option<String>,
 }
 
 impl AdmitRequest {
@@ -347,6 +350,7 @@ impl AdmitRequest {
             key_max_in_flight: None,
             cost,
             end_user: None,
+            session: None,
         }
     }
 
@@ -393,6 +397,13 @@ impl AdmitRequest {
         });
         self
     }
+
+    /// The conversation id; empty means none.
+    pub fn session(mut self, id: impl Into<String>) -> Self {
+        let id = id.into();
+        self.session = (!id.is_empty()).then_some(id);
+        self
+    }
 }
 
 /// A held admission slot. Dropping it returns capacity to the scheduler.
@@ -401,6 +412,7 @@ pub struct Permit {
     tenant: Uuid,
     key: Uuid,
     pool: PoolKey,
+    session: Option<String>,
 }
 
 impl Drop for Permit {
@@ -410,6 +422,7 @@ impl Drop for Permit {
                 tenant: self.tenant,
                 key: self.key,
                 pool: std::mem::replace(&mut self.pool, PoolKey::Unrouted),
+                session: self.session.take(),
             });
         }
     }
@@ -433,6 +446,7 @@ enum Ctl {
         tenant: Uuid,
         key: Uuid,
         pool: PoolKey,
+        session: Option<String>,
     },
     Snapshot {
         respond: oneshot::Sender<FairshareSnapshot>,
@@ -445,6 +459,9 @@ enum Ctl {
     },
     SetReplicas(usize),
     SetModelCaps(HashMap<String, usize>),
+    SetSessionAffinity(Option<SessionAffinityConfig>),
+    /// A slot held for a session's next step may have run out.
+    HoldExpired(PoolKey),
     EnableShared {
         backend: Arc<dyn SharedSlots>,
         config: SharedSlotsConfig,
@@ -523,6 +540,7 @@ impl FairShare {
             shared: None,
             next_op_id: 0,
             model_caps: HashMap::new(),
+            session_affinity: None,
             pools: HashMap::new(),
             pool_order: Vec::new(),
             cursor: 0,
@@ -667,6 +685,12 @@ impl FairShare {
         let _ = self.ctl.send(Ctl::SetModelCaps(caps));
     }
 
+    /// Turn session affinity on (`Some`) or off for every pool. See the
+    /// `affinity` module for what it does.
+    pub fn set_session_affinity(&self, config: Option<SessionAffinityConfig>) {
+        let _ = self.ctl.send(Ctl::SetSessionAffinity(config));
+    }
+
     pub async fn snapshot(&self) -> Option<FairshareSnapshot> {
         let (respond, rx) = oneshot::channel();
         self.ctl.send(Ctl::Snapshot { respond }).ok()?;
@@ -716,6 +740,9 @@ struct Waiter {
     key_max_in_flight: Option<usize>,
     cost: u32,
     end_user: Option<EndUser>,
+    session: Option<String>,
+    /// Session affinity put it ahead of an older waiter when it was taken.
+    jumped: bool,
     enqueued: Instant,
     /// The local fast path would have admitted it on arrival; in shared mode
     /// it is still reported as fast if its first claim succeeds.
@@ -759,9 +786,9 @@ impl TenantQueue {
         self.len += 1;
     }
 
-    fn pop(&mut self, key: &Uuid) -> Option<Waiter> {
+    fn pop_at(&mut self, key: &Uuid, at: usize) -> Option<Waiter> {
         let queue = self.keys.get_mut(key)?;
-        let waiter = queue.pop_front()?;
+        let waiter = queue.remove(at)?;
         if queue.is_empty() {
             self.keys.remove(key);
         }
@@ -827,6 +854,9 @@ struct Pool {
     blocked_keys: HashSet<Uuid>,
     /// Shared mode: the pool's cluster-wide occupancy as last reported.
     cluster_in_flight: Option<usize>,
+    /// Session affinity state; kept across [`Pool::reset`], since a session
+    /// stays cached upstream while the pool is idle.
+    affinity: affinity::Affinity,
     ctl_tx: mpsc::UnboundedSender<Ctl>,
 }
 
@@ -868,6 +898,7 @@ impl Pool {
             blocked_tenants: HashSet::new(),
             blocked_keys: HashSet::new(),
             cluster_in_flight: None,
+            affinity: affinity::Affinity::default(),
             ctl_tx,
         }
     }
@@ -1080,7 +1111,10 @@ impl Pool {
     }
 
     fn can_grant_immediately(&self, req: &AdmitRequest, effective: usize) -> bool {
-        if self.in_flight >= effective || self.queued_total > 0 {
+        let held = self
+            .affinity
+            .held_for_others(req.session.as_deref(), Instant::now());
+        if self.in_flight + held >= effective || self.queued_total > 0 {
             return false;
         }
         if !self.tenant_has_slot(&req.tenant) || !self.key_has_slot(&req.key) {
@@ -1112,6 +1146,7 @@ impl Pool {
         &self,
         tenant: Uuid,
         key: Uuid,
+        session: Option<String>,
         admission: Admission,
         waited: Duration,
     ) -> Admitted {
@@ -1121,25 +1156,35 @@ impl Pool {
                 tenant,
                 key,
                 pool: self.key.clone(),
+                session,
             },
             admission,
             waited,
         }
     }
 
+    /// Hand a grant to its caller. `session` and `jumped` are the waiter's,
+    /// for session affinity.
+    #[allow(clippy::too_many_arguments)]
     fn send(
-        &self,
+        &mut self,
         tenant: Uuid,
         key: Uuid,
+        session: Option<String>,
+        jumped: bool,
         respond: oneshot::Sender<Admitted>,
         admission: Admission,
         waited: Duration,
     ) {
+        let arrived = Instant::now()
+            .checked_sub(waited)
+            .unwrap_or_else(Instant::now);
+        self.affinity.granted(session.as_deref(), jumped, arrived);
         // If the caller is gone, `send` hands the `Admitted` back as `Err` and
         // dropping it here drops its `Permit`, which already releases the
         // slot via `Permit::drop`. An explicit release here would double up:
         // this grant would be released twice for one occupy.
-        let _ = respond.send(self.make_admitted(tenant, key, admission, waited));
+        let _ = respond.send(self.make_admitted(tenant, key, session, admission, waited));
     }
 
     fn grant_fast(&mut self, req: AdmitRequest, respond: oneshot::Sender<Admitted>) {
@@ -1147,6 +1192,8 @@ impl Pool {
         self.send(
             req.tenant,
             req.key,
+            req.session,
+            false,
             respond,
             Admission::Fast,
             Duration::ZERO,
@@ -1202,6 +1249,8 @@ impl Pool {
                 key_max_in_flight: req.key_max_in_flight,
                 cost: req.cost,
                 end_user: req.end_user,
+                session: req.session,
+                jumped: false,
                 enqueued,
                 fast,
                 respond,
@@ -1220,7 +1269,15 @@ impl Pool {
             return (false, dropped);
         };
         let waited = waiter.enqueued.elapsed();
-        self.send(tenant, key, waiter.respond, Admission::Queued, waited);
+        self.send(
+            tenant,
+            key,
+            waiter.session,
+            waiter.jumped,
+            waiter.respond,
+            Admission::Queued,
+            waited,
+        );
         (true, dropped)
     }
 
@@ -1229,30 +1286,58 @@ impl Pool {
     /// are dropped on the way; the count comes back with the pick.
     fn take_next(&mut self, effective: usize) -> (Option<(Uuid, Uuid, Waiter)>, usize) {
         let mut dropped = 0;
+        let now = Instant::now();
+        self.affinity.expire_holds(now);
         loop {
             if self.in_flight >= effective || self.queued_total == 0 {
                 return (None, dropped);
             }
-            let Some(tenant) = self.pick_tenant(effective) else {
-                return (None, dropped);
+            // Slots held for warm sessions' next steps are not free for
+            // anyone else until they run out, or until the oldest waiter has
+            // waited long enough to stop yielding to them.
+            let held = self.affinity.held_for_others(None, now);
+            let held_only = held > 0
+                && self.in_flight + held >= effective
+                && !self
+                    .oldest_queued()
+                    .is_some_and(|t| self.affinity.aged(t, now));
+            let (tenant, key, at) = if held_only {
+                let Some(pick) = self.pick_held(now) else {
+                    return (None, dropped);
+                };
+                pick
+            } else {
+                let Some(tenant) = self.pick_tenant(effective) else {
+                    return (None, dropped);
+                };
+                let Some(key) = self.pick_key(&tenant) else {
+                    return (None, dropped);
+                };
+                let queue = &self.queues[&tenant].keys[&key];
+                let at = self.affinity.pick(
+                    queue.iter().map(|w| (w.session.as_deref(), w.enqueued)),
+                    now,
+                );
+                (tenant, key, at)
             };
-            let Some(key) = self.pick_key(&tenant) else {
-                return (None, dropped);
-            };
-            let waiter = {
+            let mut waiter = {
                 let queue = self.queues.get_mut(&tenant).expect("picked tenant exists");
-                let waiter = queue.pop(&key).expect("picked key non-empty");
+                let waiter = queue.pop_at(&key, at).expect("picked waiter exists");
                 if queue.is_empty() {
                     self.queues.remove(&tenant);
                 }
                 waiter
             };
+            waiter.jumped =
+                at > 0 || (held_only && self.oldest_queued().is_some_and(|t| t < waiter.enqueued));
             self.queued_total -= 1;
             if waiter.respond.is_closed() {
                 dropped += 1;
                 self.forget_if_quiet(tenant, key);
                 continue;
             }
+            // Its slot is taken now; in shared mode the grant comes later.
+            self.affinity.take_hold(waiter.session.as_deref());
             self.track_waiter_meta(tenant, key, &waiter);
             self.occupy(tenant, key, waiter.cost);
             self.advance_virtual_time();
@@ -1487,7 +1572,44 @@ impl Pool {
         }
     }
 
-    fn release(&mut self, tenant: Uuid, key: Uuid) {
+    /// Arrival time of the oldest waiter in the pool.
+    fn oldest_queued(&self) -> Option<Instant> {
+        self.queues
+            .values()
+            .flat_map(|q| q.keys.values())
+            .filter_map(|d| d.front().map(|w| w.enqueued))
+            .min()
+    }
+
+    /// The oldest waiter a slot is held for, among tenants and keys under
+    /// their caps: (tenant, key, index in the key's queue).
+    fn pick_held(&self, now: Instant) -> Option<(Uuid, Uuid, usize)> {
+        let mut best: Option<(Uuid, Uuid, usize, Instant)> = None;
+        for (tenant, queue) in &self.queues {
+            if !self.tenant_has_slot(tenant) || self.blocked_tenants.contains(tenant) {
+                continue;
+            }
+            for (key, deque) in &queue.keys {
+                if !self.key_open(key) {
+                    continue;
+                }
+                let held = deque
+                    .iter()
+                    .position(|w| self.affinity.holds_for(w.session.as_deref(), now));
+                if let Some(at) = held {
+                    let enqueued = deque[at].enqueued;
+                    if best.is_none_or(|(_, _, _, t)| enqueued < t) {
+                        best = Some((*tenant, *key, at, enqueued));
+                    }
+                }
+            }
+        }
+        best.map(|(t, k, at, _)| (t, k, at))
+    }
+
+    /// Returns when the slot it holds for the session's next step runs out,
+    /// if it holds one.
+    fn release(&mut self, tenant: Uuid, key: Uuid, session: Option<&str>) -> Option<Instant> {
         self.in_flight = self.in_flight.saturating_sub(1);
         if let Some(n) = self.tenant_in_flight.get_mut(&tenant) {
             *n = n.saturating_sub(1);
@@ -1502,6 +1624,7 @@ impl Pool {
             }
         }
         self.forget_if_quiet(tenant, key);
+        self.affinity.released(session, Instant::now())
     }
 
     fn forget_if_quiet(&mut self, tenant: Uuid, key: Uuid) {
@@ -1949,6 +2072,8 @@ struct Scheduler {
     /// Configured pool sizes set with [`FairShare::set_model_caps`], which win
     /// over the cap an admission carries.
     model_caps: HashMap<String, usize>,
+    /// Set with [`FairShare::set_session_affinity`]; applies to every pool.
+    session_affinity: Option<SessionAffinityConfig>,
     pools: HashMap<PoolKey, Pool>,
     /// Insertion order of pools, for round-robin when the ceiling binds.
     pool_order: Vec<PoolKey>,
@@ -2057,10 +2182,11 @@ impl Scheduler {
         match msg {
             Ctl::Admit {
                 pool: key,
-                req,
+                mut req,
                 respond,
                 enqueued,
             } => {
+                req.session = req.session.take().map(|s| affinity::scoped(req.key, &s));
                 let ceiling = self.ceiling();
                 let headroom = ceiling.saturating_sub(self.in_flight);
                 let default_cap = self.default_model_cap;
@@ -2105,10 +2231,18 @@ impl Scheduler {
                 tenant,
                 key,
                 pool: pool_key,
+                session,
             } => {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 if let Some(pool) = self.pools.get_mut(&pool_key) {
-                    pool.release(tenant, key);
+                    if let Some(until) = pool.release(tenant, key, session.as_deref()) {
+                        let tx = self.ctl_tx.clone();
+                        let expired = pool_key.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep_until(until.into()).await;
+                            let _ = tx.send(Ctl::HoldExpired(expired));
+                        });
+                    }
                     pool.settle_idle();
                 }
                 if self.mode == SlotMode::Shared || self.quiesced_reconcile_running() {
@@ -2211,6 +2345,24 @@ impl Scheduler {
                 self.maybe_start_reconcile();
                 self.dispatch_all();
                 self.publish_stats();
+            }
+            Ctl::SetSessionAffinity(config) => {
+                self.session_affinity = config;
+                for pool in self.pools.values_mut() {
+                    pool.affinity.set_config(config);
+                }
+                self.dispatch_all();
+                self.publish_stats();
+            }
+            Ctl::HoldExpired(key) => {
+                let expired = self
+                    .pools
+                    .get_mut(&key)
+                    .is_some_and(|pool| pool.affinity.expire_holds(Instant::now()));
+                if expired {
+                    self.dispatch_all();
+                    self.publish_stats();
+                }
             }
             Ctl::Wake(pool) => {
                 if self.mode != SlotMode::Shared {
@@ -2529,7 +2681,15 @@ impl Scheduler {
                     Admission::Queued
                 };
                 let waited = waiter.enqueued.elapsed();
-                pool.send(tenant, key_id, waiter.respond, admission, waited);
+                pool.send(
+                    tenant,
+                    key_id,
+                    waiter.session,
+                    waiter.jumped,
+                    waiter.respond,
+                    admission,
+                    waited,
+                );
                 if let Some(s) = self.shared.as_mut() {
                     s.cluster_in_flight = Some(counts.global);
                 }
@@ -2719,6 +2879,7 @@ impl Scheduler {
                 self.ctl_tx.clone(),
             );
             pool.set_divisor(self.divisor);
+            pool.affinity.set_config(self.session_affinity);
             self.pools.insert(key.clone(), pool);
             self.pool_order.push(key.clone());
         }
@@ -2729,8 +2890,10 @@ impl Scheduler {
     /// caller has gone, then drop pools that have been idle for the TTL.
     fn sweep(&mut self) {
         let mut dropped = 0;
+        let now = Instant::now();
         for pool in self.pools.values_mut() {
             dropped += pool.prune_dead_waiters();
+            pool.affinity.prune(now);
             pool.settle_idle();
         }
         self.queued_total = self.queued_total.saturating_sub(dropped);

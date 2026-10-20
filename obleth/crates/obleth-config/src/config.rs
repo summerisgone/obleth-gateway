@@ -87,6 +87,8 @@ pub struct Config {
     pub fairshare_replica_ttl: Duration,
     /// Settings for models in the `discovered` capacity mode.
     pub capacity_discovery: CapacityDiscoveryConfig,
+    /// Session affinity in the fairshare queue; `None` while off.
+    pub session_affinity: Option<SessionAffinityConfig>,
 
     /// Fail-open: keep serving from cache + buffer telemetry to WAL when
     /// Redis/ClickHouse are unavailable. Fail-closed rejects instead.
@@ -202,6 +204,74 @@ impl CapacityDiscoveryConfig {
 impl Default for CapacityDiscoveryConfig {
     fn default() -> Self {
         Self::from_values(None, None, None, None)
+    }
+}
+
+/// Session affinity in the fairshare queue: the next step of an agent session
+/// whose context is still cached upstream goes ahead of its key's other
+/// waiters, and a slot its finished step frees is held for it briefly. Off
+/// unless `OBLETH_SESSION_AFFINITY` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionAffinityConfig {
+    /// How long after its last step finished a session counts as warm
+    /// (`OBLETH_SESSION_AFFINITY_WARM_SECS`, default 120).
+    pub warm_ttl: Duration,
+    /// How long a freed slot waits for the next step of the session that
+    /// freed it (`OBLETH_SESSION_AFFINITY_HOLD_MS`, default 3000; 0 disables;
+    /// at most `max_bypass`).
+    pub hold: Duration,
+    /// How many times in a row a session may go ahead of an older waiter
+    /// before it queues in arrival order again
+    /// (`OBLETH_SESSION_AFFINITY_MAX_JUMPS`, default 8, at least 1).
+    pub max_jumps: u32,
+    /// A waiter queued this long is no longer passed over and no longer
+    /// waits behind held slots (`OBLETH_SESSION_AFFINITY_MAX_BYPASS_SECS`,
+    /// default 30). Keep it well under the admission timeout.
+    pub max_bypass: Duration,
+}
+
+impl SessionAffinityConfig {
+    pub fn from_env() -> Option<Self> {
+        Self::from_values(
+            env::var("OBLETH_SESSION_AFFINITY").ok().as_deref(),
+            env::var("OBLETH_SESSION_AFFINITY_WARM_SECS")
+                .ok()
+                .as_deref(),
+            env::var("OBLETH_SESSION_AFFINITY_HOLD_MS").ok().as_deref(),
+            env::var("OBLETH_SESSION_AFFINITY_MAX_JUMPS")
+                .ok()
+                .as_deref(),
+            env::var("OBLETH_SESSION_AFFINITY_MAX_BYPASS_SECS")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// Build from raw env values; `None` while disabled. Unparseable values
+    /// fall back to the defaults.
+    pub fn from_values(
+        enabled: Option<&str>,
+        warm_secs: Option<&str>,
+        hold_ms: Option<&str>,
+        max_jumps: Option<&str>,
+        max_bypass_secs: Option<&str>,
+    ) -> Option<Self> {
+        if !lenient_bool(enabled, false) {
+            return None;
+        }
+        let num = |v: Option<&str>, default: u64| {
+            v.and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(default)
+        };
+        let max_bypass = Duration::from_secs(num(max_bypass_secs, 30).max(1));
+        Some(SessionAffinityConfig {
+            warm_ttl: Duration::from_secs(num(warm_secs, 120).max(1)),
+            // A waiter that ages during a hold is only re-checked when the
+            // hold ends, so a hold may delay it by up to its own length.
+            hold: Duration::from_millis(num(hold_ms, 3000)).min(max_bypass),
+            max_jumps: u32::try_from(num(max_jumps, 8)).unwrap_or(u32::MAX).max(1),
+            max_bypass,
+        })
     }
 }
 
@@ -327,6 +397,7 @@ impl Config {
             fairshare_replica_heartbeat,
             fairshare_replica_ttl,
             capacity_discovery: CapacityDiscoveryConfig::from_env(),
+            session_affinity: SessionAffinityConfig::from_env(),
             fail_open: require_bool("OBLETH_FAIL_OPEN", true),
             wal_path: env_or("OBLETH_WAL_PATH", "./obleth-telemetry.wal"),
             telemetry_flush_interval: telemetry_flush_interval(
@@ -528,6 +599,39 @@ mod tests {
         assert!(lenient_bool(Some("yes"), false));
         assert!(lenient_bool(Some("garbage"), true));
         assert!(!lenient_bool(None, false));
+    }
+
+    #[test]
+    fn session_affinity_is_off_by_default_and_parses_its_settings() {
+        assert_eq!(
+            SessionAffinityConfig::from_values(None, None, None, None, None),
+            None
+        );
+        assert_eq!(
+            SessionAffinityConfig::from_values(Some("0"), Some("5"), None, None, None),
+            None
+        );
+        let d = SessionAffinityConfig::from_values(Some("1"), None, None, None, None).unwrap();
+        assert_eq!(d.warm_ttl, Duration::from_secs(120));
+        assert_eq!(d.hold, Duration::from_millis(3000));
+        assert_eq!(d.max_jumps, 8);
+        assert_eq!(d.max_bypass, Duration::from_secs(30));
+        let c = SessionAffinityConfig::from_values(
+            Some("on"),
+            Some("60"),
+            Some("0"),
+            Some("0"),
+            Some("junk"),
+        )
+        .unwrap();
+        assert_eq!(c.warm_ttl, Duration::from_secs(60));
+        assert_eq!(c.hold, Duration::ZERO);
+        assert_eq!(c.max_jumps, 1);
+        assert_eq!(c.max_bypass, Duration::from_secs(30));
+        let clamped =
+            SessionAffinityConfig::from_values(Some("1"), None, Some("90000"), None, Some("10"))
+                .unwrap();
+        assert_eq!(clamped.hold, Duration::from_secs(10));
     }
 
     #[test]
