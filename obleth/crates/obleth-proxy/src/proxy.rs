@@ -1876,7 +1876,8 @@ async fn run_pipeline(
             effective_weight,
             est.total(),
             end_user.as_deref(),
-        ),
+        )
+        .session(req_meta.session_id.as_str()),
     );
     let admitted = match timeout(admit_wait, admit).await {
         Ok(Some(a)) => a,
@@ -4469,6 +4470,7 @@ pub(crate) fn admit_request_for(
         key_max_in_flight: positive(resolved.key_max_in_flight),
         cost,
         end_user,
+        session: None,
     }
 }
 
