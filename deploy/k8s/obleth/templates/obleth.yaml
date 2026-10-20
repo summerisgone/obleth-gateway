@@ -88,6 +88,13 @@ spec:
             - { name: OBLETH_REDIS_RESPONSE_TIMEOUT_MS, value: {{ .Values.obleth.redisResponseTimeoutMs | quote }} }
             - { name: OBLETH_REDIS_CONNECT_TIMEOUT_MS, value: {{ .Values.obleth.redisConnectTimeoutMs | quote }} }
             - { name: OBLETH_ADMISSION_TIMEOUT_SECS, value: {{ .Values.obleth.admissionTimeoutSecs | quote }} }
+            {{- with .Values.obleth.sessionAffinity }}
+            - { name: OBLETH_SESSION_AFFINITY, value: {{ .enabled | quote }} }
+            - { name: OBLETH_SESSION_AFFINITY_WARM_SECS, value: {{ .warmSecs | quote }} }
+            - { name: OBLETH_SESSION_AFFINITY_HOLD_MS, value: {{ .holdMs | quote }} }
+            - { name: OBLETH_SESSION_AFFINITY_MAX_JUMPS, value: {{ .maxJumps | quote }} }
+            - { name: OBLETH_SESSION_AFFINITY_MAX_BYPASS_SECS, value: {{ .maxBypassSecs | quote }} }
+            {{- end }}
             - { name: OBLETH_VIDEO_JOB_RETENTION_HOURS, value: {{ .Values.obleth.videoJobRetentionHours | quote }} }
             - { name: OBLETH_VIDEO_JOB_SCOPE, value: {{ .Values.obleth.videoJobScope | default "key" | quote }} }
             # Telemetry spill file used while ClickHouse is unreachable. Must be

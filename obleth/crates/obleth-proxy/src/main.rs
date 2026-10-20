@@ -113,6 +113,16 @@ async fn main() -> anyhow::Result<()> {
         cfg.fairshare_algorithm,
         cfg.default_model_max_in_flight,
     );
+    if let Some(affinity) = cfg.session_affinity {
+        tracing::info!(
+            warm_secs = affinity.warm_ttl.as_secs(),
+            hold_ms = affinity.hold.as_millis() as u64,
+            max_jumps = affinity.max_jumps,
+            max_bypass_secs = affinity.max_bypass.as_secs(),
+            "fairshare session affinity enabled"
+        );
+        fairshare.set_session_affinity(Some(affinity));
+    }
     // Cluster-wide limits: with shared slots on and more than one replica
     // live, every admission takes a slot in Redis against the configured
     // (undivided) limits; alone, admission stays local. When shared slots are

@@ -121,6 +121,23 @@ obleth:
   # Longest a request waits in the fairshare queue before a 503 with
   # Retry-After: 5. 0 or invalid falls back to this default.
   admissionTimeoutSecs: 60
+  # Session affinity for agent sessions behind a prefix-caching backend. The
+  # next step of a session whose last step finished within warmSecs goes
+  # ahead of its key's other waiters. When a step that arrived within holdMs
+  # of the session's previous step finishing (an agent loop) finishes, its
+  # slot is held for holdMs for the next step. A session that went ahead of
+  # an older waiter maxJumps times in a row queues in arrival order again; a
+  # waiter queued maxBypassSecs is no longer passed over or held off (keep it
+  # well under admissionTimeoutSecs; holdMs is capped at it). Sessions are the
+  # request log's session ids (x-obleth-session-id / x-session-id, body
+  # session_id, or derived), scoped to the key. Per replica: in shared mode a
+  # hold only stops this replica.
+  sessionAffinity:
+    enabled: false
+    warmSecs: 120
+    holdMs: 3000
+    maxJumps: 8
+    maxBypassSecs: 30
   # How long a video job's record (which tenant owns it, which endpoint holds
   # it) is kept, in hours. Follow-ups for an older job answer 404. The backend
   # usually forgets finished jobs within an hour or two, so the default leaves
