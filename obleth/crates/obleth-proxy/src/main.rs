@@ -6,6 +6,7 @@
 
 mod completion;
 mod energy;
+mod jobs;
 mod jwt_auth;
 mod knowledge;
 mod lifecycle;
@@ -23,7 +24,6 @@ mod speech;
 mod state;
 mod upstream_failure;
 mod verdicts;
-mod videos;
 
 mod boons;
 mod classifier;
@@ -444,14 +444,14 @@ async fn main() -> anyhow::Result<()> {
         energy: energy.clone(),
         jwt,
         knowledge: knowledge.clone(),
-        video_jobs: videos::VideoJobStore::new(store.clone(), cfg.video_job_scope),
+        jobs: jobs::JobStore::new(store.clone(), cfg.job_scope),
     };
     tracing::info!(
-        scope = cfg.video_job_scope.as_str(),
+        scope = cfg.job_scope.as_str(),
         "video jobs are private to their {}",
-        cfg.video_job_scope.as_str()
+        cfg.job_scope.as_str()
     );
-    videos::spawn_job_pruner(app_state.video_jobs.clone());
+    jobs::spawn_job_pruner(app_state.jobs.clone());
 
     match store.all_resolved_models().await {
         Ok(models) => {

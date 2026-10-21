@@ -1314,8 +1314,8 @@ fn probe_silence_wav() -> Vec<u8> {
 /// Build the minimal real inference request used to verify a model actually
 /// serves. `api_base` already includes the `/v1` suffix (for a `search` route
 /// it is the search instance's root instead). Returns `None` for
-/// `image` (a "minimal" generation is still costly), `video` (a probe would be
-/// a multi-minute render holding a card) and unrecognized types — those fall
+/// `image` (a "minimal" generation is still costly), `video` and `mesh` (a
+/// probe would be a multi-minute render holding a card) and unrecognized types — those fall
 /// back to the catalog existence check.
 fn build_probe_request(
     api_base: &str,
@@ -1912,6 +1912,7 @@ mod tests {
     fn probe_request_costly_and_unknown_modes_are_none() {
         assert!(build_probe_request("https://up/v1", "image", "m").is_none());
         assert!(build_probe_request("https://up/v1", "video", "m").is_none());
+        assert!(build_probe_request("https://up/v1", "mesh", "m").is_none());
         assert!(build_probe_request("https://up/v1", "something-else", "m").is_none());
     }
 

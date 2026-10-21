@@ -78,6 +78,9 @@ function prices(type: string, m: ModelRoute): { name: string; label: string; val
       return [{ name: "cost_per_image", label: "Per image", value: m.cost_per_image, perM: false }];
     case "video":
       return [{ name: "cost_per_video", label: "Per video", value: m.cost_per_video, perM: false }];
+    case "mesh":
+      // Meshes share the flat per-job price field with videos.
+      return [{ name: "cost_per_video", label: "Per mesh", value: m.cost_per_video, perM: false }];
     case "audio_speech":
       return [{ name: "cost_per_character", label: "Per 1M characters", value: m.cost_per_character, perM: true }];
     case "audio_transcription":

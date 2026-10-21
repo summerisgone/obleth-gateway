@@ -19,13 +19,13 @@ use uuid::Uuid;
 
 mod backup;
 mod crypto;
+mod jobs;
 pub mod knowledge;
 mod models_io;
-mod video_jobs;
 pub use backup::BACKUP_KEY_SENTINEL;
 pub use crypto::{Cipher, CryptoError};
+pub use jobs::{JobOwner, JobRecord};
 pub use models_io::{ModelImportOutcome, ModelImportWrite};
-pub use video_jobs::{VideoJob, VideoJobOwner};
 
 /// Process-wide cipher for upstream secret columns, initialized once from the
 /// environment. Kept global so the row-mapping helpers can transparently
@@ -106,6 +106,7 @@ const SCHEMA_V34: &str = include_str!("../../../../schema/postgres/0034_model_li
 const SCHEMA_V35: &str = include_str!("../../../../schema/postgres/0035_reasoning_effort.sql");
 const SCHEMA_V36: &str =
     include_str!("../../../../schema/postgres/0036_model_rejected_request_fields.sql");
+const SCHEMA_V37: &str = include_str!("../../../../schema/postgres/0037_job_kind.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -258,6 +259,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V34).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V35).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V36).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V37).execute(&mut *conn).await?;
             Ok(())
         }
         .await;

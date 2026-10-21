@@ -1049,22 +1049,23 @@ async fn run_pipeline(
         return resp;
     }
 
-    // ---- Videos API follow-ups (poll, download, delete, list) ----
+    // ---- job follow-ups: videos, meshes (poll, download, delete, list) ----
     // They carry a job id, never a model, so they are served from the job
     // record written at create time: routed to the model and endpoint that
     // made the job, and "not found" for anyone who does not own it (another
     // tenant, or by default another key of this one). Reads of work the
     // create already paid for, so no admission, budget, or ledger row (see
-    // `crate::videos`).
-    if let Some(call) = crate::videos::follow_up(&method, &path) {
-        let inbound = crate::videos::Inbound {
+    // `crate::jobs`).
+    if let Some((kind, call)) = crate::jobs::follow_up(&method, &path) {
+        let inbound = crate::jobs::Inbound {
             method: &method,
             query: &query,
             headers: &headers,
         };
-        return crate::videos::handle_follow_up(&state, &resolved, call, inbound, request_id).await;
+        return crate::jobs::handle_follow_up(&state, &resolved, kind, call, inbound, request_id)
+            .await;
     }
-    let video_create = crate::videos::is_create(&method, &path);
+    let job_create = crate::jobs::is_create(&method, &path);
 
     // ---- request flight-recorder tracer ----
     let mut tracer: Option<crate::tracer::SpanRecorder> = if resolved.tracing_enabled {
@@ -1756,12 +1757,13 @@ async fn run_pipeline(
     let output_guardrails_armed = response_plan
         .as_ref()
         .is_some_and(|p| p.guardrails.is_some());
-    // A video create is never replayed from cache either: an identical body
-    // must start a new job, not hand back an id some earlier call recorded.
+    // A job create (video, mesh) is never replayed from cache either: an
+    // identical body must start a new job, not hand back an id some earlier
+    // call recorded.
     let cache_enabled = route.as_ref().map(|r| r.cache_enabled).unwrap_or(false)
         && !tool_loop_armed
         && !output_guardrails_armed
-        && !video_create;
+        && job_create.is_none();
     let cache_ttl = route.as_ref().map(|r| r.cache_ttl_secs).unwrap_or(0);
     // TTL <= 0 means "don't cache": nothing is ever written, so a lookup could
     // never hit and would only cost a Redis round-trip.
@@ -2428,7 +2430,7 @@ async fn run_pipeline(
     let mut last_err: Option<String> = None;
     let mut timed_out = false;
     let total_targets = targets.len();
-    // Which target answered: a video job lives on the backend that accepted it.
+    // Which target answered: a job lives on the backend that accepted it.
     let mut served_target = 0usize;
 
     'targets: for (ti, target) in targets.iter().enumerate() {
@@ -2779,20 +2781,21 @@ async fn run_pipeline(
     // Cache only successful responses.
     let store_in_cache = cache_key.clone();
 
-    // ---- video job create: record the job before its id leaves ----
-    // The response is a small JSON video object. It is read whole, its id is
+    // ---- job create (video, mesh): record the job before its id leaves ----
+    // The response is a small JSON job object. It is read whole, its id is
     // recorded against this tenant, this key and the target that accepted
     // it, and only then is it returned — an unrecorded id could never be
     // followed up. The create is billed its flat `cost_per_video` (no
     // tokens) once recorded, and nothing when it is not. The whole step runs
     // as its own task so a client that leaves mid-way cannot strand a job it
     // was charged for.
-    if video_create {
+    if let Some(kind) = job_create {
         if let Some(t) = tracer.take() {
             t.finish("ok");
         }
-        let job = crate::videos::CreatedJob {
-            jobs: state.video_jobs.clone(),
+        let job = crate::jobs::CreatedJob {
+            kind,
+            jobs: state.jobs.clone(),
             http: state.http.clone(),
             model: model.clone(),
             tenant_id: resolved.tenant_id,
@@ -2805,7 +2808,7 @@ async fn run_pipeline(
             started: upstream_start,
         };
         let recorded = tokio::spawn(async move {
-            let outcome = crate::videos::record_create(job, upstream).await;
+            let outcome = crate::jobs::record_create(job, upstream).await;
             drop(permit);
             let total_ms = request_start.elapsed().as_millis() as u32;
             let settle = accounting.settle_with(
@@ -2821,7 +2824,7 @@ async fn run_pipeline(
         });
         return match recorded.await {
             Ok(outcome) => outcome.into_response(request_id),
-            Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "video create failed"),
+            Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "job create failed"),
         };
     }
 
@@ -5461,7 +5464,8 @@ const REGISTERED_MODEL_PATHS: &[&str] = &[
     "/v1/images/generations",
     "/v1/images/edits",
     "/v1/images/variations",
-    crate::videos::VIDEOS_PATH,
+    crate::jobs::VIDEOS_PATH,
+    crate::jobs::MESHES_PATH,
 ];
 
 fn requires_registered_model(path: &str) -> bool {
@@ -5471,8 +5475,9 @@ fn requires_registered_model(path: &str) -> bool {
 /// True when the endpoint takes a file upload, so the OpenAI spec sends it as
 /// `multipart/form-data` with the model as a form field rather than JSON:
 /// audio transcription/translation, the two image endpoints that take a
-/// source image (edits and variations), and the video create, whose optional
-/// reference frame is an upload (it accepts JSON too).
+/// source image (edits and variations), the video create, whose optional
+/// reference frame is an upload, and the mesh create, whose source image is
+/// (both accept JSON too).
 fn is_multipart_endpoint(path: &str) -> bool {
     matches!(
         path,
@@ -5480,7 +5485,8 @@ fn is_multipart_endpoint(path: &str) -> bool {
             | "/v1/audio/translations"
             | "/v1/images/edits"
             | "/v1/images/variations"
-            | crate::videos::VIDEOS_PATH
+            | crate::jobs::VIDEOS_PATH
+            | crate::jobs::MESHES_PATH
     )
 }
 
@@ -5598,8 +5604,8 @@ fn build_multipart_form(
 }
 
 /// Per-request surcharge for non-token-billed modalities: image generations are
-/// billed per image, text-to-speech per input character, and a video job at a
-/// flat price per created job. Returns `0.0` for token-billed modalities
+/// billed per image, text-to-speech per input character, and a video or mesh
+/// job at the model's flat per-job price (`cost_per_video`). Returns `0.0` for token-billed modalities
 /// (chat, embeddings) and audio transcription.
 fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value) -> f64 {
     let Some(route) = route else {
@@ -5627,9 +5633,9 @@ fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value
                 .unwrap_or(0);
             chars as f64 * route.cost_per_character
         }
-        // Frozen at the create, the only video call that reaches settlement:
+        // Frozen at the create, the only job call that reaches settlement:
         // the polls and the download are served outside the pipeline.
-        "video" => route.cost_per_video,
+        "video" | "mesh" => route.cost_per_video,
         _ => 0.0,
     }
 }
@@ -6138,6 +6144,8 @@ fn request_type_for_path(path: &str) -> &'static str {
         "image"
     } else if path.ends_with("/videos") {
         "video"
+    } else if path.ends_with("/meshes") {
+        "mesh"
     } else if path.ends_with("/rerank") || path.ends_with("/reranking") {
         "rerank"
     } else if path.ends_with("/moderations") {
@@ -9116,6 +9124,7 @@ mod tests {
         "/v1/images/edits",
         "/v1/images/variations",
         "/v1/videos",
+        "/v1/meshes",
     ];
 
     #[test]

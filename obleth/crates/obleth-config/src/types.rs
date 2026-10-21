@@ -34,10 +34,10 @@ impl FairshareAlgorithm {
     }
 }
 
-/// Who may follow up a video job (poll, download, delete, list):
-/// `OBLETH_VIDEO_JOB_SCOPE`.
+/// Who may follow up a generation job (a video or a mesh: poll, download,
+/// delete, list): `OBLETH_VIDEO_JOB_SCOPE`, named for the first job kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VideoJobScope {
+pub enum JobScope {
     /// Only the API key that created the job. With secret keys and with the
     /// per-(issuer, subject) identity keys of JWT callers alike, a key is one
     /// user, so a job is private to the user who made it.
@@ -47,9 +47,9 @@ pub enum VideoJobScope {
     Tenant,
 }
 
-impl VideoJobScope {
+impl JobScope {
     /// The scope an `OBLETH_VIDEO_JOB_SCOPE` value names. Unset or blank is
-    /// the default, [`VideoJobScope::Key`]; any other value that is not `key`
+    /// the default, [`JobScope::Key`]; any other value that is not `key`
     /// or `tenant` (case-insensitive) is `Err` with the value, so the caller
     /// can warn and fall back to the default rather than widen access on a
     /// typo.
@@ -1646,6 +1646,10 @@ where
 /// OpenAI-compatible endpoints the model serves (see
 /// `endpoint_matches_model_type` in the proxy). `chat` is the default.
 ///
+/// `video` and `mesh` are job-based (`/v1/videos`, `/v1/meshes`): a create
+/// returns a job id, and the result is fetched once the job completes. A
+/// `mesh` model turns an image into a 3D model (binary glTF).
+///
 /// `search` is the odd one out: not a model but a web search tool, served on
 /// `POST /v1/search` from an upstream that speaks the SearXNG JSON API.
 pub const MODEL_TYPES: &[&str] = &[
@@ -1655,6 +1659,7 @@ pub const MODEL_TYPES: &[&str] = &[
     "audio_speech",
     "image",
     "video",
+    "mesh",
     "search",
 ];
 

@@ -93,7 +93,7 @@ describe("Playground shell", () => {
 
   it("offers Speech right after Image, as a tab and on the launcher", async () => {
     const tabs = [...host.querySelectorAll("[aria-label='Playground mode'] button")].map((b) => b.getAttribute("aria-label"));
-    expect(tabs).toEqual(["Chat", "Image", "Speech", "Router", "Verdicts", "Search"]);
+    expect(tabs).toEqual(["Chat", "Image", "Speech", "3D", "Router", "Verdicts", "Search"]);
     const card = [...host.querySelectorAll("button")].find((b) => b.textContent?.startsWith("Speech"))!;
     await act(async () => card.click());
     expect(fieldLabels()).toContain("Text to read aloud");

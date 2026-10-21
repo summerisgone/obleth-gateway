@@ -10,6 +10,7 @@ import { useEnabledModels } from "@/components/charo/use-enabled-models";
 import { UnifiedWorkspace } from "./workspaces";
 import { RouterWorkspace } from "./router-workspace";
 import { ImageWorkspace } from "./image-workspace";
+import { MeshWorkspace, handOffToMesh } from "./mesh-workspace";
 import { SpeechWorkspace } from "./speech-workspace";
 import { SearchWorkspace } from "./search-workspace";
 import { VerdictsWorkspace } from "./verdicts-workspace";
@@ -39,7 +40,7 @@ export const SPEECH_TEXT_MAX_LENGTH = 20_000;
 // duplicating the schema, and so its cap can be checked against
 // ROUTER_PROMPT_MAX_LENGTH directly rather than by re-deriving it.
 export const sessionSchema = z.object({
-  id: z.string(), title: z.string(), mode: z.enum(["chat", "compare", "router", "image", "speech", "verdicts", "search"]),
+  id: z.string(), title: z.string(), mode: z.enum(["chat", "compare", "router", "image", "mesh", "speech", "verdicts", "search"]),
   models: z.array(z.string()).min(1).max(4), generation: generationSchema,
   recipients: z.array(z.number().int().min(0).max(3)).optional(),
   // Last touched, for ordering and grouping the session rail.
@@ -74,6 +75,24 @@ export const sessionSchema = z.object({
   imageCount: z.number().int().min(1).max(4).optional(),
   imageSteps: z.number().int().min(1).max(150).optional(),
   imageSeed: z.number().int().min(0).max(4_294_967_295).optional(),
+  // 3D mode's form draft, plus the jobs it started: a job runs for minutes,
+  // so its id (not the image or the mesh, both megabytes) is kept to resume
+  // polling after a mode switch or a reload. See mesh-workspace.tsx.
+  meshModel: z.string().max(200).optional(),
+  meshResolution: z.enum(["512", "1024", "1536"]).optional(),
+  meshFaces: z.number().int().min(1_000).max(2_000_000).optional(),
+  meshTexture: z.number().int().min(256).max(8192).optional(),
+  meshSeed: z.number().int().min(0).max(4_294_967_295).optional(),
+  meshJobs: z.array(z.object({
+    id: z.string().max(256),
+    model: z.string().max(200),
+    resolution: z.string().max(20),
+    faces: z.number().int().optional(),
+    texture: z.number().int().optional(),
+    seed: z.number().int().optional(),
+    createdAt: z.number(),
+    sourceName: z.string().max(200).optional(),
+  })).max(20).optional(),
   // Speech mode's form draft, kept on the session for the same reason as the
   // image fields; the audio itself is memory-only (see speech-workspace.tsx —
   // a minute of WAV is megabytes, far past what localStorage can hold).
@@ -289,7 +308,9 @@ export function Playground({ scope, gatewayBase = "http://localhost:8080", openM
             : session.mode === "router"
             ? <RouterWorkspace session={session} update={update} settingsOpen={settingsOpen} onOpenSession={openSession} />
             : session.mode === "image"
-            ? <ImageWorkspace storageKey={`${root}:${session.id}:image`} session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} />
+            ? <ImageWorkspace storageKey={`${root}:${session.id}:image`} session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} onMakeMesh={(url) => { handOffToMesh(url, "generated.png"); update({ mode: "mesh" }); }} />
+            : session.mode === "mesh"
+            ? <MeshWorkspace session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} />
             : session.mode === "speech"
             ? <SpeechWorkspace storageKey={`${root}:${session.id}:speech`} session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} />
             : session.mode === "verdicts"

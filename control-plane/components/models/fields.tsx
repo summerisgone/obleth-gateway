@@ -72,6 +72,7 @@ export const MODEL_TYPE_OPTIONS = [
   { value: "audio_speech", label: "Text to speech (TTS)" },
   { value: "image", label: "Image generation" },
   { value: "video", label: "Video generation" },
+  { value: "mesh", label: "3D mesh generation" },
   { value: "search", label: "Web search (SearXNG)" },
 ] as const;
 
@@ -120,6 +121,8 @@ export function modelTypeHint(type: string): string {
       return "Serves /v1/images/generations, /v1/images/edits and /v1/images/variations (multipart image upload). Billed per image.";
     case "video":
       return "Serves the /v1/videos job API: create (JSON or multipart reference image), poll, download, delete, list. Billed a flat price per created job; polls and downloads are free. Health is catalog-only.";
+    case "mesh":
+      return "Serves the /v1/meshes job API: create from an image (multipart upload or JSON), poll, download the binary glTF, delete, list. Billed a flat price per created job; polls and downloads are free. Health is catalog-only.";
     case "search":
       return "A web search tool, not a model: serves POST /v1/search (the Perplexity Search API shape, as LiteLLM does) and is listed on GET /v1/search/tools, not /v1/models. The API base is a SearXNG instance's root, with JSON output enabled in its settings. Searches are free.";
     default:
