@@ -141,11 +141,17 @@ pub(crate) fn choose(
     };
 
     // The incumbent stays whenever the evidence allows it and it can take the
-    // request: on a quiet turn, and on a harder one it is strong enough for.
+    // request: on a quiet turn, on a harder one it is strong enough for, and
+    // on a new topic it already holds a level in. A follow-up the classifier
+    // reads as another topic ("add a docstring" as writing) then stays put;
+    // only a model with no standing in the new topic hands it on.
     let keepable = match plan.decision {
         Decision::Keep => true,
         Decision::Harder => incumbent.is_some_and(|c| c.strength(&plan.domains) >= plan.floor),
-        Decision::Escalate(_) | Decision::Topic => false,
+        Decision::Topic => {
+            incumbent.is_some_and(|c| c.strength(&plan.domains) >= intent.difficulty.max(1))
+        }
+        Decision::Escalate(_) => false,
     };
     if keepable {
         if let Some(c) = incumbent {
@@ -404,6 +410,38 @@ mod tests {
         );
         assert_eq!(weak.reason, Reason::Harder);
         assert_eq!(names(&weak), ["big"]);
+    }
+
+    #[test]
+    fn a_new_topic_stays_with_an_incumbent_that_holds_it() {
+        let mut writer = candidate("writer", 2);
+        writer.levels = vec![("writing".into(), 2)];
+        let mut both = candidate("both", 3);
+        both.levels.push(("writing".into(), 2));
+        let all = vec![candidate("coder", 3), both, writer];
+        let writing = Intent {
+            tags: vec!["writing".into()],
+            difficulty: 1,
+            source: IntentSource::Classifier,
+        };
+        let held = choose(
+            &all,
+            Some(&record("both", 3)),
+            &writing,
+            &Observed::default(),
+            |_| true,
+        );
+        assert_eq!(held.reason, Reason::Kept);
+        assert_eq!(held.domains, vec!["writing".to_string()]);
+        let moved = choose(
+            &all,
+            Some(&record("coder", 3)),
+            &writing,
+            &Observed::default(),
+            |_| true,
+        );
+        assert_eq!(moved.reason, Reason::Topic);
+        assert_eq!(names(&moved), ["both", "writer"]);
     }
 
     #[test]
