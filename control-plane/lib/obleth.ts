@@ -969,6 +969,33 @@ export type UsageDailyGroupBy =
   | "day_model"
   | "day_key_model";
 
+/** `GET /usage/speed`: one model's speed over the window, or one hour or day of it. */
+export interface ModelSpeedPoint {
+  /** Start of the hour or day, epoch millis; 0 for a whole-window row. */
+  bucket_ms: number;
+  model: string;
+  requests: number;
+  /** Successful, uncached requests that produced tokens: the ones a speed was measured on. */
+  rated: number;
+  /** Median output tokens a second, after the first token. */
+  gen_tokens_per_sec: number;
+  /** What the slowest tenth of requests got. */
+  slow_tokens_per_sec: number;
+  /** Median prompt tokens a second before the first token. */
+  prompt_tokens_per_sec: number;
+  p50_ttft_ms: number;
+}
+
+export interface UsageSpeedParams {
+  sinceMs: number;
+  untilMs: number;
+  bucket?: "none" | "hour" | "day";
+  tz?: string;
+  tenantId?: string;
+  keyId?: string;
+  model?: string;
+}
+
 export interface UsageDailyParams {
   startDay: string;
   endDay: string;
@@ -2655,6 +2682,18 @@ export const obleth = {
     ),
   costs: (sinceMs?: number) =>
     api<CostAgg[]>(`/costs${qs({ since_ms: sinceMs })}`),
+  usageSpeed: (params: UsageSpeedParams) =>
+    api<ModelSpeedPoint[]>(
+      `/usage/speed${qs({
+        since_ms: params.sinceMs,
+        until_ms: params.untilMs,
+        bucket: params.bucket,
+        tz: params.tz,
+        tenant_id: params.tenantId,
+        key_id: params.keyId,
+        model: params.model,
+      })}`,
+    ),
   usageDaily: (params: UsageDailyParams) =>
     api<UsageDailyRow[]>(
       `/usage/daily${qs({

@@ -11,11 +11,11 @@ use crate::model_health::{
     ValidateModelResult,
 };
 use crate::usage::{
-    CacheStats, CostAgg, KeyUsageSummary, KeyUsageSummaryQuery, ModelUsageTimePoint,
-    TenantUsageTimePoint, UsageAgg, UsageBreakdownQuery, UsageDailyQuery, UsageDailyRow,
-    UsageKeyAgg, UsageKeyModelBreakdown, UsageLogBucket, UsageLogFacet, UsageLogFacets,
-    UsageLogFailure, UsageLogHistogram, UsageLogQuery, UsageLogRow, UsageModelAgg, UsageQuery,
-    UsageSeriesQuery, UsageTimePoint,
+    CacheStats, CostAgg, KeyUsageSummary, KeyUsageSummaryQuery, ModelSpeedPoint,
+    ModelUsageTimePoint, TenantUsageTimePoint, UsageAgg, UsageBreakdownQuery, UsageDailyQuery,
+    UsageDailyRow, UsageKeyAgg, UsageKeyModelBreakdown, UsageLogBucket, UsageLogFacet,
+    UsageLogFacets, UsageLogFailure, UsageLogHistogram, UsageLogQuery, UsageLogRow, UsageModelAgg,
+    UsageQuery, UsageSeriesQuery, UsageSpeedQuery, UsageTimePoint,
 };
 use crate::{
     AlertSettingsView, ApplyAutotuneCapacity, AuditEntryView, AuditQuery, AutoRouterSettingsView,
@@ -89,6 +89,7 @@ use obleth_config::{
         crate::get_usage_series,
         crate::get_usage_series_tenants,
         crate::get_usage_series_models,
+        crate::get_usage_speed,
         crate::get_usage_breakdown,
         crate::get_cache_stats,
         crate::get_usage_logs,
@@ -260,6 +261,7 @@ use obleth_config::{
         ListKeysQuery,
         UsageQuery,
         UsageSeriesQuery,
+        UsageSpeedQuery,
         UsageDailyQuery,
         UsageLogQuery,
         KeyUsageSummaryQuery,
@@ -270,6 +272,7 @@ use obleth_config::{
         UsageTimePoint,
         TenantUsageTimePoint,
         ModelUsageTimePoint,
+        ModelSpeedPoint,
         UsageBreakdownQuery,
         UsageKeyModelBreakdown,
         CacheStats,

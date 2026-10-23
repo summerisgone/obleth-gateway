@@ -214,6 +214,7 @@ pub fn router(state: AdminState) -> Router {
             get(get_usage_series_tenants),
         )
         .route("/api/v1/usage/series/models", get(get_usage_series_models))
+        .route("/api/v1/usage/speed", get(get_usage_speed))
         .route("/api/v1/usage/breakdown", get(get_usage_breakdown))
         .route("/api/v1/usage/cache", get(get_cache_stats))
         .route("/api/v1/usage/logs", get(get_usage_logs))
@@ -5081,6 +5082,22 @@ async fn get_usage_series_models(
     Ok(Json(
         usage::query_usage_series_by_model(&state.clickhouse, q).await?,
     ))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/usage/speed", tag = "usage",
+    params(usage::UsageSpeedQuery),
+    responses((status = 200, body = [usage::ModelSpeedPoint]))
+)]
+async fn get_usage_speed(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::UsageSpeedQuery>,
+) -> Result<Json<Vec<usage::ModelSpeedPoint>>> {
+    if let Some(tz) = &q.tz {
+        tz.parse::<chrono_tz::Tz>()
+            .map_err(|_| AdminError::BadRequest(format!("unknown time zone: {tz}")))?;
+    }
+    Ok(Json(usage::query_usage_speed(&state.clickhouse, q).await?))
 }
 
 #[utoipa::path(
