@@ -45,6 +45,10 @@ use uuid::Uuid;
 use crate::view::{PeerView, PeerViews, ReplicaView};
 use crate::FairShare;
 
+/// How long a refused claim marks its pool (or the ceiling) as waited on,
+/// as the Redis backend does.
+const WAIT_MARK: Duration = Duration::from_secs(1);
+
 /// A boxed, sendable future returned by [`SharedSlots`] operations.
 pub type SlotFuture<T> = Pin<Box<dyn Future<Output = Result<T, SlotError>> + Send + 'static>>;
 
@@ -96,6 +100,11 @@ pub struct SlotHold {
     /// How long the backend remembers when the session's step finished, for
     /// the next step's check.
     pub remember: Duration,
+    /// The most holds in a row a session may have while some replica waits
+    /// for the pool. Then its slot is released, so waiters on other replicas
+    /// get their turn; a release, or a hold while nobody waits, starts the
+    /// count again.
+    pub max_run: u32,
 }
 
 /// A held slot to give back.
@@ -331,6 +340,11 @@ struct MemState {
     holds: HashMap<String, Instant>,
     /// When each session's step last finished, by hold id.
     recent: HashMap<String, Instant>,
+    /// Holds in a row while the pool was waited on, by hold id.
+    chain: HashMap<String, u32>,
+    /// Until when someone waits for each pool, by pool id ("" for the
+    /// global ceiling), as the Redis wait markers.
+    waiting: HashMap<String, Instant>,
     views: HashMap<String, MemView>,
     subscribers: Vec<FairShare>,
     failing: bool,
@@ -609,6 +623,13 @@ impl SharedSlots for InMemorySlots {
             }
             AcquireOutcome::Granted
         };
+        if let AcquireOutcome::Denied(denial) = outcome {
+            let mark = match denial {
+                SlotDenial::Global => String::new(),
+                _ => claim.pool.clone(),
+            };
+            s.waiting.insert(mark, Instant::now() + WAIT_MARK);
+        }
         let c = counts(&s);
         let subs = s.subscribers.clone();
         drop(s);
@@ -622,6 +643,8 @@ impl SharedSlots for InMemorySlots {
         let now = Instant::now();
         s.recent
             .retain(|_, done| now.saturating_duration_since(*done) < hold.remember);
+        let MemState { recent, chain, .. } = &mut *s;
+        chain.retain(|id, _| recent.contains_key(id));
         let arrived = now.checked_sub(hold.arrived_ago).unwrap_or(now);
         let chained = s
             .recent
@@ -635,11 +658,17 @@ impl SharedSlots for InMemorySlots {
                 .and_then(|h| h.get(f).copied())
                 .unwrap_or(0)
         };
+        let waited = [slot.pool.as_str(), ""]
+            .iter()
+            .any(|p| s.waiting.get(*p).is_some_and(|until| *until > now));
+        let run = s.chain.get(&hold.id).copied().unwrap_or(0);
         let can = chained
+            && (!waited || run < hold.max_run)
             && s.count(&hf) < hold.max_held
             && !s.holds.contains_key(&hold.id)
             && mine(&s, &pf) > 0;
         if !can {
+            s.chain.remove(&hold.id);
             drop(s);
             wake_all(
                 &self.cluster.state.lock().unwrap().subscribers.clone(),
@@ -661,6 +690,11 @@ impl SharedSlots for InMemorySlots {
             }
         }
         s.add(&owner, &hf, 1);
+        if waited {
+            s.chain.insert(hold.id.clone(), run + 1);
+        } else {
+            s.chain.remove(&hold.id);
+        }
         s.holds.insert(hold.id, Instant::now() + hold.ttl);
         let counts = ClusterCounts {
             pool: s.count(&pf),

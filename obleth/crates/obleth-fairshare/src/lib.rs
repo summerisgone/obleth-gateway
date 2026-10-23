@@ -1681,7 +1681,7 @@ impl Pool {
             return StepEnd::Release;
         };
         let aged = self
-            .oldest_queued()
+            .oldest_eligible()
             .is_some_and(|t| self.affinity.aged(t, now));
         match hold_in {
             _ if aged => StepEnd::Release,
@@ -1703,7 +1703,7 @@ impl Pool {
     /// yet tried for a slot held for it, and give it its local slot, for a
     /// claim on that held slot alone. Undone by [`Pool::requeue`].
     fn take_probe(&mut self) -> Option<(Uuid, Uuid, Waiter)> {
-        let oldest = self.oldest_queued();
+        let oldest = self.oldest_eligible();
         let (tenant, key, at) = self.queues.iter().find_map(|(tenant, queue)| {
             queue.keys.iter().find_map(|(key, deque)| {
                 deque
@@ -1726,12 +1726,22 @@ impl Pool {
         Some((tenant, key, waiter))
     }
 
-    /// Arrival of the oldest request queued in the pool.
-    fn oldest_queued(&self) -> Option<Instant> {
+    /// Arrival of the oldest request queued in the pool that a free slot
+    /// would go to: its caller still waits and neither its tenant nor its
+    /// key is at a cap. Holds only give way to those.
+    fn oldest_eligible(&self) -> Option<Instant> {
         self.queues
-            .values()
-            .flat_map(|q| q.keys.values())
-            .filter_map(|d| d.front().map(|w| w.enqueued))
+            .iter()
+            .filter(|(tenant, _)| {
+                self.tenant_has_slot(tenant) && !self.blocked_tenants.contains(tenant)
+            })
+            .flat_map(|(_, q)| q.keys.iter())
+            .filter(|(key, _)| self.key_open(key))
+            .filter_map(|(_, d)| {
+                d.iter()
+                    .find(|w| !w.respond.is_closed())
+                    .map(|w| w.enqueued)
+            })
             .min()
     }
 
@@ -1739,7 +1749,7 @@ impl Pool {
     /// waited too long to keep yielding to them.
     fn holds_to_give_up(&mut self, now: Instant) -> Vec<affinity::Hold> {
         let aged = self
-            .oldest_queued()
+            .oldest_eligible()
             .is_some_and(|t| self.affinity.aged(t, now));
         if aged {
             self.affinity.give_up()
@@ -1783,7 +1793,7 @@ impl Pool {
                     .affinity
                     .redeem(Some(&session))
                     .expect("hold just listed");
-                let jumped = at > 0 || self.oldest_queued().is_some_and(|t| t < waiter.enqueued);
+                let jumped = at > 0 || self.oldest_eligible().is_some_and(|t| t < waiter.enqueued);
                 self.track_waiter_meta(tenant, key, &waiter);
                 self.charge(tenant, key, waiter.cost);
                 self.advance_virtual_time();
@@ -2572,10 +2582,13 @@ impl Scheduler {
                 self.publish_stats();
             }
             Ctl::HoldDone { pool, result } => {
-                if let Ok((true, _)) = &result {
-                    self.stats.affinity.holds.fetch_add(1, Ordering::Relaxed);
+                match result {
+                    Ok((true, counts)) => {
+                        self.stats.affinity.holds.fetch_add(1, Ordering::Relaxed);
+                        self.hold_done(pool, counts);
+                    }
+                    result => self.release_done(pool, result.map(|(_, counts)| counts)),
                 }
-                self.release_done(pool, result.map(|(_, counts)| counts));
                 self.publish_stats();
             }
             Ctl::ReconcileDone { result } => {
@@ -2629,6 +2642,7 @@ impl Scheduler {
             max_held: cfg.max_held(pool.configured_cap),
             arrived_ago: arrived.elapsed(),
             remember: cfg.warm_ttl,
+            max_run: cfg.max_jumps,
         };
         pool.release(tenant, key);
         pool.settle_idle();
@@ -2663,7 +2677,7 @@ impl Scheduler {
             .flat_map(|p| {
                 [
                     p.affinity.next_expiry(),
-                    p.oldest_queued().map(|t| t + bypass),
+                    p.oldest_eligible().map(|t| t + bypass),
                 ]
             })
             .flatten()
@@ -2917,7 +2931,8 @@ impl Scheduler {
             let Some(pool) = self.pools.get_mut(key).filter(|_| holds) else {
                 continue;
             };
-            while pool.queued_total > 0 && pool.pending.len() < max_pending {
+            let limit = if pool.probing { 1 } else { max_pending };
+            while pool.queued_total > 0 && pool.pending.len() < limit {
                 let Some((tenant, key_id, waiter)) = pool.take_probe() else {
                     break;
                 };
@@ -3099,6 +3114,25 @@ impl Scheduler {
                 }
             }
             Err(e) => self.shared_failed(&e.to_string()),
+        }
+        self.maybe_start_reconcile();
+        self.dispatch_all();
+    }
+
+    /// The backend kept a slot for a session's next step. Nothing was freed
+    /// in the cluster, so claims refused for a full pool or ceiling stay
+    /// waiting for a release.
+    fn hold_done(&mut self, key: PoolKey, counts: ClusterCounts) {
+        if let Some(s) = self.shared.as_mut() {
+            s.ops = s.ops.saturating_sub(1);
+            if self.mode == SlotMode::Shared {
+                s.cluster_in_flight = Some(counts.global);
+            }
+        }
+        if self.mode == SlotMode::Shared {
+            if let Some(pool) = self.pools.get_mut(&key) {
+                pool.cluster_in_flight = Some(counts.pool);
+            }
         }
         self.maybe_start_reconcile();
         self.dispatch_all();

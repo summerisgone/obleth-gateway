@@ -238,6 +238,26 @@ async fn holds_give_way_to_a_request_that_waited_too_long() {
 }
 
 #[tokio::test]
+async fn a_waiter_held_back_by_its_own_key_cap_does_not_end_holds() {
+    let mut cfg = config(2_000);
+    cfg.max_bypass = Duration::from_millis(100);
+    let fs = start(Some(cfg));
+    let (agent, other) = (Uuid::new_v4(), Uuid::new_v4());
+    let capped = |session| req(other, 2, session).key_cap(1);
+    step(&fs, agent, 2, "loop").await;
+    let second = admit(&fs, req(agent, 2, "loop")).await;
+    let busy = admit(&fs, capped("busy")).await;
+    let _backlog = spawn_admit(&fs, capped("backlog"));
+    wait_for_queued(&fs, 1).await;
+    // Long past max_bypass, but a free slot would not be the backlog's.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    drop(second.permit);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(held(&fs).await, 1);
+    drop(busy.permit);
+}
+
+#[tokio::test]
 async fn turning_affinity_off_releases_held_slots() {
     let fs = start(Some(config(30_000)));
     let (agent, other) = (Uuid::new_v4(), Uuid::new_v4());
@@ -421,4 +441,29 @@ async fn a_first_step_on_a_shared_pool_holds_nothing() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(cluster.held_slots(&pool_id()), 0);
     assert_eq!(cluster.pool_in_flight(&pool_id()), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_looping_session_gives_way_to_another_gateway_after_max_jumps() {
+    let cluster = InMemoryCluster::new();
+    let mut cfg = config(5_000);
+    cfg.max_jumps = 2;
+    let gws = shared_gateways(&cluster, 2, cfg).await;
+    let (agent, other) = (Uuid::new_v4(), Uuid::new_v4());
+    step(&gws[0], agent, 1, "loop").await;
+    let mut running = admit(&gws[0], req(agent, 1, "loop")).await;
+    let mut waiting = spawn_admit(&gws[1], req(other, 1, "other"));
+    wait_for_queued(&gws[1], 1).await;
+    // Two holds in a row while gw-1 waits, each taken by the next step.
+    for _ in 0..2 {
+        drop(running.permit);
+        running = admit(&gws[0], req(agent, 1, "loop")).await;
+        assert!(!waiting.is_finished(), "held for the loop");
+    }
+    drop(running.permit);
+    let granted = granted_within(&mut waiting, Duration::from_secs(1))
+        .await
+        .expect("the waiter on the other gateway gets the slot");
+    assert_eq!(granted.admission, Admission::Queued);
+    assert_eq!(cluster.held_slots(&pool_id()), 0);
 }

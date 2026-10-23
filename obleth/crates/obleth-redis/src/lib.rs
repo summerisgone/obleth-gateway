@@ -9,8 +9,8 @@ pub mod scripts;
 mod slots;
 
 pub use slots::{
-    RedisSlots, SlotKeys, REPLICAS_KEY, SLOT_HELD_PREFIX, SLOT_HOLDS_KEY, SLOT_HOLD_PREFIX,
-    SLOT_RECENT_KEY, SLOT_RELEASE_CHANNEL, SLOT_TOTALS_KEY, SLOT_VIEW_PREFIX,
+    RedisSlots, SlotKeys, REPLICAS_KEY, SLOT_CHAIN_KEY, SLOT_HELD_PREFIX, SLOT_HOLDS_KEY,
+    SLOT_HOLD_PREFIX, SLOT_RECENT_KEY, SLOT_RELEASE_CHANNEL, SLOT_TOTALS_KEY, SLOT_VIEW_PREFIX,
 };
 
 use std::sync::OnceLock;
@@ -1886,6 +1886,7 @@ mod tests {
             keys.totals.clone(),
             keys.holds.clone(),
             keys.recent.clone(),
+            keys.chain.clone(),
         ];
         all.extend(instances.iter().map(|i| keys.held(i)));
         all.extend(instances.iter().map(|i| keys.view(i)));
@@ -2340,6 +2341,7 @@ mod tests {
             max_held,
             arrived_ago: std::time::Duration::ZERO,
             remember: std::time::Duration::from_secs(120),
+            max_run: 8,
         }
     }
 
@@ -2464,6 +2466,64 @@ mod tests {
             .await
             .unwrap();
         assert!(!left);
+        drop_test_keys(&store, &keys, &["a", "b"]).await;
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// While another replica waits for the pool, a session is held for at
+    /// most `max_run` steps in a row; then its slot goes to the waiter.
+    #[tokio::test]
+    async fn a_session_holds_only_so_many_times_in_a_row_while_others_wait() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        live(&store, &keys, &["a", "b"]).await;
+        let c = claim("m:r", 1, 100);
+        let hold = SlotHold {
+            max_run: 2,
+            ..slot_hold("m:r|k/s", 60_000, 1)
+        };
+        let next = SlotClaim {
+            hold: Some(hold.id.clone()),
+            redeem_only: true,
+            ..c.clone()
+        };
+        let slot = take_slot(&store, &keys, "a", &c).await;
+        store.slot_hold(&keys, "a", &slot, &hold).await.unwrap();
+
+        // Nobody waits: held as often as the session loops.
+        take_slot(&store, &keys, "a", &c).await;
+        for _ in 0..3 {
+            let (held, _) = store.slot_hold(&keys, "a", &slot, &hold).await.unwrap();
+            assert!(held);
+            let (outcome, _) = store.slot_acquire(&keys, "a", &next).await.unwrap();
+            assert_eq!(outcome, AcquireOutcome::Redeemed);
+        }
+
+        // b waits for the pool: two more holds, then the slot is released.
+        let (outcome, _) = store
+            .slot_acquire(&keys, "b", &claim("m:r", 1, 100))
+            .await
+            .unwrap();
+        assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Pool));
+        for _ in 0..2 {
+            let (held, _) = store.slot_hold(&keys, "a", &slot, &hold).await.unwrap();
+            assert!(held);
+            let (outcome, _) = store.slot_acquire(&keys, "a", &next).await.unwrap();
+            assert_eq!(outcome, AcquireOutcome::Redeemed);
+        }
+        let (held, counts) = store.slot_hold(&keys, "a", &slot, &hold).await.unwrap();
+        assert!(!held, "the waiter's turn");
+        assert_eq!(counts.pool, 0);
+        let (outcome, _) = store
+            .slot_acquire(&keys, "b", &claim("m:r", 1, 100))
+            .await
+            .unwrap();
+        assert_eq!(outcome, AcquireOutcome::Granted);
+        let mut conn = store.conn.clone();
+        let run: Option<i64> = conn.hget(&keys.chain, &hold.id).await.unwrap();
+        assert_eq!(run, None, "giving way starts the count again");
         drop_test_keys(&store, &keys, &["a", "b"]).await;
     }
 

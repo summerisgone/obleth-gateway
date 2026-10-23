@@ -45,6 +45,8 @@ pub const SLOT_HOLDS_KEY: &str = "obleth:fairshare:holds";
 pub const SLOT_HOLD_PREFIX: &str = "obleth:fairshare:hold:";
 /// When each session's last step finished, by hold id.
 pub const SLOT_RECENT_KEY: &str = "obleth:fairshare:recent";
+/// Each session's holds in a row while its pool was waited on, by hold id.
+pub const SLOT_CHAIN_KEY: &str = "obleth:fairshare:chain";
 
 /// How long a refused claim marks its pool as waited on. Every refusal
 /// renews it, and a waiter retries well inside it, so releases keep
@@ -64,6 +66,7 @@ pub struct SlotKeys {
     pub holds: String,
     pub hold_prefix: String,
     pub recent: String,
+    pub chain: String,
 }
 
 impl Default for SlotKeys {
@@ -77,6 +80,7 @@ impl Default for SlotKeys {
             holds: SLOT_HOLDS_KEY.into(),
             hold_prefix: SLOT_HOLD_PREFIX.into(),
             recent: SLOT_RECENT_KEY.into(),
+            chain: SLOT_CHAIN_KEY.into(),
         }
     }
 }
@@ -93,6 +97,7 @@ impl SlotKeys {
             holds: format!("{prefix}:holds"),
             hold_prefix: format!("{prefix}:hold:"),
             recent: format!("{prefix}:recent"),
+            chain: format!("{prefix}:chain"),
         }
     }
 
@@ -272,6 +277,7 @@ impl RedisStore {
             .key(keys.held(instance))
             .key(&keys.holds)
             .key(&keys.recent)
+            .key(&keys.chain)
             .arg(&slot.pool)
             .arg(slot.tenant.to_string())
             .arg(slot.key.to_string())
@@ -282,6 +288,7 @@ impl RedisStore {
             .arg(hold.max_held as u64)
             .arg(hold.arrived_ago.as_millis() as u64)
             .arg(hold.remember.as_millis().max(1) as u64)
+            .arg(hold.max_run.max(1))
             .invoke_async(&mut conn)
             .await?;
         Ok((

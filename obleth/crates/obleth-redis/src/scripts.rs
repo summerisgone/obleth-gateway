@@ -332,7 +332,9 @@ return { tokens, cost }
 //   holdings are freed. A second sorted set (`obleth:fairshare:recent`)
 //   scores each session's hold id by when its last step finished, so a
 //   step can be told to have followed straight on from the one before
-//   whichever replica either ran on.
+//   whichever replica either ran on, and a hash (`obleth:fairshare:chain`)
+//   counts the holds a session has had in a row while the pool was waited
+//   on, so no session keeps a slot from waiters on other replicas for long.
 //
 // Every change to a holdings hash is applied to the totals in the same
 // script, so the totals are always the sum of the holdings. A replica's
@@ -622,43 +624,57 @@ return { freed, tonumber(c[1]) or 0, tonumber(c[2]) or 0 }
 /// giving it back.
 ///
 /// KEYS[1] = slot totals hash, KEYS[2] = this replica's holdings,
-/// KEYS[3] = held slot ids, KEYS[4] = sessions' last finished steps
+/// KEYS[3] = held slot ids, KEYS[4] = sessions' last finished steps,
+/// KEYS[5] = sessions' holds in a row while waited on
 /// ARGV[1] = pool id, ARGV[2] = tenant, ARGV[3] = key, ARGV[4] = release
 /// channel, ARGV[5] = held slot hash prefix, ARGV[6] = hold id,
 /// ARGV[7] = how long to hold it, in ms, ARGV[8] = most slots the pool may
 /// have held at once, ARGV[9] = how long ago the finished step arrived, in
-/// ms, ARGV[10] = how long a session's last finish is remembered, in ms
+/// ms, ARGV[10] = how long a session's last finish is remembered, in ms,
+/// ARGV[11] = most holds in a row while the pool is waited on
 ///
 /// Held slots that ran out are freed first, and finishes older than
-/// ARGV[10] forgotten. This finish is recorded under the id. Then, if the
-/// step arrived within ARGV[7] of the session's previous step finishing,
-/// this replica holds a slot in the pool, the pool has fewer than ARGV[8]
-/// held and nothing is held under the id yet, the slot's counts move from
-/// this replica's
+/// ARGV[10] forgotten with their counts. This finish is recorded under the
+/// id. Then, if the step arrived within ARGV[7] of the session's previous
+/// step finishing, the session has had fewer than ARGV[11] holds in a row
+/// while some replica waited on the pool (or the ceiling) or nobody waits
+/// now, this replica holds a slot in the pool, the pool has fewer than
+/// ARGV[8] held and nothing is held under the id yet, the slot's counts
+/// move from this replica's
 /// holdings to the held slot's hash, which also counts `h|<pool>` (in the
 /// totals too), and the id is scored by expiry. The totals' `g`, `p|`, `t|`
 /// and `k|` stay as they are: a held slot still counts against every limit.
-/// Otherwise the slot is released exactly as `SLOT_RELEASE` does.
+/// A hold while the pool is waited on adds one to the session's count, one
+/// while nobody waits clears it. Otherwise the slot is released exactly as
+/// `SLOT_RELEASE` does and the count is cleared: the session has given way.
 ///
 /// Returns `{code, pool count, global count}`: 2 held, else what
 /// `SLOT_RELEASE` returns (1 freed, 0 nothing to free).
 pub const SLOT_HOLD: &str = concat!(
     slot_helpers!(),
     r#"
-local totals, held, holds, recent = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
+local totals, held, holds, recent, chain = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
 local pool = ARGV[1]
 local pf = 'p|' .. pool
 local hf = 'h|' .. pool
 local now = now_ms()
 purge_holds(totals, holds, ARGV[5], ARGV[4], now)
-redis.call('ZREMRANGEBYSCORE', recent, '-inf', now - tonumber(ARGV[10]))
+local cutoff = now - tonumber(ARGV[10])
+for _, id in ipairs(redis.call('ZRANGEBYSCORE', recent, '-inf', cutoff)) do
+  redis.call('HDEL', chain, id)
+end
+redis.call('ZREMRANGEBYSCORE', recent, '-inf', cutoff)
 local prev = tonumber(redis.call('ZSCORE', recent, ARGV[6]))
 redis.call('ZADD', recent, now, ARGV[6])
 local chained = prev ~= nil and (now - tonumber(ARGV[9])) - prev <= tonumber(ARGV[7])
+local w = redis.call('HMGET', totals, 'w|' .. pool, 'w')
+local waited = (tonumber(w[1]) or 0) > now or (tonumber(w[2]) or 0) > now
+local run = tonumber(redis.call('HGET', chain, ARGV[6])) or 0
 local fields = { 'g', pf, 't|' .. pool .. '|' .. ARGV[2], 'k|' .. pool .. '|' .. ARGV[3] }
 local hold = ARGV[5] .. ARGV[6]
 
 if chained
+  and (not waited or run < tonumber(ARGV[11]))
   and (tonumber(redis.call('HGET', held, pf)) or 0) > 0
   and (tonumber(redis.call('HGET', totals, hf)) or 0) < tonumber(ARGV[8])
   and redis.call('EXISTS', hold) == 0 then
@@ -671,10 +687,16 @@ if chained
   redis.call('HINCRBY', hold, hf, 1)
   redis.call('HINCRBY', totals, hf, 1)
   redis.call('ZADD', holds, now + tonumber(ARGV[7]), ARGV[6])
+  if waited then
+    redis.call('HSET', chain, ARGV[6], run + 1)
+  else
+    redis.call('HDEL', chain, ARGV[6])
+  end
   local c = redis.call('HMGET', totals, pf, 'g')
   return { 2, tonumber(c[1]) or 0, tonumber(c[2]) or 0 }
 end
 
+redis.call('HDEL', chain, ARGV[6])
 local freed = 0
 for _, f in ipairs(fields) do
   if (tonumber(redis.call('HGET', held, f)) or 0) > 0 then
