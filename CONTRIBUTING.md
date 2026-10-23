@@ -84,8 +84,9 @@ acknowledgement is the required step for this repository.
 
 This repository is source-available under the Business Source License 1.1. The
 current license permits internal, academic, research, educational, and other
-allowed uses described in [LICENSE](LICENSE), while restricting hosted resale and
-competing commercial gateway products until the Change Date.
+allowed uses described in [LICENSE](LICENSE), including free hosting for other
+people, while restricting paid hosted services and competing commercial gateway
+products until the Change Date.
 
 If you submit a contribution, you agree that your contribution will be licensed
 under the terms described in [CONTRIBUTOR_CERTIFICATE.md](CONTRIBUTOR_CERTIFICATE.md)

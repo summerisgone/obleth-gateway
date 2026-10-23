@@ -4,6 +4,58 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v2.3.0
+
+A new job API, `/v1/meshes`, turns an image into a 3D model, and the Playground has a 3D mode to try it. Energy can be measured per model instead of shared out by hand-set slot counts. The request log now covers MCP calls, keeps a deleted key's name, searches with `*` and filters by several keys, teams or models at once. A model can refuse request fields its server can't handle, and first-token time is recorded only for streamed replies.
+
+> **Upgrade notes.** No breaking changes. Postgres migrations `0036` and `0037` and the new ClickHouse `usage` columns only add columns, and the gateway applies them when it starts.
+>
+> - **Behaviour to expect after upgrading:**
+>   - First-token time is recorded only for replies streamed to the client. A buffered reply has none (`0`) in the ledger, the request log and the `obleth_ttft_ms` histogram, so a model that is mostly called without streaming shows far fewer first-token samples, and a lower median, than before. Rows written before the upgrade keep their old values.
+>   - Calls through `/mcp/<server>` now appear in the request log as `mcp` rows with no tokens or cost. Reports that count every row in `usage` will count them too.
+>   - Existing video jobs keep working: rows written before migration `0037` are read as videos.
+>   - Nothing changes for energy or rejected request fields until they are configured.
+
+**Gateway**
+
+- **3D meshes.** A new model type, `mesh`, turns an image into a 3D model through a job API shaped like `/v1/videos`.
+  - **Routes:** `POST /v1/meshes` takes the image as a multipart upload and returns a job id; `GET /v1/meshes` lists jobs, `GET` and `DELETE /v1/meshes/{id}` read and remove one, and `GET /v1/meshes/{id}/content` returns the binary glTF (`.glb`) once the job completes.
+  - **Jobs:** each job is recorded against its tenant, key and endpoint before the id reaches the client. Follow-ups go to the server that took the create, and another key's jobs read as not found.
+  - **Billing:** the model's flat per-job price.
+  - **Storage:** the job table gains a `kind` column (migration `0037`) and every lookup matches it, so a job is only found through the endpoint that created it.
+- **Energy per model.** Settings → Energy takes a per-model PromQL query (`model_power_query`) returning watts per model, named by a label (`model_power_label`, `model` by default).
+  - **Matching:** a model whose name, capacity Service or upstream model matches a series is charged that series' power while it serves, split across its in-flight requests across the cluster. Idle power is charged to nobody.
+  - **Shared servers:** an optional `model_requests_query` returns how many requests each model's servers are handling. When clients other than the gateway use the same servers, a model's power is split across the larger of the two counts, so gateway requests aren't charged for everyone else's share.
+  - **Fallback:** models with no series keep the node slot share, so either query alone is enough and existing settings behave as before.
+  - **Alerts:** a failed poll raises `energy_model_power_poll_failed` or `energy_model_requests_poll_failed` and keeps the last reading.
+  - **Test route:** it runs every query and reports which registered models match a series, and which series match no model.
+- **Rejected request fields.** A model can carry `rejected_request_fields`: up to 32 top-level body keys (case-sensitive, never `model`) that its server crashes or misbehaves on.
+  - **Refusal:** a request carrying one, at the top level or inside `extra_body`, gets a 400 in the OpenAI error shape (`invalid_request_error`, `param` naming the field, code `unsupported_parameter`) and never reaches the upstream. It is recorded as a rejected row with no tokens.
+  - **Scope:** the check covers every path, Responses and Messages included. Aliases, variants and family members use the model's list, and fields that reasoning effort or boons add are not checked.
+  - **API:** `PUT /api/v1/models/{id}/rejected-request-fields`, or the field on model create and update. It is stored in Postgres (migration `0036`) and carried in manifests and backups. Empty by default.
+- **MCP calls in the request log.** Each call through `/mcp/<server>` past the key gate is a usage row: request type `mcp`, the server's name as the model, the HTTP status, and the time until the server's response headers. A call to an unknown or disabled server, one with an oversized body and one to an unreachable server are recorded as well. The client's `mcp-session-id` groups a session's calls, and each answer carries `x-obleth-request-id`.
+- **First-token time only on streamed replies** (see the upgrade notes). A buffered reply's first byte arrives with its last, so its whole duration used to be recorded as its first token: one mostly unstreamed model read a 34 s median while its streamed replies got a first token in under a second.
+- **Usage rows keep the key and tenant names.** Keys and tenants are hard-deleted, and regenerating a key deletes the old one, so a deleted key's past requests used to lose their owner. Each row now records `key_name` and `tenant_name` as they were when the request was served.
+- **Request log filters.** `key_id`, `tenant_id` and `model` on `/usage/logs`, its histogram and its facets accept a comma-separated list of up to 200 values. A single value works as before.
+
+**ClickHouse and telemetry**
+
+- Usage rows carry `key_name`, `tenant_name` and `streamed`, added with `ADD COLUMN IF NOT EXISTS`. Older WAL records replay with empty names and `streamed = false`.
+
+**Dashboard**
+
+- **Playground:** a 3D mode for mesh models.
+  - Drop in an image, pick quality, detail and texture size, and follow the job's stage and progress. The finished model opens in an orbit viewer and downloads as `.glb`.
+  - Job ids are kept on the session, so a running job survives a mode switch or a reload.
+  - Image results offer "3D" to send a generated picture straight to it, and Get code shows the upload, poll and download steps.
+  - three.js loads only when a viewer opens. The content security policy's `connect-src` now allows `blob:` and `data:`, which the viewer needs to read the downloaded model and its textures.
+- **Models:** the mesh type can be chosen when registering a model and is priced per mesh. A model's Connection section has a "Rejected request fields" box, one field name per line.
+- **Logs:**
+  - The search box takes `*` in `model:`, `team:` and `key:` (for example `key:jlee379*`) and picks up to 100 matches. A bare word that isn't a request id is looked up as a key, then a team, then a model.
+  - The Type menu covers every request type the gateway records, including `verdict`, `messages`, `mcp` and `mesh`, plus any new type the log has shown.
+  - A deleted key or team shows its recorded name, and a buffered reply reads "Not streamed" where it has no first token.
+- **Settings → Energy:** the per-model power and request-count queries sit under Power per model. Their test shows which models match before saving.
+
 ## v2.2.0
 
 Reasoning effort is translated for each model, and model families give one name to an instruct model and its thinking sibling. `/v1/models` now carries what a catalog needs, including the boons that run on each model. Fair share is counted across every gateway. Verdicts take images. A stream the upstream cuts short now says so instead of reading as a whole answer. Text-to-speech streams through the gateway, a new route lists a speech model's voices, and the Playground has a Speech mode.

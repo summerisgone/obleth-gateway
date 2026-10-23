@@ -156,4 +156,8 @@ Bug reports and feature requests go in [GitHub Issues](https://github.com/thediy
 
 ## License
 
-[Business Source License 1.1](LICENSE). Source-available; each release converts to [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0) four years after publication. Free for internal, academic, research, and educational use. You may not offer obleth as a hosted service or distribute a competing gateway product derived from it until the Change Date. Contact the maintainers for commercial licensing.
+[Business Source License 1.1](LICENSE). Source-available; each release converts to [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0) four years after publication.
+
+**Free to run, including for other people.** A university can host obleth for its students, faculty and researchers, and a company can host it for its employees. Recovering your costs inside your own organization (chargeback) is fine, and so is a free public instance with no ads. You can also charge for consulting, setup or support.
+
+**Not free to sell.** Until the Change Date you may not charge others for access to obleth: no OpenRouter-style paid API or other paid hosted gateway built on it, whether through subscriptions, usage or per-token fees, credits, ads, or bundling it into a paid product. You also may not sell a competing gateway product derived from it. The [LICENSE](LICENSE) has the exact terms. Contact the maintainers for a commercial license.
