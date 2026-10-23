@@ -1249,7 +1249,12 @@ impl Pool {
             .unwrap_or_else(Instant::now);
         self.affinity
             .granted(grant.session.as_deref(), grant.jumped, arrived);
-        self.pass_earlier(grant.tenant, grant.key, arrived);
+        // Only affinity's own reordering counts as passing. In shared mode
+        // concurrent claims for one key can land out of order too; that is
+        // not a request being passed over.
+        if grant.jumped {
+            self.pass_earlier(grant.tenant, grant.key, arrived);
+        }
         // If the caller is gone, `send` hands the `Admitted` back as `Err` and
         // dropping it here drops its `Permit`, which already releases the
         // slot via `Permit::drop`. An explicit release here would double up:
@@ -3595,5 +3600,46 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(score("many"), score("one"));
+    }
+
+    /// A queued request counts as passed only when session affinity served
+    /// a later one first, not when a later one's grant simply landed first.
+    #[test]
+    fn only_affinity_reordering_passes_a_queued_request() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = Pool::new(
+            PoolKey::Model("m".into()),
+            FairshareAlgorithm::Weighted,
+            8,
+            tx,
+        );
+        pool.affinity.configure(
+            Some(SessionAffinityConfig {
+                warm_ttl: Duration::from_secs(120),
+                hold: Duration::from_secs(3),
+                max_jumps: 8,
+                max_bypass: Duration::from_secs(30),
+                max_held_percent: 25,
+            }),
+            Arc::default(),
+        );
+        let t = Uuid::new_v4();
+        let (respond, _admitted) = oneshot::channel();
+        pool.enqueue(
+            AdmitRequest::new(t, "m", 10).session("old"),
+            respond,
+            Instant::now(),
+            false,
+        );
+        let passed = |pool: &Pool| pool.queues[&t].keys[&t].front().unwrap().passed;
+        let grant = |pool: &mut Pool, jumped: bool| {
+            let (respond, _admitted) = oneshot::channel();
+            let grant = Grant::new(t, t, Some("new".into()), jumped);
+            pool.send(grant, respond, Admission::Queued, Duration::ZERO);
+        };
+        grant(&mut pool, false);
+        assert_eq!(passed(&pool), 0);
+        grant(&mut pool, true);
+        assert_eq!(passed(&pool), 1);
     }
 }
