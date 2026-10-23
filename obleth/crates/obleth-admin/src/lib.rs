@@ -11284,6 +11284,8 @@ mod tests {
                 global_cap: 64,
                 tenant_cap: None,
                 key_cap: None,
+                hold: None,
+                redeem_only: false,
             };
             use obleth_fairshare::SharedSlots;
             other.acquire(claim).await.expect("claimed");

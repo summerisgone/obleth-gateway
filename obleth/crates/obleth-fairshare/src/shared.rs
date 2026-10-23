@@ -21,6 +21,12 @@
 //! (see [`crate::FairShare::wake`]) and a short jittered retry covers a lost
 //! wakeup.
 //!
+//! With session affinity, a finished step's slot can be held for the
+//! session's next step ([`SharedSlots::hold`]). A hold leaves its replica's
+//! holdings but still counts against every limit, and the next claim naming
+//! it, from whichever replica the step reached, takes it over. A hold nobody
+//! takes is freed when it runs out, like the holdings of a dead replica.
+//!
 //! The backend also carries each replica's [`ReplicaView`], a compact copy
 //! of its scheduler state published every [`SharedSlotsConfig::view_interval`]
 //! while more than one replica is live, so dashboards can show the queues and
@@ -67,6 +73,29 @@ pub struct SlotClaim {
     pub global_cap: usize,
     pub tenant_cap: Option<usize>,
     pub key_cap: Option<usize>,
+    /// The id of a slot held for this request's session ([`SlotHold::id`]):
+    /// if it is still held, the claim takes it over instead of a new slot.
+    pub hold: Option<String>,
+    /// Take only the held slot: with none held under `hold`, take nothing
+    /// and mark nothing as waited on.
+    pub redeem_only: bool,
+}
+
+/// A finished request's slot to keep for its session's next step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotHold {
+    /// The same on every replica for one session in one pool.
+    pub id: String,
+    pub ttl: Duration,
+    /// The most slots the pool may have held at once, cluster-wide.
+    pub max_held: usize,
+    /// How long ago the finished request arrived. It chained onto the
+    /// session's previous step, and so is worth holding for, if it arrived
+    /// within `ttl` of that step finishing, on whichever replica.
+    pub arrived_ago: Duration,
+    /// How long the backend remembers when the session's step finished, for
+    /// the next step's check.
+    pub remember: Duration,
 }
 
 /// A held slot to give back.
@@ -90,6 +119,10 @@ pub enum SlotDenial {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquireOutcome {
     Granted,
+    /// The claim took over the slot held under its `hold` id.
+    Redeemed,
+    /// A `redeem_only` claim found no slot held for it.
+    NotHeld,
     Denied(SlotDenial),
     /// The backend does not count this replica as live (its heartbeat
     /// expired), so it must not take slots until it has re-registered and
@@ -132,6 +165,17 @@ pub enum ReconcileOutcome {
 pub trait SharedSlots: Send + Sync + 'static {
     fn acquire(&self, claim: SlotClaim) -> SlotFuture<(AcquireOutcome, ClusterCounts)>;
     fn release(&self, slot: SlotRelease) -> SlotFuture<ClusterCounts>;
+    /// A session's step finished in a slot this replica holds: note when, and
+    /// if the step chained onto the session's previous one (see
+    /// [`SlotHold::arrived_ago`]) keep the slot for `hold.ttl` under
+    /// `hold.id` instead of giving it back. A held slot leaves this replica's
+    /// holdings but still counts against the pool, the ceiling, the tenant
+    /// and the key; the first claim naming the id takes it over
+    /// ([`AcquireOutcome::Redeemed`]), and one nobody takes is freed when it
+    /// runs out. A step that did not chain, or a pool with `max_held` slots
+    /// held already, or an id held already, has the slot released as by
+    /// [`SharedSlots::release`]. Returns whether it is held.
+    fn hold(&self, slot: SlotRelease, hold: SlotHold) -> SlotFuture<(bool, ClusterCounts)>;
     /// Replace everything this replica is recorded as holding with
     /// `holdings`.
     fn reconcile(&self, holdings: Vec<PoolHoldings>) -> SlotFuture<ReconcileOutcome>;
@@ -261,7 +305,15 @@ fn tenant_field(pool: &str, tenant: &Uuid) -> String {
 fn key_field(pool: &str, key: &Uuid) -> String {
     format!("k|{pool}|{key}")
 }
+fn held_field(pool: &str) -> String {
+    format!("h|{pool}")
+}
 const GLOBAL_FIELD: &str = "g";
+
+/// The holdings owner a held slot is recorded under, beside the replicas.
+fn hold_owner(id: &str) -> String {
+    format!("hold:{id}")
+}
 
 /// A published view, with when it was published and how long it lives.
 struct MemView {
@@ -275,6 +327,10 @@ struct MemState {
     totals: HashMap<String, usize>,
     held: HashMap<String, HashMap<String, usize>>,
     live: HashSet<String>,
+    /// Held slots by id, with when each runs out.
+    holds: HashMap<String, Instant>,
+    /// When each session's step last finished, by hold id.
+    recent: HashMap<String, Instant>,
     views: HashMap<String, MemView>,
     subscribers: Vec<FairShare>,
     failing: bool,
@@ -297,6 +353,38 @@ impl MemState {
 
     fn count(&self, field: &str) -> usize {
         self.totals.get(field).copied().unwrap_or(0)
+    }
+
+    /// Free the holds that ran out; returns the pools freed in.
+    fn purge_holds(&mut self) -> Vec<String> {
+        let now = Instant::now();
+        let expired: Vec<String> = self
+            .holds
+            .iter()
+            .filter(|(_, until)| **until <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut freed = Vec::new();
+        for id in expired {
+            self.holds.remove(&id);
+            freed.extend(self.reclaim(&hold_owner(&id)));
+        }
+        freed
+    }
+
+    /// Move everything `from` holds to `to`, apart from the held-slot count,
+    /// which is dropped.
+    fn take_over(&mut self, from: &str, to: &str) {
+        let Some(held) = self.held.get(from).cloned() else {
+            return;
+        };
+        for (field, n) in held {
+            self.add(from, &field, -(n as isize));
+            if !field.starts_with("h|") {
+                self.add(to, &field, n as isize);
+            }
+        }
+        self.held.remove(from);
     }
 
     fn reclaim(&mut self, instance: &str) -> Vec<String> {
@@ -395,6 +483,20 @@ impl InMemoryCluster {
         self.state.lock().unwrap().count(GLOBAL_FIELD)
     }
 
+    /// Slots held for sessions' next steps in a pool.
+    pub fn held_slots(&self, pool: &str) -> usize {
+        self.state.lock().unwrap().count(&held_field(pool))
+    }
+
+    /// Free the holds that ran out now, as any backend call would.
+    pub fn purge_holds(&self) {
+        let (freed, subs) = {
+            let mut s = self.state.lock().unwrap();
+            (s.purge_holds(), s.subscribers.clone())
+        };
+        wake_all(&subs, freed);
+    }
+
     /// What `instance` is recorded as holding in a pool.
     pub fn held(&self, instance: &str, pool: &str) -> usize {
         self.state
@@ -441,6 +543,14 @@ impl InMemoryCluster {
     }
 }
 
+fn wake_all(subscribers: &[FairShare], pools: Vec<String>) {
+    for pool in pools {
+        for fs in subscribers {
+            fs.wake(&pool);
+        }
+    }
+}
+
 /// One replica's handle on an [`InMemoryCluster`].
 #[derive(Clone)]
 pub struct InMemorySlots {
@@ -474,8 +584,17 @@ impl SharedSlots for InMemorySlots {
             pool: s.count(&pf),
             global: s.count(GLOBAL_FIELD),
         };
-        let outcome = if !s.live.contains(&self.instance) {
+        let live = s.live.contains(&self.instance);
+        let freed = if live { s.purge_holds() } else { Vec::new() };
+        let held = claim.hold.as_ref().filter(|id| s.holds.contains_key(*id));
+        let outcome = if !live {
             AcquireOutcome::NotRegistered
+        } else if let Some(id) = held {
+            s.holds.remove(id);
+            s.take_over(&hold_owner(id), &self.instance);
+            AcquireOutcome::Redeemed
+        } else if claim.redeem_only {
+            AcquireOutcome::NotHeld
         } else if s.count(&pf) >= claim.pool_cap {
             AcquireOutcome::Denied(SlotDenial::Pool)
         } else if s.count(GLOBAL_FIELD) >= claim.global_cap {
@@ -491,7 +610,66 @@ impl SharedSlots for InMemorySlots {
             AcquireOutcome::Granted
         };
         let c = counts(&s);
+        let subs = s.subscribers.clone();
+        drop(s);
+        wake_all(&subs, freed);
         Box::pin(async move { Ok((outcome, c)) })
+    }
+
+    fn hold(&self, slot: SlotRelease, hold: SlotHold) -> SlotFuture<(bool, ClusterCounts)> {
+        let mut s = self.cluster.state.lock().unwrap();
+        let freed = s.purge_holds();
+        let now = Instant::now();
+        s.recent
+            .retain(|_, done| now.saturating_duration_since(*done) < hold.remember);
+        let arrived = now.checked_sub(hold.arrived_ago).unwrap_or(now);
+        let chained = s
+            .recent
+            .insert(hold.id.clone(), now)
+            .is_some_and(|done| arrived.saturating_duration_since(done) <= hold.ttl);
+        let pf = pool_field(&slot.pool);
+        let hf = held_field(&slot.pool);
+        let mine = |s: &MemState, f: &str| {
+            s.held
+                .get(&self.instance)
+                .and_then(|h| h.get(f).copied())
+                .unwrap_or(0)
+        };
+        let can = chained
+            && s.count(&hf) < hold.max_held
+            && !s.holds.contains_key(&hold.id)
+            && mine(&s, &pf) > 0;
+        if !can {
+            drop(s);
+            wake_all(
+                &self.cluster.state.lock().unwrap().subscribers.clone(),
+                freed,
+            );
+            let release = self.release(slot);
+            return Box::pin(async move { release.await.map(|c| (false, c)) });
+        }
+        let owner = hold_owner(&hold.id);
+        for f in [
+            GLOBAL_FIELD.to_string(),
+            pf.clone(),
+            tenant_field(&slot.pool, &slot.tenant),
+            key_field(&slot.pool, &slot.key),
+        ] {
+            if mine(&s, &f) > 0 {
+                s.add(&self.instance, &f, -1);
+                s.add(&owner, &f, 1);
+            }
+        }
+        s.add(&owner, &hf, 1);
+        s.holds.insert(hold.id, Instant::now() + hold.ttl);
+        let counts = ClusterCounts {
+            pool: s.count(&pf),
+            global: s.count(GLOBAL_FIELD),
+        };
+        let subs = s.subscribers.clone();
+        drop(s);
+        wake_all(&subs, freed);
+        Box::pin(async move { Ok((true, counts)) })
     }
 
     fn release(&self, slot: SlotRelease) -> SlotFuture<ClusterCounts> {

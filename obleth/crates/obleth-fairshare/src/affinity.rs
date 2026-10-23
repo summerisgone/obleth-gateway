@@ -17,6 +17,9 @@
 //!   held slot still counts against the pool, the tenant and the key, so it
 //!   never lets anyone past a cap or a share, and at most
 //!   [`SessionAffinityConfig::max_held`] of a pool's slots are held at once.
+//!   In shared slot mode the slot is held in the backend instead, where the
+//!   next step takes it over from whichever replica it reaches (see
+//!   [`crate::shared`]); the pool only decides that it should be held.
 //! - **Jumps**: a session that went ahead of an older request `max_jumps`
 //!   times in a row, by either route, loses both until it is served in order.
 //! - **Aging**: once a request has waited `max_bypass`, its key is served in
@@ -56,11 +59,22 @@ pub struct AffinityStats {
 #[derive(Debug, Default)]
 struct Session {
     in_flight: usize,
+    /// When the latest step to be granted arrived.
+    arrived: Option<Instant>,
     last_done: Option<Instant>,
     /// Grants in a row that went ahead of an older request.
     jumps: u32,
     /// The latest step arrived within `hold` of the previous one finishing.
     chained: bool,
+}
+
+/// A finished step whose slot may be held.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Finished {
+    /// It arrived within `hold` of the session's previous step finishing
+    /// here. Steps that ran on other replicas are not seen.
+    pub(crate) chained: bool,
+    pub(crate) arrived: Instant,
 }
 
 /// A slot kept taken for a session's next step.
@@ -159,25 +173,29 @@ impl Affinity {
         s.chained = s
             .last_done
             .is_some_and(|t| arrived.saturating_duration_since(t) <= cfg.hold);
+        s.arrived = Some(arrived);
         s.in_flight += 1;
         s.jumps = if jumped { s.jumps.saturating_add(1) } else { 0 };
     }
 
-    /// A step of `session` finished. Returns whether the session would like
-    /// its slot held: its step chained onto the previous one, nothing else of
-    /// it is running, and it is still favoured. Whether the pool can spare
-    /// the slot is the caller's call ([`Affinity::can_hold`]).
-    pub(crate) fn finished(&mut self, session: Option<&str>, now: Instant) -> bool {
+    /// A step of `session` finished. `Some` when its slot may be held for
+    /// the session's next step: holds are on, nothing else of the session is
+    /// running here, and it is still favoured. Whether it should be (the
+    /// step chained onto the one before) and whether the pool can spare the
+    /// slot ([`Affinity::can_hold`]) are the caller's call.
+    pub(crate) fn finished(&mut self, session: Option<&str>, now: Instant) -> Option<Finished> {
         let (Some(cfg), Some(session)) = (self.config, session) else {
-            return false;
+            return None;
         };
-        let Some(s) = self.sessions.get_mut(session) else {
-            return false;
-        };
+        let s = self.sessions.get_mut(session)?;
         s.in_flight = s.in_flight.saturating_sub(1);
         s.last_done = Some(now);
-        let wants = s.chained && s.in_flight == 0;
-        wants && !cfg.hold.is_zero() && self.favoured(session, now)
+        let step = Finished {
+            chained: s.chained,
+            arrived: s.arrived.unwrap_or(now),
+        };
+        let alone = s.in_flight == 0;
+        (alone && !cfg.hold.is_zero() && self.favoured(session, now)).then_some(step)
     }
 
     /// Whether a pool of `cap` slots may hold one more.
@@ -284,11 +302,17 @@ mod tests {
         a
     }
 
-    /// One whole step of `s` arriving and finishing at `at`; whether it
-    /// would like its slot held.
+    /// Whether a step finishing now chained onto the one before, so its slot
+    /// should be held.
+    fn chained(a: &mut Affinity, s: &str, at: Instant) -> bool {
+        a.finished(Some(s), at).is_some_and(|f| f.chained)
+    }
+
+    /// One whole step of `s` arriving and finishing at `at`; whether its
+    /// slot should be held.
     fn step(a: &mut Affinity, s: &str, at: Instant) -> bool {
         a.granted(Some(s), false, at);
-        a.finished(Some(s), at)
+        chained(a, s, at)
     }
 
     #[test]
@@ -352,14 +376,25 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_step_reports_when_it_arrived() {
+        let mut a = on();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        a.granted(Some("s"), false, t0);
+        let f = a.finished(Some("s"), t1).expect("may be held");
+        assert!(!f.chained, "no step before it here");
+        assert_eq!(f.arrived, t0);
+    }
+
+    #[test]
     fn no_hold_while_another_step_of_the_session_runs() {
         let mut a = on();
         let now = Instant::now();
         step(&mut a, "s", now);
         a.granted(Some("s"), false, now);
         a.granted(Some("s"), false, now);
-        assert!(!a.finished(Some("s"), now));
-        assert!(a.finished(Some("s"), now));
+        assert!(a.finished(Some("s"), now).is_none());
+        assert!(chained(&mut a, "s", now));
     }
 
     #[test]
@@ -390,13 +425,16 @@ mod tests {
         let now = Instant::now();
         step(&mut a, "s", now);
         a.granted(Some("s"), true, now);
-        assert!(a.finished(Some("s"), now));
+        assert!(chained(&mut a, "s", now));
         a.granted(Some("s"), true, now);
-        assert!(!a.finished(Some("s"), now), "out of jumps: no hold");
+        assert!(
+            a.finished(Some("s"), now).is_none(),
+            "out of jumps: no hold"
+        );
         let queue = [(Some("cold"), now), (Some("s"), now)];
         assert_eq!(a.pick(queue.into_iter(), now), 0, "out of jumps: no jump");
         a.granted(Some("s"), false, now);
-        assert!(a.finished(Some("s"), now));
+        assert!(chained(&mut a, "s", now));
         assert_eq!(a.pick(queue.into_iter(), now), 1);
         assert_eq!(a.stats.jumps.load(Ordering::Relaxed), 2);
     }

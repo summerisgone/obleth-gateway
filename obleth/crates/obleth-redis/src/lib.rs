@@ -9,8 +9,8 @@ pub mod scripts;
 mod slots;
 
 pub use slots::{
-    RedisSlots, SlotKeys, REPLICAS_KEY, SLOT_HELD_PREFIX, SLOT_RELEASE_CHANNEL, SLOT_TOTALS_KEY,
-    SLOT_VIEW_PREFIX,
+    RedisSlots, SlotKeys, REPLICAS_KEY, SLOT_HELD_PREFIX, SLOT_HOLDS_KEY, SLOT_HOLD_PREFIX,
+    SLOT_RECENT_KEY, SLOT_RELEASE_CHANNEL, SLOT_TOTALS_KEY, SLOT_VIEW_PREFIX,
 };
 
 use std::sync::OnceLock;
@@ -44,6 +44,7 @@ cached_script!(replica_deregister_script, scripts::REPLICA_DEREGISTER);
 cached_script!(peer_views_script, scripts::PEER_VIEWS);
 cached_script!(slot_acquire_script, scripts::SLOT_ACQUIRE);
 cached_script!(slot_release_script, scripts::SLOT_RELEASE);
+cached_script!(slot_hold_script, scripts::SLOT_HOLD);
 cached_script!(slot_reconcile_script, scripts::SLOT_RECONCILE);
 
 const KEY_PREFIX: &str = "obleth:key:";
@@ -251,10 +252,12 @@ impl RedisStore {
         let live: usize = replica_heartbeat_script()
             .key(&keys.replicas)
             .key(&keys.totals)
+            .key(&keys.holds)
             .arg(instance)
             .arg(ttl.as_millis().max(1) as u64)
             .arg(&keys.held_prefix)
             .arg(&keys.channel)
+            .arg(&keys.hold_prefix)
             .invoke_async(&mut conn)
             .await?;
         Ok(live)
@@ -1878,7 +1881,12 @@ mod tests {
 
     async fn drop_test_keys(store: &RedisStore, keys: &SlotKeys, instances: &[&str]) {
         let mut conn = store.conn.clone();
-        let mut all = vec![keys.replicas.clone(), keys.totals.clone()];
+        let mut all = vec![
+            keys.replicas.clone(),
+            keys.totals.clone(),
+            keys.holds.clone(),
+            keys.recent.clone(),
+        ];
         all.extend(instances.iter().map(|i| keys.held(i)));
         all.extend(instances.iter().map(|i| keys.view(i)));
         let _: () = conn.del(all).await.unwrap();
@@ -2089,7 +2097,7 @@ mod tests {
 
     use obleth_fairshare::{
         AcquireOutcome, FairShare, PoolHoldings, ReconcileOutcome, SharedSlotsConfig, SlotClaim,
-        SlotDenial, SlotMode, SlotRelease, StaticCapacity,
+        SlotDenial, SlotHold, SlotMode, SlotRelease, StaticCapacity,
     };
 
     fn claim(pool: &str, pool_cap: usize, global_cap: usize) -> SlotClaim {
@@ -2101,6 +2109,8 @@ mod tests {
             global_cap,
             tenant_cap: None,
             key_cap: None,
+            hold: None,
+            redeem_only: false,
         }
     }
 
@@ -2304,6 +2314,156 @@ mod tests {
         let fields: std::collections::HashMap<String, i64> =
             conn.hgetall(&keys.totals).await.unwrap();
         assert!(fields.is_empty(), "counts at zero are deleted: {fields:?}");
+        drop_test_keys(&store, &keys, &["a", "b"]).await;
+    }
+
+    /// Take a slot for `c` on `instance`; what releases it.
+    async fn take_slot(
+        store: &RedisStore,
+        keys: &SlotKeys,
+        instance: &str,
+        c: &SlotClaim,
+    ) -> SlotRelease {
+        let (outcome, _) = store.slot_acquire(keys, instance, c).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Granted);
+        SlotRelease {
+            pool: c.pool.clone(),
+            tenant: c.tenant,
+            key: c.key,
+        }
+    }
+
+    fn slot_hold(id: &str, ttl_ms: u64, max_held: usize) -> SlotHold {
+        SlotHold {
+            id: id.into(),
+            ttl: std::time::Duration::from_millis(ttl_ms),
+            max_held,
+            arrived_ago: std::time::Duration::ZERO,
+            remember: std::time::Duration::from_secs(120),
+        }
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// A slot is held only for a step that followed straight on from the
+    /// session's previous one; a held slot keeps counting, moves to
+    /// whichever replica claims it for its session, and is freed when nobody
+    /// does.
+    #[tokio::test]
+    async fn slot_holds_keep_counting_move_to_the_claimant_and_run_out() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        live(&store, &keys, &["a", "b"]).await;
+        let c = claim("m:h", 1, 100);
+        let hold = slot_hold("m:h|k/s", 60_000, 1);
+
+        // The session's first step has nothing to chain to: released.
+        let slot = take_slot(&store, &keys, "a", &c).await;
+        let (held, counts) = store.slot_hold(&keys, "a", &slot, &hold).await.unwrap();
+        assert!(!held);
+        assert_eq!((counts.pool, counts.global), (0, 0));
+
+        // Its second, straight after, on any replica: held.
+        let slot = take_slot(&store, &keys, "a", &c).await;
+        let (held, counts) = store.slot_hold(&keys, "a", &slot, &hold).await.unwrap();
+        assert!(held);
+        assert_eq!(
+            (counts.pool, counts.global),
+            (1, 1),
+            "a held slot still counts"
+        );
+        assert_eq!(held_field(&store, &keys, "a", "p|m:h").await, 0);
+        assert_eq!(totals_field(&store, &keys, "h|m:h").await, 1);
+
+        // Nobody else gets it, and a claim for another session's hold alone
+        // takes nothing.
+        let (outcome, _) = store
+            .slot_acquire(&keys, "b", &claim("m:h", 1, 100))
+            .await
+            .unwrap();
+        assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Pool));
+        let probe = SlotClaim {
+            hold: Some("m:h|k/other".into()),
+            redeem_only: true,
+            ..claim("m:h", 1, 100)
+        };
+        let (outcome, _) = store.slot_acquire(&keys, "b", &probe).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::NotHeld);
+
+        // The session's next step, on b, takes it over.
+        let next = SlotClaim {
+            hold: Some(hold.id.clone()),
+            redeem_only: true,
+            ..c.clone()
+        };
+        let (outcome, counts) = store.slot_acquire(&keys, "b", &next).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Redeemed);
+        assert_eq!((counts.pool, counts.global), (1, 1));
+        assert_eq!(held_field(&store, &keys, "b", "p|m:h").await, 1);
+        assert_eq!(
+            held_field(&store, &keys, "b", &format!("k|m:h|{}", c.key)).await,
+            1
+        );
+        assert_eq!(totals_field(&store, &keys, "h|m:h").await, 0);
+        let (outcome, _) = store.slot_acquire(&keys, "b", &next).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::NotHeld, "taken once only");
+
+        // b gives it back like any slot it holds.
+        let (freed, counts) = store.slot_release(&keys, "b", &slot).await.unwrap();
+        assert!(freed);
+        assert_eq!((counts.pool, counts.global), (0, 0));
+
+        // A step that came later than the hold after the one before is not
+        // held for.
+        let late = slot_hold("m:h|k/late", 200, 1);
+        let c = claim("m:h", 4, 100);
+        let slot = take_slot(&store, &keys, "a", &c).await;
+        store.slot_hold(&keys, "a", &slot, &late).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let slot = take_slot(&store, &keys, "a", &c).await;
+        let (held, _) = store.slot_hold(&keys, "a", &slot, &late).await.unwrap();
+        assert!(!held);
+
+        // At most max_held per pool: a second hold is a plain release.
+        let mut slots = Vec::new();
+        for id in ["m:h|k/1", "m:h|k/2"] {
+            let c = claim("m:h", 4, 100);
+            let first = take_slot(&store, &keys, "a", &c).await;
+            store
+                .slot_hold(&keys, "a", &first, &slot_hold(id, 200, 1))
+                .await
+                .unwrap();
+            slots.push((id, take_slot(&store, &keys, "a", &c).await));
+        }
+        let (held, _) = store
+            .slot_hold(&keys, "a", &slots[0].1, &slot_hold(slots[0].0, 200, 1))
+            .await
+            .unwrap();
+        assert!(held);
+        let (held, counts) = store
+            .slot_hold(&keys, "a", &slots[1].1, &slot_hold(slots[1].0, 200, 1))
+            .await
+            .unwrap();
+        assert!(!held);
+        assert_eq!(counts.pool, 1, "released, not held");
+
+        // Nobody takes the first: the next heartbeat after it runs out frees it.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        live(&store, &keys, &["a"]).await;
+        let mut conn = store.conn.clone();
+        let mut fields: std::collections::HashMap<String, i64> =
+            conn.hgetall(&keys.totals).await.unwrap();
+        // The refused claim above left its wait marker.
+        fields.retain(|f, _| !f.starts_with('w'));
+        assert!(fields.is_empty(), "everything given back: {fields:?}");
+        let ids: Vec<String> = conn.zrange(&keys.holds, 0, -1).await.unwrap();
+        assert!(ids.is_empty());
+        let left: bool = conn
+            .exists(format!("{}m:h|k/1", keys.hold_prefix))
+            .await
+            .unwrap();
+        assert!(!left);
         drop_test_keys(&store, &keys, &["a", "b"]).await;
     }
 
@@ -2582,6 +2742,81 @@ mod tests {
             .await
             .expect("admitted in time")
             .expect("scheduler alive")
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// Two gateways on one Redis with session affinity: a looping session's
+    /// slot is held when its step ends on one gateway, its next step takes
+    /// it on the other, and another request gets the slot only after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_held_slot_follows_its_session_across_gateways_through_redis() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        let config = SharedSlotsConfig {
+            reconcile_interval: std::time::Duration::from_secs(60),
+            ..SharedSlotsConfig::default()
+        };
+        let (a, la) = slot_gateway(&store, &keys, "a", 2, config.clone()).await;
+        let (b, lb) = slot_gateway(&store, &keys, "b", 2, config).await;
+        for fs in [&a, &b] {
+            fs.set_session_affinity(Some(obleth_config::SessionAffinityConfig {
+                warm_ttl: std::time::Duration::from_secs(120),
+                hold: std::time::Duration::from_secs(3),
+                max_jumps: 8,
+                max_bypass: std::time::Duration::from_secs(30),
+                max_held_percent: 100,
+            }));
+            wait_for_slot_mode(fs, SlotMode::Shared).await;
+        }
+        let agent = Uuid::new_v4();
+        let step = || {
+            obleth_fairshare::AdmitRequest::new(agent, "shared-model", 1)
+                .model_cap(1)
+                .session("loop")
+        };
+        let admit = |fs: &FairShare, req| {
+            let fs = fs.clone();
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(3), fs.admit(req))
+                    .await
+                    .expect("admitted in time")
+                    .expect("scheduler alive")
+            }
+        };
+        drop(admit(&a, step()).await.permit);
+        let second = admit(&a, step()).await;
+        let other = {
+            let b = b.clone();
+            tokio::spawn(async move { b.admit(model_req(1)).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(second.permit);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(totals_field(&store, &keys, "h|m:shared-model").await, 1);
+        assert!(!other.is_finished(), "the held slot is the session's");
+
+        let third = admit(&b, step()).await;
+        assert_eq!(totals_field(&store, &keys, "h|m:shared-model").await, 0);
+        assert_eq!(held_field(&store, &keys, "b", "p|m:shared-model").await, 1);
+        assert_eq!(
+            b.stats()
+                .affinity
+                .redeemed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(!other.is_finished());
+        drop(third.permit);
+        let granted = tokio::time::timeout(std::time::Duration::from_secs(5), other)
+            .await
+            .expect("granted once the session is done")
+            .unwrap();
+        drop(granted);
+        la.abort();
+        lb.abort();
+        drop_test_keys(&store, &keys, &["a", "b"]).await;
     }
 
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.

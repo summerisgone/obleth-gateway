@@ -52,6 +52,9 @@
 //! requests from the same key, and the slot a step frees can be held briefly
 //! for the session's next step (see [`affinity`]). A held slot counts like a
 //! taken one, against the pool, the global ceiling, the tenant and the key.
+//! In shared mode it is held in the backend, so the step can take it on any
+//! replica: a claim names the session's hold, and a request queued behind a
+//! full pool makes one claim for that held slot alone.
 //!
 //! Requests with no resolved route share one [`PoolKey::Unrouted`] pool. A
 //! pool with no permits and no waiters for [`IDLE_POOL_TTL`] is dropped by the
@@ -78,8 +81,8 @@ pub use history::{
 pub use replicas::{replica_share, ReplicaTracker};
 pub use shared::{
     AcquireOutcome, ClusterCounts, InMemoryCluster, InMemorySlots, PoolHoldings, ReconcileOutcome,
-    SharedSlots, SharedSlotsConfig, SlotClaim, SlotDenial, SlotError, SlotFuture, SlotMode,
-    SlotRelease,
+    SharedSlots, SharedSlotsConfig, SlotClaim, SlotDenial, SlotError, SlotFuture, SlotHold,
+    SlotMode, SlotRelease,
 };
 pub use view::{
     merge_views, ClusterSnapshot, PeerView, PeerViews, ReplicaGroupView, ReplicaKeyView,
@@ -490,6 +493,10 @@ enum Ctl {
         pool: PoolKey,
         result: Result<ClusterCounts, SlotError>,
     },
+    HoldDone {
+        pool: PoolKey,
+        result: Result<(bool, ClusterCounts), SlotError>,
+    },
     ReconcileDone {
         result: Result<ReconcileOutcome, SlotError>,
     },
@@ -757,11 +764,44 @@ struct Waiter {
     session: Option<String>,
     /// Session affinity put it ahead of an older request when it was taken.
     jumped: bool,
+    /// Shared mode: a claim for only its session's held slot has been tried.
+    probed: bool,
     enqueued: Instant,
     /// The local fast path would have admitted it on arrival; in shared mode
     /// it is still reported as fast if its first claim succeeds.
     fast: bool,
     respond: oneshot::Sender<Admitted>,
+}
+
+/// Where a slot held for a session's next step is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldIn {
+    /// In the pool: it stays taken here.
+    Pool,
+    /// In the shared backend, where any replica's claim can take it.
+    Backend,
+    /// Nowhere: the slot is given back.
+    Nowhere,
+}
+
+/// What becomes of a finished step's slot.
+#[derive(Debug, PartialEq, Eq)]
+enum StepEnd {
+    Release,
+    /// Held in the pool for the session's next step.
+    Held,
+    /// To be held in the shared backend for the session's next step, if
+    /// the step chained onto the one before.
+    HoldInBackend {
+        session: String,
+        arrived: Instant,
+    },
+}
+
+/// The id a slot held for `session` in `pool` goes by in the shared
+/// backend, the same on every replica.
+fn hold_id(pool: &PoolKey, session: &str) -> String {
+    format!("{}|{session}", pool.slot_id())
 }
 
 /// Who a grant goes to, for [`Pool::send`].
@@ -1284,6 +1324,7 @@ impl Pool {
                 end_user: req.end_user,
                 session: req.session,
                 jumped: false,
+                probed: false,
                 enqueued,
                 fast,
                 respond,
@@ -1347,6 +1388,36 @@ impl Pool {
             self.occupy(tenant, key, waiter.cost);
             self.advance_virtual_time();
             return (Some((tenant, key, waiter)), dropped);
+        }
+    }
+
+    /// Shared mode: the claim for a waiter [`Pool::take_next`] or
+    /// [`Pool::take_probe`] gave its local slot. With `holds`, it names the
+    /// slot held for the waiter's session, if any; `redeem_only` claims that
+    /// slot alone.
+    fn claim(
+        &self,
+        tenant: Uuid,
+        key: Uuid,
+        waiter: &Waiter,
+        global_cap: usize,
+        holds: bool,
+        redeem_only: bool,
+    ) -> SlotClaim {
+        SlotClaim {
+            pool: self.key.slot_id(),
+            tenant,
+            key,
+            pool_cap: self.configured_cap,
+            global_cap,
+            tenant_cap: self.tenant_cap.get(&tenant).copied(),
+            key_cap: self.key_cap.get(&key).copied(),
+            hold: waiter
+                .session
+                .as_deref()
+                .filter(|_| holds)
+                .map(|session| hold_id(&self.key, session)),
+            redeem_only,
         }
     }
 
@@ -1595,29 +1666,64 @@ impl Pool {
         self.forget_if_quiet(tenant, key);
     }
 
-    /// A step of `session` finished in a slot of `tenant` and `key`. Returns
-    /// whether the slot is now held for the session's next step rather than
-    /// given back. `may_hold` is false where this replica cannot hold one.
+    /// A step of `session` finished in a slot of `tenant` and `key`: what
+    /// becomes of the slot, given where a hold for the session's next step
+    /// would be kept.
     fn finish_step(
         &mut self,
         tenant: Uuid,
         key: Uuid,
         session: Option<&str>,
-        may_hold: bool,
-    ) -> bool {
+        hold_in: HoldIn,
+    ) -> StepEnd {
         let now = Instant::now();
-        let wants = self.affinity.finished(session, now);
-        let Some(session) = session.filter(|_| wants && may_hold) else {
-            return false;
+        let (Some(step), Some(session)) = (self.affinity.finished(session, now), session) else {
+            return StepEnd::Release;
         };
         let aged = self
             .oldest_queued()
             .is_some_and(|t| self.affinity.aged(t, now));
-        if aged || !self.affinity.can_hold(self.cap) {
-            return false;
+        match hold_in {
+            _ if aged => StepEnd::Release,
+            HoldIn::Pool if step.chained && self.affinity.can_hold(self.cap) => {
+                self.affinity.hold(session, tenant, key, now);
+                StepEnd::Held
+            }
+            // The step before may have run on another replica: the backend,
+            // which saw it finish, decides whether this one chained onto it.
+            HoldIn::Backend => StepEnd::HoldInBackend {
+                session: session.to_string(),
+                arrived: step.arrived,
+            },
+            _ => StepEnd::Release,
         }
-        self.affinity.hold(session, tenant, key, now);
-        true
+    }
+
+    /// Shared mode: take the first queued request of a session that has not
+    /// yet tried for a slot held for it, and give it its local slot, for a
+    /// claim on that held slot alone. Undone by [`Pool::requeue`].
+    fn take_probe(&mut self) -> Option<(Uuid, Uuid, Waiter)> {
+        let oldest = self.oldest_queued();
+        let (tenant, key, at) = self.queues.iter().find_map(|(tenant, queue)| {
+            queue.keys.iter().find_map(|(key, deque)| {
+                deque
+                    .iter()
+                    .position(|w| w.session.is_some() && !w.probed && !w.respond.is_closed())
+                    .map(|at| (*tenant, *key, at))
+            })
+        })?;
+        let queue = self.queues.get_mut(&tenant).expect("tenant just found");
+        let mut waiter = queue.pop_at(&key, at).expect("waiter just found");
+        if queue.is_empty() {
+            self.queues.remove(&tenant);
+        }
+        self.queued_total -= 1;
+        waiter.probed = true;
+        waiter.jumped = oldest.is_some_and(|t| t < waiter.enqueued);
+        self.track_waiter_meta(tenant, key, &waiter);
+        self.occupy(tenant, key, waiter.cost);
+        self.advance_virtual_time();
+        Some((tenant, key, waiter))
     }
 
     /// Arrival of the oldest request queued in the pool.
@@ -2314,13 +2420,24 @@ impl Scheduler {
                 pool: pool_key,
                 session,
             } => {
-                // In shared mode the slot is the backend's; it is not held here.
-                let may_hold = self.mode != SlotMode::Shared;
-                let held = self.pools.get_mut(&pool_key).is_some_and(|pool| {
-                    pool.finish_step(tenant, key, session.as_deref(), may_hold)
-                });
-                if !held {
-                    self.release_slot(&pool_key, tenant, key);
+                // In shared mode the slot is the backend's, so a hold is kept
+                // there, where the session's next step can take it from any
+                // replica. Not while a quiesced reconcile holds releases back.
+                let hold_in = match self.mode {
+                    SlotMode::Shared if self.quiesced_reconcile_running() => HoldIn::Nowhere,
+                    SlotMode::Shared => HoldIn::Backend,
+                    _ => HoldIn::Pool,
+                };
+                let end = match self.pools.get_mut(&pool_key) {
+                    Some(pool) => pool.finish_step(tenant, key, session.as_deref(), hold_in),
+                    None => StepEnd::Release,
+                };
+                match end {
+                    StepEnd::Held => {}
+                    StepEnd::Release => self.release_slot(&pool_key, tenant, key),
+                    StepEnd::HoldInBackend { session, arrived } => {
+                        self.hold_in_backend(&pool_key, tenant, key, &session, arrived)
+                    }
                 }
                 self.dispatch_all();
                 self.publish_stats();
@@ -2454,6 +2571,13 @@ impl Scheduler {
                 self.release_done(pool, result);
                 self.publish_stats();
             }
+            Ctl::HoldDone { pool, result } => {
+                if let Ok((true, _)) = &result {
+                    self.stats.affinity.holds.fetch_add(1, Ordering::Relaxed);
+                }
+                self.release_done(pool, result.map(|(_, counts)| counts));
+                self.publish_stats();
+            }
             Ctl::ReconcileDone { result } => {
                 self.reconcile_done(result);
                 self.publish_stats();
@@ -2483,6 +2607,51 @@ impl Scheduler {
     }
 
     // ---- session affinity ---------------------------------------------------
+
+    /// Shared mode: give the slot back here, and to the backend to keep for
+    /// `session`'s next step if the step that arrived at `arrived` chained
+    /// onto the session's previous one.
+    fn hold_in_backend(
+        &mut self,
+        pool_key: &PoolKey,
+        tenant: Uuid,
+        key: Uuid,
+        session: &str,
+        arrived: Instant,
+    ) {
+        let (Some(cfg), Some(pool)) = (self.session_affinity, self.pools.get_mut(pool_key)) else {
+            self.release_slot(pool_key, tenant, key);
+            return;
+        };
+        let hold = SlotHold {
+            id: hold_id(pool_key, session),
+            ttl: cfg.hold,
+            max_held: cfg.max_held(pool.configured_cap),
+            arrived_ago: arrived.elapsed(),
+            remember: cfg.warm_ttl,
+        };
+        pool.release(tenant, key);
+        pool.settle_idle();
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.publish_model_load(pool_key);
+        let Some(s) = self.shared.as_mut() else {
+            return;
+        };
+        s.ops += 1;
+        let slot = SlotRelease {
+            pool: pool_key.slot_id(),
+            tenant,
+            key,
+        };
+        let fut = s.backend.hold(slot, hold);
+        let timeout = s.config.op_timeout;
+        let tx = self.ctl_tx.clone();
+        let pool = pool_key.clone();
+        tokio::spawn(async move {
+            let result = bounded(timeout, fut).await;
+            let _ = tx.send(Ctl::HoldDone { pool, result });
+        });
+    }
 
     /// When the next held slot runs out, or a request in a pool holding one
     /// has waited long enough for the holds to give way to it.
@@ -2686,19 +2855,18 @@ impl Scheduler {
         let Some(s) = self.shared.as_ref() else {
             return;
         };
-        // Wait out a full ceiling.
-        if s.global_blocked {
-            return;
-        }
+        // Wait out a full ceiling; only claims on held slots go meanwhile.
+        let global_blocked = s.global_blocked;
         let max_pending = s.config.max_pending_per_pool.max(1);
         let global_cap = self.capacity.max_in_flight();
+        let holds = self.session_affinity.is_some_and(|c| !c.hold.is_zero());
         let n = self.pool_order.len();
         if n == 0 {
             return;
         }
         let ceiling = self.ceiling();
         let mut claims: Vec<(PoolKey, u64, SlotClaim)> = Vec::new();
-        let mut progressed = true;
+        let mut progressed = !global_blocked;
         while progressed && self.in_flight < ceiling && self.queued_total > 0 {
             progressed = false;
             for i in 0..n {
@@ -2726,15 +2894,7 @@ impl Scheduler {
                 };
                 let id = self.next_op_id;
                 self.next_op_id += 1;
-                let claim = SlotClaim {
-                    pool: key.slot_id(),
-                    tenant,
-                    key: key_id,
-                    pool_cap: pool.configured_cap,
-                    global_cap,
-                    tenant_cap: pool.tenant_cap.get(&tenant).copied(),
-                    key_cap: pool.key_cap.get(&key_id).copied(),
-                };
+                let claim = pool.claim(tenant, key_id, &waiter, global_cap, holds, false);
                 pool.pending.insert(
                     id,
                     PendingClaim {
@@ -2749,6 +2909,33 @@ impl Scheduler {
                 progressed = true;
             }
             self.cursor = (self.cursor + 1) % n;
+        }
+        // A slot may be held for a session whose next step came to this
+        // replica while the step before it ran on another: each such queued
+        // request tries once for the held slot alone, out of queue order.
+        for key in self.pool_order.iter() {
+            let Some(pool) = self.pools.get_mut(key).filter(|_| holds) else {
+                continue;
+            };
+            while pool.queued_total > 0 && pool.pending.len() < max_pending {
+                let Some((tenant, key_id, waiter)) = pool.take_probe() else {
+                    break;
+                };
+                let id = self.next_op_id;
+                self.next_op_id += 1;
+                let claim = pool.claim(tenant, key_id, &waiter, global_cap, true, true);
+                pool.pending.insert(
+                    id,
+                    PendingClaim {
+                        tenant,
+                        key: key_id,
+                        waiter,
+                    },
+                );
+                self.in_flight += 1;
+                self.queued_total = self.queued_total.saturating_sub(1);
+                claims.push((key.clone(), id, claim));
+            }
         }
         for (pool, id, claim) in claims {
             self.publish_model_load(&pool);
@@ -2812,8 +2999,13 @@ impl Scheduler {
             return;
         };
         match result {
-            Ok((AcquireOutcome::Granted, counts)) => {
-                pool.probing = false;
+            Ok((outcome @ (AcquireOutcome::Granted | AcquireOutcome::Redeemed), counts)) => {
+                if outcome == AcquireOutcome::Redeemed {
+                    // Taking a held slot says nothing about room for others.
+                    self.stats.affinity.redeemed.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    pool.probing = false;
+                }
                 pool.cluster_in_flight = Some(counts.pool);
                 let PendingClaim {
                     tenant,
@@ -2861,6 +3053,13 @@ impl Scheduler {
                     }
                 }
                 self.schedule_retry();
+            }
+            Ok((AcquireOutcome::NotHeld, counts)) => {
+                // Nothing held for it; it waits its turn, already probed.
+                pool.requeue(claim);
+                pool.cluster_in_flight = Some(counts.pool);
+                self.in_flight = self.in_flight.saturating_sub(1);
+                self.queued_total += 1;
             }
             Ok((AcquireOutcome::NotRegistered, _)) => {
                 pool.requeue(claim);

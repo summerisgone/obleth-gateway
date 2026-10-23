@@ -4,7 +4,11 @@
 //!
 //! Cost per request, only while more than one replica is live: one script
 //! call on admission and one on release, each touching the totals hash, this
-//! replica's holdings hash and (for admission) a `ZSCORE` on the replica set.
+//! replica's holdings hash and (for admission) a `ZSCORE` on the replica set,
+//! plus a range read of the held slot set. With session affinity a finished
+//! step's slot can be held instead of released (the same one call), and a
+//! request queued behind a full pool may make one claim for a slot held for
+//! its session.
 //! Reconciles run once per heartbeat interval, off the request path.
 //!
 //! Off the request path too, each replica rewrites its scheduler view (a few
@@ -16,7 +20,7 @@ use std::time::Duration;
 
 use obleth_fairshare::{
     AcquireOutcome, ClusterCounts, PeerView, PeerViews, PoolHoldings, ReconcileOutcome,
-    ReplicaView, SharedSlots, SlotClaim, SlotDenial, SlotError, SlotFuture, SlotRelease,
+    ReplicaView, SharedSlots, SlotClaim, SlotDenial, SlotError, SlotFuture, SlotHold, SlotRelease,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +39,12 @@ pub const SLOT_RELEASE_CHANNEL: &str = "obleth:fairshare:released";
 /// Prefix of each replica's scheduler view (a JSON string with a TTL); the
 /// instance id is appended.
 pub const SLOT_VIEW_PREFIX: &str = "obleth:fairshare:view:";
+/// Ids of the slots held for sessions' next steps, scored by expiry.
+pub const SLOT_HOLDS_KEY: &str = "obleth:fairshare:holds";
+/// Prefix of each held slot's holdings hash; the hold id is appended.
+pub const SLOT_HOLD_PREFIX: &str = "obleth:fairshare:hold:";
+/// When each session's last step finished, by hold id.
+pub const SLOT_RECENT_KEY: &str = "obleth:fairshare:recent";
 
 /// How long a refused claim marks its pool as waited on. Every refusal
 /// renews it, and a waiter retries well inside it, so releases keep
@@ -51,6 +61,9 @@ pub struct SlotKeys {
     pub held_prefix: String,
     pub channel: String,
     pub view_prefix: String,
+    pub holds: String,
+    pub hold_prefix: String,
+    pub recent: String,
 }
 
 impl Default for SlotKeys {
@@ -61,6 +74,9 @@ impl Default for SlotKeys {
             held_prefix: SLOT_HELD_PREFIX.into(),
             channel: SLOT_RELEASE_CHANNEL.into(),
             view_prefix: SLOT_VIEW_PREFIX.into(),
+            holds: SLOT_HOLDS_KEY.into(),
+            hold_prefix: SLOT_HOLD_PREFIX.into(),
+            recent: SLOT_RECENT_KEY.into(),
         }
     }
 }
@@ -74,6 +90,9 @@ impl SlotKeys {
             held_prefix: format!("{prefix}:held:"),
             channel: format!("{prefix}:released"),
             view_prefix: format!("{prefix}:view:"),
+            holds: format!("{prefix}:holds"),
+            hold_prefix: format!("{prefix}:hold:"),
+            recent: format!("{prefix}:recent"),
         }
     }
 
@@ -175,6 +194,7 @@ impl RedisStore {
             .key(&keys.totals)
             .key(keys.held(instance))
             .key(&keys.replicas)
+            .key(&keys.holds)
             .arg(instance)
             .arg(&claim.pool)
             .arg(claim.tenant.to_string())
@@ -184,10 +204,16 @@ impl RedisStore {
             .arg(claim.tenant_cap.unwrap_or(0) as u64)
             .arg(claim.key_cap.unwrap_or(0) as u64)
             .arg(WAIT_MARK_MS)
+            .arg(&keys.hold_prefix)
+            .arg(&keys.channel)
+            .arg(claim.hold.as_deref().unwrap_or(""))
+            .arg(if claim.redeem_only { "1" } else { "0" })
             .invoke_async(&mut conn)
             .await?;
         let outcome = match code {
             1 => AcquireOutcome::Granted,
+            2 => AcquireOutcome::Redeemed,
+            3 => AcquireOutcome::NotHeld,
             0 => AcquireOutcome::Denied(SlotDenial::Pool),
             -1 => AcquireOutcome::Denied(SlotDenial::Global),
             -2 => AcquireOutcome::Denied(SlotDenial::Tenant),
@@ -223,6 +249,43 @@ impl RedisStore {
             .await?;
         Ok((
             freed == 1,
+            ClusterCounts {
+                pool: pool.max(0) as usize,
+                global: global.max(0) as usize,
+            },
+        ))
+    }
+
+    /// Keep one slot `instance` holds for a session's next step (see
+    /// [`SharedSlots::hold`]). Returns whether it is held and the counts
+    /// after.
+    pub async fn slot_hold(
+        &self,
+        keys: &SlotKeys,
+        instance: &str,
+        slot: &SlotRelease,
+        hold: &SlotHold,
+    ) -> crate::Result<(bool, ClusterCounts)> {
+        let mut conn = self.conn.clone();
+        let (code, pool, global): (i64, i64, i64) = crate::slot_hold_script()
+            .key(&keys.totals)
+            .key(keys.held(instance))
+            .key(&keys.holds)
+            .key(&keys.recent)
+            .arg(&slot.pool)
+            .arg(slot.tenant.to_string())
+            .arg(slot.key.to_string())
+            .arg(&keys.channel)
+            .arg(&keys.hold_prefix)
+            .arg(&hold.id)
+            .arg(hold.ttl.as_millis().max(1) as u64)
+            .arg(hold.max_held as u64)
+            .arg(hold.arrived_ago.as_millis() as u64)
+            .arg(hold.remember.as_millis().max(1) as u64)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok((
+            code == 2,
             ClusterCounts {
                 pool: pool.max(0) as usize,
                 global: global.max(0) as usize,
@@ -359,6 +422,16 @@ impl SharedSlots for RedisSlots {
                 .slot_release(&this.keys, &this.instance, &slot)
                 .await
                 .map(|(_, counts)| counts)
+                .map_err(slot_error)
+        })
+    }
+
+    fn hold(&self, slot: SlotRelease, hold: SlotHold) -> SlotFuture<(bool, ClusterCounts)> {
+        let this = self.clone();
+        Box::pin(async move {
+            this.store
+                .slot_hold(&this.keys, &this.instance, &slot, &hold)
+                .await
                 .map_err(slot_error)
         })
     }

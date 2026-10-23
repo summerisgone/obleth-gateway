@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use obleth_config::{Admission, FairshareAlgorithm, SessionAffinityConfig};
-use obleth_fairshare::{AdmitRequest, Admitted, FairShare, StaticCapacity};
+use obleth_fairshare::{
+    AdmitRequest, Admitted, FairShare, InMemoryCluster, PoolKey, SharedSlotsConfig, SlotMode,
+    StaticCapacity,
+};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -260,4 +263,162 @@ async fn requests_without_a_session_are_unaffected() {
         drop(a.permit);
     }
     assert_eq!(held(&fs).await, 0);
+}
+
+// ---- shared slots: holds kept in the backend --------------------------------
+
+/// `n` gateways sharing `cluster` in shared mode, with affinity on.
+async fn shared_gateways(
+    cluster: &InMemoryCluster,
+    n: usize,
+    affinity: SessionAffinityConfig,
+) -> Vec<FairShare> {
+    let mut gws = Vec::new();
+    for i in 0..n {
+        let fs = start(Some(affinity));
+        fs.enable_shared_slots(
+            Arc::new(cluster.gateway(&format!("gw-{i}"))),
+            SharedSlotsConfig {
+                reconcile_interval: Duration::from_secs(60),
+                ..SharedSlotsConfig::default()
+            },
+        );
+        fs.set_replicas(n);
+        cluster.subscribe(&fs);
+        gws.push(fs);
+    }
+    for fs in &gws {
+        let stats = fs.stats();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.mode() != SlotMode::Shared {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("shared mode");
+    }
+    gws
+}
+
+fn pool_id() -> String {
+    PoolKey::Model(MODEL.into()).slot_id()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_slot_follows_the_session_to_another_gateway() {
+    let cluster = InMemoryCluster::new();
+    let gws = shared_gateways(&cluster, 2, config(2_000)).await;
+    let (agent, other) = (Uuid::new_v4(), Uuid::new_v4());
+    step(&gws[0], agent, 1, "loop").await;
+    let second = admit(&gws[0], req(agent, 1, "loop")).await;
+    let mut waiting = spawn_admit(&gws[1], req(other, 1, "other"));
+    wait_for_queued(&gws[1], 1).await;
+    drop(second.permit);
+
+    // Held in the backend: it still fills the pool, and nobody else gets it.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while cluster.held_slots(&pool_id()) != 1 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("held in the backend");
+    assert_eq!(cluster.pool_in_flight(&pool_id()), 1);
+    assert_eq!(cluster.held("gw-0", &pool_id()), 0);
+    assert!(
+        granted_within(&mut waiting, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "the held slot is not anyone else's"
+    );
+
+    // The session's next step reaches the other gateway and takes it there.
+    let third = admit(&gws[1], req(agent, 1, "loop")).await;
+    assert_eq!(cluster.held_slots(&pool_id()), 0);
+    assert_eq!(cluster.held("gw-1", &pool_id()), 1);
+    assert_eq!(gws[1].stats().affinity.redeemed.load(Ordering::Relaxed), 1);
+    assert!(!waiting.is_finished(), "the other request still waits");
+    drop(third.permit);
+    granted_within(&mut waiting, Duration::from_secs(5))
+        .await
+        .expect("granted once the session is done with the slot");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backend_hold_nobody_takes_is_freed() {
+    let cluster = InMemoryCluster::new();
+    let gws = shared_gateways(&cluster, 2, config(150)).await;
+    let (agent, other) = (Uuid::new_v4(), Uuid::new_v4());
+    step(&gws[0], agent, 1, "loop").await;
+    let second = admit(&gws[0], req(agent, 1, "loop")).await;
+    let mut waiting = spawn_admit(&gws[1], req(other, 1, "other"));
+    wait_for_queued(&gws[1], 1).await;
+    drop(second.permit);
+    let granted = granted_within(&mut waiting, Duration::from_secs(5))
+        .await
+        .expect("granted once the hold runs out");
+    assert_eq!(granted.admission, Admission::Queued);
+    assert_eq!(cluster.held_slots(&pool_id()), 0);
+    assert_eq!(cluster.pool_in_flight(&pool_id()), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backend_holds_are_capped_per_pool() {
+    let cluster = InMemoryCluster::new();
+    let mut cfg = config(2_000);
+    cfg.max_held_percent = 25;
+    let gws = shared_gateways(&cluster, 2, cfg).await;
+    let agents: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+    for a in &agents {
+        step(&gws[0], *a, 4, "loop").await;
+    }
+    let mut seconds = Vec::new();
+    for a in &agents {
+        seconds.push(admit(&gws[0], req(*a, 4, "loop")).await);
+    }
+    drop(seconds);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        cluster.held_slots(&pool_id()),
+        1,
+        "25% of four slots is one"
+    );
+    assert_eq!(cluster.pool_in_flight(&pool_id()), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_loop_whose_steps_alternate_gateways_is_held_for() {
+    let cluster = InMemoryCluster::new();
+    let gws = shared_gateways(&cluster, 2, config(2_000)).await;
+    let (agent, other) = (Uuid::new_v4(), Uuid::new_v4());
+    // Each step lands on the other gateway, so neither sees two in a row.
+    step(&gws[0], agent, 1, "loop").await;
+    let second = admit(&gws[1], req(agent, 1, "loop")).await;
+    let mut waiting = spawn_admit(&gws[0], req(other, 1, "other"));
+    wait_for_queued(&gws[0], 1).await;
+    drop(second.permit);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while cluster.held_slots(&pool_id()) != 1 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("held: the backend saw both steps");
+    let third = admit(&gws[0], req(agent, 1, "loop")).await;
+    assert_eq!(cluster.held("gw-0", &pool_id()), 1);
+    assert!(!waiting.is_finished());
+    drop(third.permit);
+    granted_within(&mut waiting, Duration::from_secs(5))
+        .await
+        .expect("granted once the hold after the third step runs out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_step_on_a_shared_pool_holds_nothing() {
+    let cluster = InMemoryCluster::new();
+    let gws = shared_gateways(&cluster, 2, config(2_000)).await;
+    step(&gws[0], Uuid::new_v4(), 1, "once").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(cluster.held_slots(&pool_id()), 0);
+    assert_eq!(cluster.pool_in_flight(&pool_id()), 0);
 }
