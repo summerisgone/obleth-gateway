@@ -83,6 +83,10 @@ pub struct SlotClaim {
     /// Take only the held slot: with none held under `hold`, take nothing
     /// and mark nothing as waited on.
     pub redeem_only: bool,
+    /// A request for the pool has waited too long to keep yielding to held
+    /// slots: the pool's other held slots are freed first, and none is held
+    /// there while such claims keep coming.
+    pub starving: bool,
 }
 
 /// A finished request's slot to keep for its session's next step.
@@ -345,6 +349,9 @@ struct MemState {
     /// Until when someone waits for each pool, by pool id ("" for the
     /// global ceiling), as the Redis wait markers.
     waiting: HashMap<String, Instant>,
+    /// Until when a request for each pool has waited too long for slots to
+    /// be held there, by pool id.
+    starving: HashMap<String, Instant>,
     views: HashMap<String, MemView>,
     subscribers: Vec<FairShare>,
     failing: bool,
@@ -380,6 +387,23 @@ impl MemState {
             .collect();
         let mut freed = Vec::new();
         for id in expired {
+            self.holds.remove(&id);
+            freed.extend(self.reclaim(&hold_owner(&id)));
+        }
+        freed
+    }
+
+    /// Free every slot held in `pool` but `keep`; returns the pools freed in.
+    fn free_pool_holds(&mut self, pool: &str, keep: Option<&str>) -> Vec<String> {
+        let lead = format!("{pool}|");
+        let ids: Vec<String> = self
+            .holds
+            .keys()
+            .filter(|id| id.starts_with(&lead) && Some(id.as_str()) != keep)
+            .cloned()
+            .collect();
+        let mut freed = Vec::new();
+        for id in ids {
             self.holds.remove(&id);
             freed.extend(self.reclaim(&hold_owner(&id)));
         }
@@ -599,7 +623,12 @@ impl SharedSlots for InMemorySlots {
             global: s.count(GLOBAL_FIELD),
         };
         let live = s.live.contains(&self.instance);
-        let freed = if live { s.purge_holds() } else { Vec::new() };
+        let mut freed = if live { s.purge_holds() } else { Vec::new() };
+        if live && claim.starving {
+            s.starving
+                .insert(claim.pool.clone(), Instant::now() + WAIT_MARK);
+            freed.extend(s.free_pool_holds(&claim.pool, claim.hold.as_deref()));
+        }
         let held = claim.hold.as_ref().filter(|id| s.holds.contains_key(*id));
         let outcome = if !live {
             AcquireOutcome::NotRegistered
@@ -662,7 +691,9 @@ impl SharedSlots for InMemorySlots {
             .iter()
             .any(|p| s.waiting.get(*p).is_some_and(|until| *until > now));
         let run = s.chain.get(&hold.id).copied().unwrap_or(0);
+        let starving = s.starving.get(&slot.pool).is_some_and(|until| *until > now);
         let can = chained
+            && !starving
             && (!waited || run < hold.max_run)
             && s.count(&hf) < hold.max_held
             && !s.holds.contains_key(&hold.id)

@@ -2112,6 +2112,7 @@ mod tests {
             key_cap: None,
             hold: None,
             redeem_only: false,
+            starving: false,
         }
     }
 
@@ -2524,6 +2525,52 @@ mod tests {
         let mut conn = store.conn.clone();
         let run: Option<i64> = conn.hget(&keys.chain, &hold.id).await.unwrap();
         assert_eq!(run, None, "giving way starts the count again");
+        drop_test_keys(&store, &keys, &["a", "b"]).await;
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// A claim for a request that waited too long frees the pool's held
+    /// slots, and none is held there while such claims keep coming.
+    #[tokio::test]
+    async fn a_starving_claim_frees_held_slots_and_stops_new_ones() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        live(&store, &keys, &["a", "b"]).await;
+        let c = claim("m:s", 1, 100);
+        let hold = slot_hold("m:s|k/s", 60_000, 1);
+        let slot = take_slot(&store, &keys, "a", &c).await;
+        store.slot_hold(&keys, "a", &slot, &hold).await.unwrap();
+        take_slot(&store, &keys, "a", &c).await;
+        let (held, _) = store.slot_hold(&keys, "a", &slot, &hold).await.unwrap();
+        assert!(held);
+
+        let starving = SlotClaim {
+            starving: true,
+            ..claim("m:s", 1, 100)
+        };
+        let (outcome, counts) = store.slot_acquire(&keys, "b", &starving).await.unwrap();
+        assert_eq!(
+            outcome,
+            AcquireOutcome::Granted,
+            "the held slot was freed for it"
+        );
+        assert_eq!(counts.pool, 1);
+        assert_eq!(totals_field(&store, &keys, "h|m:s").await, 0);
+        let mut conn = store.conn.clone();
+        let ids: Vec<String> = conn.zrange(&keys.holds, 0, -1).await.unwrap();
+        assert!(ids.is_empty());
+
+        // The session's next steps are not held for meanwhile.
+        let next = SlotRelease {
+            pool: starving.pool.clone(),
+            tenant: starving.tenant,
+            key: starving.key,
+        };
+        let (held, counts) = store.slot_hold(&keys, "b", &next, &hold).await.unwrap();
+        assert!(!held);
+        assert_eq!(counts.pool, 0);
         drop_test_keys(&store, &keys, &["a", "b"]).await;
     }
 

@@ -224,8 +224,9 @@ pub struct SessionAffinityConfig {
     /// arriving for the session to count as a loop worth holding for. At most
     /// `max_bypass`.
     pub hold: Duration,
-    /// How many times in a row a session may go ahead of an older request
-    /// before it waits its turn again
+    /// How many times a queued request may be passed by later requests of
+    /// its key, by warm sessions or held slots, before it goes next; also
+    /// the most holds in a row a session gets while others wait for the pool
     /// (`OBLETH_FAIRSHARE_SESSION_AFFINITY_MAX_JUMPS`, default 8, at least 1).
     pub max_jumps: u32,
     /// A request that has waited this long is no longer passed over, and

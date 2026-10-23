@@ -213,6 +213,7 @@ impl RedisStore {
             .arg(&keys.channel)
             .arg(claim.hold.as_deref().unwrap_or(""))
             .arg(if claim.redeem_only { "1" } else { "0" })
+            .arg(if claim.starving { "1" } else { "0" })
             .invoke_async(&mut conn)
             .await?;
         let outcome = match code {

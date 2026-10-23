@@ -20,8 +20,9 @@
 //!   In shared slot mode the slot is held in the backend instead, where the
 //!   next step takes it over from whichever replica it reaches (see
 //!   [`crate::shared`]); the pool only decides that it should be held.
-//! - **Jumps**: a session that went ahead of an older request `max_jumps`
-//!   times in a row, by either route, loses both until it is served in order.
+//! - **Passing**: a queued request may be passed by later requests of its key,
+//!   by either route, `max_jumps` times. Then it goes next, and no slot is
+//!   held for its key, nor a held one taken, until it has been served.
 //! - **Aging**: once a request has waited `max_bypass`, its key is served in
 //!   arrival order again and its pool's held slots are given up.
 //!
@@ -62,8 +63,6 @@ struct Session {
     /// When the latest step to be granted arrived.
     arrived: Option<Instant>,
     last_done: Option<Instant>,
-    /// Grants in a row that went ahead of an older request.
-    jumps: u32,
     /// The latest step arrived within `hold` of the previous one finishing.
     chained: bool,
 }
@@ -111,6 +110,10 @@ impl Affinity {
         std::mem::take(&mut self.holds)
     }
 
+    pub(crate) fn on(&self) -> bool {
+        self.config.is_some()
+    }
+
     fn warm(&self, cfg: &SessionAffinityConfig, session: &str, now: Instant) -> bool {
         self.sessions.get(session).is_some_and(|s| {
             s.in_flight > 0
@@ -119,16 +122,16 @@ impl Affinity {
         })
     }
 
-    /// Warm and not out of jumps: may go ahead, and may have a slot held.
+    /// Warm: may go ahead, and may have a slot held.
     fn favoured(&self, session: &str, now: Instant) -> bool {
-        let Some(cfg) = &self.config else {
-            return false;
-        };
-        self.warm(cfg, session, now)
-            && self
-                .sessions
-                .get(session)
-                .is_none_or(|s| s.jumps < cfg.max_jumps)
+        self.config
+            .as_ref()
+            .is_some_and(|cfg| self.warm(cfg, session, now))
+    }
+
+    /// Whether a queued request passed `passed` times may be passed no more.
+    pub(crate) fn passed_out(&self, passed: u32) -> bool {
+        self.config.is_some_and(|cfg| passed >= cfg.max_jumps)
     }
 
     /// Whether a request queued at `enqueued` has waited long enough that
@@ -139,24 +142,31 @@ impl Affinity {
     }
 
     /// Which of one key's queued requests goes next, given each one's
-    /// session and arrival in queue order: the first of a favoured session,
-    /// unless the head has aged. 0 (the head) while affinity is off.
+    /// session, arrival and times passed, in queue order: the first of a
+    /// favoured session, unless the head has aged or been passed
+    /// `max_jumps` times. Everyone ahead of the pick is passed by it, and
+    /// the head has been passed at least as often as anyone behind it, so no
+    /// request is passed more than `max_jumps` times. 0 (the head) while
+    /// affinity is off.
     pub(crate) fn pick<'a>(
         &self,
-        mut waiters: impl Iterator<Item = (Option<&'a str>, Instant)>,
+        mut waiters: impl Iterator<Item = (Option<&'a str>, Instant, u32)>,
         now: Instant,
     ) -> usize {
         if self.config.is_none() {
             return 0;
         }
-        let Some((session, enqueued)) = waiters.next() else {
+        let Some((session, enqueued, passed)) = waiters.next() else {
             return 0;
         };
-        if self.aged(enqueued, now) || session.is_some_and(|s| self.favoured(s, now)) {
+        if self.aged(enqueued, now)
+            || self.passed_out(passed)
+            || session.is_some_and(|s| self.favoured(s, now))
+        {
             return 0;
         }
         waiters
-            .position(|(s, _)| s.is_some_and(|s| self.favoured(s, now)))
+            .position(|(s, _, _)| s.is_some_and(|s| self.favoured(s, now)))
             .map_or(0, |i| i + 1)
     }
 
@@ -175,7 +185,6 @@ impl Affinity {
             .is_some_and(|t| arrived.saturating_duration_since(t) <= cfg.hold);
         s.arrived = Some(arrived);
         s.in_flight += 1;
-        s.jumps = if jumped { s.jumps.saturating_add(1) } else { 0 };
     }
 
     /// A step of `session` finished. `Some` when its slot may be held for
@@ -257,6 +266,20 @@ impl Affinity {
         gone
     }
 
+    /// Give up the holds of `key`, e.g. to a request of the key that may be
+    /// passed no more; the caller releases them.
+    pub(crate) fn give_up_key(&mut self, key: Uuid) -> Vec<Hold> {
+        if !self.holds.iter().any(|h| h.key == key) {
+            return Vec::new();
+        }
+        let (gone, kept): (Vec<Hold>, Vec<Hold>) = std::mem::take(&mut self.holds)
+            .into_iter()
+            .partition(|h| h.key == key);
+        self.holds = kept;
+        self.count_expired(&gone);
+        gone
+    }
+
     fn count_expired(&self, gone: &[Hold]) {
         self.stats
             .expired
@@ -321,7 +344,10 @@ mod tests {
         let now = Instant::now();
         assert!(!step(&mut a, "s", now));
         assert!(!step(&mut a, "s", now));
-        assert_eq!(a.pick([(None, now), (Some("s"), now)].into_iter(), now), 0);
+        assert_eq!(
+            a.pick([(None, now, 0), (Some("s"), now, 0)].into_iter(), now),
+            0
+        );
         assert!(a.sessions.is_empty());
         assert!(!a.aged(now - Duration::from_secs(3600), now));
     }
@@ -331,10 +357,14 @@ mod tests {
         let mut a = on();
         let now = Instant::now();
         step(&mut a, "warm", now);
-        let queue = [(Some("cold"), now), (None, now), (Some("warm"), now)];
+        let queue = [
+            (Some("cold"), now, 0),
+            (None, now, 0),
+            (Some("warm"), now, 0),
+        ];
         assert_eq!(a.pick(queue.into_iter(), now), 2);
         // Already at the head: nothing to jump.
-        let queue = [(Some("warm"), now), (Some("cold"), now)];
+        let queue = [(Some("warm"), now, 0), (Some("cold"), now, 0)];
         assert_eq!(a.pick(queue.into_iter(), now), 0);
     }
 
@@ -344,7 +374,7 @@ mod tests {
         let t0 = Instant::now();
         step(&mut a, "s", t0);
         let later = t0 + Duration::from_secs(121);
-        let queue = [(Some("other"), later), (Some("s"), later)];
+        let queue = [(Some("other"), later, 0), (Some("s"), later, 0)];
         assert_eq!(a.pick(queue.into_iter(), later), 0);
         a.prune(later);
         assert!(a.sessions.is_empty());
@@ -356,7 +386,7 @@ mod tests {
         let t0 = Instant::now();
         let now = t0 + Duration::from_secs(30);
         step(&mut a, "warm", now);
-        let queue = [(Some("cold"), t0), (Some("warm"), now)];
+        let queue = [(Some("cold"), t0, 0), (Some("warm"), now, 0)];
         assert_eq!(a.pick(queue.into_iter(), now), 0);
     }
 
@@ -420,23 +450,35 @@ mod tests {
     }
 
     #[test]
-    fn out_of_jumps_waits_its_turn_until_served_in_order() {
+    fn a_request_passed_max_jumps_times_goes_next() {
         let mut a = on();
         let now = Instant::now();
         step(&mut a, "s", now);
-        a.granted(Some("s"), true, now);
-        assert!(chained(&mut a, "s", now));
-        a.granted(Some("s"), true, now);
-        assert!(
-            a.finished(Some("s"), now).is_none(),
-            "out of jumps: no hold"
+        let queue = |passed| [(Some("cold"), now, passed), (Some("s"), now, 0)];
+        assert_eq!(a.pick(queue(1).into_iter(), now), 1);
+        assert_eq!(
+            a.pick(queue(2).into_iter(), now),
+            0,
+            "passed twice: its turn"
         );
-        let queue = [(Some("cold"), now), (Some("s"), now)];
-        assert_eq!(a.pick(queue.into_iter(), now), 0, "out of jumps: no jump");
-        a.granted(Some("s"), false, now);
-        assert!(chained(&mut a, "s", now));
-        assert_eq!(a.pick(queue.into_iter(), now), 1);
-        assert_eq!(a.stats.jumps.load(Ordering::Relaxed), 2);
+        assert!(!a.passed_out(1));
+        assert!(a.passed_out(2));
+        a.granted(Some("s"), true, now);
+        assert_eq!(a.stats.jumps.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_key_gives_up_only_its_own_holds() {
+        let mut a = on();
+        let now = Instant::now();
+        let (t, k1, k2) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        a.hold("a", t, k1, now);
+        a.hold("b", t, k2, now);
+        let gone = a.give_up_key(k1);
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].session, "a");
+        assert_eq!(a.held(), 1);
+        assert!(a.give_up_key(k1).is_empty());
     }
 
     #[test]
@@ -447,7 +489,7 @@ mod tests {
         let now = Instant::now();
         step(&mut a, &scoped(k1, "s"), now);
         let (x, s) = (scoped(k2, "x"), scoped(k2, "s"));
-        let queue = [(Some(x.as_str()), now), (Some(s.as_str()), now)];
+        let queue = [(Some(x.as_str()), now, 0), (Some(s.as_str()), now, 0)];
         assert_eq!(a.pick(queue.into_iter(), now), 0);
     }
 

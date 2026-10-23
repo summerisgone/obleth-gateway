@@ -51,9 +51,10 @@ obleth:
   # keys or tenants), and when a step that followed straight on from the
   # previous one finishes, its slot is held for holdMs for the session's next
   # step. A held slot counts against the pool, tenant and key like a running
-  # request. A session goes ahead at most maxJumps times in a row, no more
-  # than maxHeldPercent of a pool's slots are held at once, and a request
-  # that has waited maxBypassSecs is passed by nothing. Sessions come from
+  # request. A queued request is passed at most maxJumps times, a session is
+  # held for at most maxJumps times in a row while others wait, no more than
+  # maxHeldPercent of a pool's slots are held at once, and a request that has
+  # waited maxBypassSecs is passed by nothing, on any gateway replica. Sessions come from
   # the client's session id or the derived one, and only on models that keep
   # a session on one endpoint (not load_balance across several).
   fairshareSessionAffinity:

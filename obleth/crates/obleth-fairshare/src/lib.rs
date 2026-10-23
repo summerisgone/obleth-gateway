@@ -766,6 +766,9 @@ struct Waiter {
     jumped: bool,
     /// Shared mode: a claim for only its session's held slot has been tried.
     probed: bool,
+    /// Times a later request of its key was served first, through session
+    /// affinity.
+    passed: u32,
     enqueued: Instant,
     /// The local fast path would have admitted it on arrival; in shared mode
     /// it is still reported as fast if its first claim succeeds.
@@ -1246,6 +1249,7 @@ impl Pool {
             .unwrap_or_else(Instant::now);
         self.affinity
             .granted(grant.session.as_deref(), grant.jumped, arrived);
+        self.pass_earlier(grant.tenant, grant.key, arrived);
         // If the caller is gone, `send` hands the `Admitted` back as `Err` and
         // dropping it here drops its `Permit`, which already releases the
         // slot via `Permit::drop`. An explicit release here would double up:
@@ -1325,6 +1329,7 @@ impl Pool {
                 session: req.session,
                 jumped: false,
                 probed: false,
+                passed: 0,
                 enqueued,
                 fast,
                 respond,
@@ -1366,7 +1371,7 @@ impl Pool {
             let at = self.affinity.pick(
                 self.queues[&tenant].keys[&key]
                     .iter()
-                    .map(|w| (w.session.as_deref(), w.enqueued)),
+                    .map(|w| (w.session.as_deref(), w.enqueued, w.passed)),
                 Instant::now(),
             );
             let mut waiter = {
@@ -1418,7 +1423,19 @@ impl Pool {
                 .filter(|_| holds)
                 .map(|session| hold_id(&self.key, session)),
             redeem_only,
+            starving: holds && self.starving(waiter),
         }
+    }
+
+    /// Shared mode: whether the pool has a request, `waiter` included, that
+    /// has waited `max_bypass`. Its claims then make every replica give up
+    /// the pool's held slots.
+    fn starving(&self, waiter: &Waiter) -> bool {
+        let now = Instant::now();
+        self.affinity.aged(waiter.enqueued, now)
+            || self
+                .oldest_eligible()
+                .is_some_and(|t| self.affinity.aged(t, now))
     }
 
     /// Shared mode: undo [`Pool::take_next`] for a waiter whose claim was
@@ -1684,7 +1701,7 @@ impl Pool {
             .oldest_eligible()
             .is_some_and(|t| self.affinity.aged(t, now));
         match hold_in {
-            _ if aged => StepEnd::Release,
+            _ if aged || self.key_passed_out(tenant, key) => StepEnd::Release,
             HoldIn::Pool if step.chained && self.affinity.can_hold(self.cap) => {
                 self.affinity.hold(session, tenant, key, now);
                 StepEnd::Held
@@ -1709,6 +1726,7 @@ impl Pool {
                 deque
                     .iter()
                     .position(|w| w.session.is_some() && !w.probed && !w.respond.is_closed())
+                    .filter(|_| !self.key_passed_out(*tenant, *key))
                     .map(|at| (*tenant, *key, at))
             })
         })?;
@@ -1724,6 +1742,37 @@ impl Pool {
         self.occupy(tenant, key, waiter.cost);
         self.advance_virtual_time();
         Some((tenant, key, waiter))
+    }
+
+    /// Session affinity: a request of `key` that arrived at `arrived` was
+    /// served, passing every request of the key queued before it.
+    fn pass_earlier(&mut self, tenant: Uuid, key: Uuid, arrived: Instant) {
+        if !self.affinity.on() {
+            return;
+        }
+        let Some(deque) = self
+            .queues
+            .get_mut(&tenant)
+            .and_then(|q| q.keys.get_mut(&key))
+        else {
+            return;
+        };
+        for w in deque.iter_mut().take_while(|w| w.enqueued < arrived) {
+            w.passed = w.passed.saturating_add(1);
+        }
+    }
+
+    /// Session affinity: whether a queued request of `key` whose caller
+    /// still waits has been passed as often as it may be. Then nothing more
+    /// may pass it: no slot is held for the key, nor a held one taken.
+    fn key_passed_out(&self, tenant: Uuid, key: Uuid) -> bool {
+        self.queues
+            .get(&tenant)
+            .and_then(|q| q.keys.get(&key))
+            .is_some_and(|d| {
+                d.iter()
+                    .any(|w| self.affinity.passed_out(w.passed) && !w.respond.is_closed())
+            })
     }
 
     /// Arrival of the oldest request queued in the pool that a free slot
@@ -1746,16 +1795,25 @@ impl Pool {
     }
 
     /// The held slots to give back now: all of them once a request here has
-    /// waited too long to keep yielding to them.
+    /// waited too long to keep yielding to them, and those of a key with a
+    /// request that may be passed no more.
     fn holds_to_give_up(&mut self, now: Instant) -> Vec<affinity::Hold> {
         let aged = self
             .oldest_eligible()
             .is_some_and(|t| self.affinity.aged(t, now));
         if aged {
-            self.affinity.give_up()
-        } else {
-            Vec::new()
+            return self.affinity.give_up();
         }
+        let passed_out: Vec<Uuid> = self
+            .affinity
+            .holds()
+            .filter(|h| self.key_passed_out(h.tenant, h.key))
+            .map(|h| h.key)
+            .collect();
+        passed_out
+            .into_iter()
+            .flat_map(|key| self.affinity.give_up_key(key))
+            .collect()
     }
 
     /// Hand held slots to queued requests of their sessions. Each keeps the
@@ -1769,6 +1827,9 @@ impl Pool {
             .map(|h| (h.session.clone(), h.tenant, h.key))
             .collect();
         for (session, tenant, key) in held {
+            if self.key_passed_out(tenant, key) {
+                continue;
+            }
             let find = |pool: &Pool| {
                 pool.queues
                     .get(&tenant)
@@ -2399,8 +2460,12 @@ impl Scheduler {
                 });
                 pool.idle_since = None;
                 pool.track_meta(&req);
-                // A slot held for this session's next step is this request's.
-                if let Some(hold) = pool.affinity.redeem(req.session.as_deref()) {
+                // A slot held for this session's next step is this request's,
+                // unless the key has a request that may be passed no more.
+                let hold = (!pool.key_passed_out(req.tenant, req.key))
+                    .then(|| pool.affinity.redeem(req.session.as_deref()))
+                    .flatten();
+                if let Some(hold) = hold {
                     pool.grant_held(hold, req, respond);
                     self.publish_stats();
                     return;

@@ -238,6 +238,65 @@ async fn holds_give_way_to_a_request_that_waited_too_long() {
 }
 
 #[tokio::test]
+async fn a_cold_request_is_passed_at_most_max_jumps_times() {
+    let mut cfg = config(0);
+    cfg.max_jumps = 2;
+    let fs = start(Some(cfg));
+    let key = Uuid::new_v4();
+    for s in ["w1", "w2", "w3"] {
+        step(&fs, key, 1, s).await;
+    }
+    let mut running = admit(&fs, req(key, 1, "busy")).await;
+    let mut cold = spawn_admit(&fs, req(key, 1, "cold"));
+    wait_for_queued(&fs, 1).await;
+    // Two warm sessions go ahead of it, one after the other.
+    for s in ["w1", "w2"] {
+        let mut warm = spawn_admit(&fs, req(key, 1, s));
+        wait_for_queued(&fs, 2).await;
+        drop(running.permit);
+        running = granted_within(&mut warm, Duration::from_secs(2))
+            .await
+            .expect("the warm session goes first");
+        assert!(!cold.is_finished());
+    }
+    // Passed twice: a third warm session waits behind it.
+    let mut warm = spawn_admit(&fs, req(key, 1, "w3"));
+    wait_for_queued(&fs, 2).await;
+    drop(running.permit);
+    let granted = granted_within(&mut cold, Duration::from_secs(2))
+        .await
+        .expect("its turn after being passed max_jumps times");
+    assert!(!warm.is_finished());
+    drop(granted.permit);
+    granted_within(&mut warm, Duration::from_secs(2))
+        .await
+        .expect("then the warm one");
+}
+
+#[tokio::test]
+async fn a_key_stops_holding_once_a_request_of_it_may_be_passed_no_more() {
+    let mut cfg = config(5_000);
+    cfg.max_jumps = 1;
+    let fs = start(Some(cfg));
+    let key = Uuid::new_v4();
+    step(&fs, key, 1, "loop").await;
+    let second = admit(&fs, req(key, 1, "loop")).await;
+    let mut cold = spawn_admit(&fs, req(key, 1, "cold"));
+    wait_for_queued(&fs, 1).await;
+    drop(second.permit);
+    assert_eq!(held(&fs).await, 1, "nobody passed yet: held");
+    // The loop's next step takes the held slot, passing the cold request.
+    let third = admit(&fs, req(key, 1, "loop")).await;
+    assert_eq!(third.admission, Admission::Fast);
+    drop(third.permit);
+    let granted = granted_within(&mut cold, Duration::from_secs(1))
+        .await
+        .expect("passed once: the slot is its, not held");
+    assert_eq!(held(&fs).await, 0);
+    drop(granted.permit);
+}
+
+#[tokio::test]
 async fn a_waiter_held_back_by_its_own_key_cap_does_not_end_holds() {
     let mut cfg = config(2_000);
     cfg.max_bypass = Duration::from_millis(100);
@@ -466,4 +525,34 @@ async fn a_looping_session_gives_way_to_another_gateway_after_max_jumps() {
         .expect("the waiter on the other gateway gets the slot");
     assert_eq!(granted.admission, Admission::Queued);
     assert_eq!(cluster.held_slots(&pool_id()), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_that_waited_too_long_on_another_gateway_frees_held_slots() {
+    let cluster = InMemoryCluster::new();
+    let mut cfg = config(10_000);
+    cfg.max_jumps = 100;
+    cfg.max_bypass = Duration::from_millis(400);
+    let gws = shared_gateways(&cluster, 2, cfg).await;
+    let (agent, other) = (Uuid::new_v4(), Uuid::new_v4());
+    step(&gws[0], agent, 1, "loop").await;
+    let second = admit(&gws[0], req(agent, 1, "loop")).await;
+    let mut waiting = spawn_admit(&gws[1], req(other, 1, "other"));
+    wait_for_queued(&gws[1], 1).await;
+    drop(second.permit);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while cluster.held_slots(&pool_id()) != 1 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("held in the backend");
+    let granted = granted_within(&mut waiting, Duration::from_secs(3))
+        .await
+        .expect("granted once it has waited max_bypass, long before the hold runs out");
+    assert!(granted.waited < Duration::from_secs(2));
+    assert_eq!(cluster.held_slots(&pool_id()), 0);
+    drop(granted.permit);
+    let third = admit(&gws[0], req(agent, 1, "loop")).await;
+    drop(third.permit);
 }
