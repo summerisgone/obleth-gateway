@@ -1401,6 +1401,7 @@ export interface AutoRouterSettingsView {
   temperature: number;
   difficulty_enabled: boolean;
   tier_source: "hybrid" | "derived" | "declared";
+  sticky_enabled: boolean;
   messages_default_model: string | null;
   verdicts_default_model: string | null;
 }
@@ -1416,6 +1417,7 @@ export interface UpdateAutoRouterSettings {
   temperature?: number;
   difficulty_enabled?: boolean;
   tier_source?: "hybrid" | "derived" | "declared";
+  sticky_enabled?: boolean;
   messages_default_model?: string | null;
   verdicts_default_model?: string | null;
 }

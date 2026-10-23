@@ -2582,6 +2582,9 @@ pub struct AutoRouterSettingsView {
     pub difficulty_enabled: bool,
     /// `"hybrid" | "derived" | "declared"`.
     pub tier_source: String,
+    /// Keep a conversation on the model that answered its last turn until
+    /// that model is not doing a good job.
+    pub sticky_enabled: bool,
     /// Model or alias served for unknown model names on `/v1/messages`;
     /// `None` means such requests get `not_found_error`.
     pub messages_default_model: Option<String>,
@@ -2607,6 +2610,7 @@ impl AutoRouterSettingsView {
             temperature: s.temperature,
             difficulty_enabled: s.difficulty_enabled,
             tier_source: tier_source_as_str(s.tier_source).to_string(),
+            sticky_enabled: s.sticky_enabled,
             messages_default_model: s.messages_default_model.clone(),
             verdicts_default_model: s.verdicts_default_model.clone(),
         }
@@ -2638,6 +2642,8 @@ pub struct UpdateAutoRouterSettings {
     /// leave the persisted `tier_source` untouched.
     #[serde(default)]
     pub tier_source: Option<String>,
+    #[serde(default)]
+    pub sticky_enabled: Option<bool>,
     /// Model or alias served for unknown model names on `/v1/messages`.
     /// Empty string clears it.
     #[serde(default)]
@@ -2700,6 +2706,7 @@ fn merge_auto_router(
             .as_deref()
             .and_then(parse_tier_source)
             .unwrap_or(existing.tier_source),
+        sticky_enabled: body.sticky_enabled.unwrap_or(existing.sticky_enabled),
         messages_default_model,
         verdicts_default_model,
     }

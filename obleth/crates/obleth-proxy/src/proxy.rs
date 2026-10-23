@@ -948,6 +948,7 @@ async fn proxy_handler_inner(
     let mut variant: Option<String> = None;
     let mut lifecycle: Option<crate::lifecycle::Notice> = None;
     let mut reasoning: Option<crate::reasoning::Note> = None;
+    let mut auto_note: Option<crate::sticky::Note> = None;
     let resp = run_pipeline(
         state,
         req,
@@ -955,6 +956,7 @@ async fn proxy_handler_inner(
         &mut variant,
         &mut lifecycle,
         &mut reasoning,
+        &mut auto_note,
     )
     .await;
     let mut resp = with_variant_header(resp, variant.as_deref());
@@ -962,6 +964,9 @@ async fn proxy_handler_inner(
         crate::lifecycle::apply_headers(&mut resp, notice);
     }
     if let Some(note) = &reasoning {
+        note.apply_headers(&mut resp);
+    }
+    if let Some(note) = &auto_note {
         note.apply_headers(&mut resp);
     }
     resp
@@ -1013,6 +1018,7 @@ async fn run_pipeline(
     served_variant: &mut Option<String>,
     lifecycle_notice: &mut Option<crate::lifecycle::Notice>,
     reasoning_note: &mut Option<crate::reasoning::Note>,
+    auto_note: &mut Option<crate::sticky::Note>,
 ) -> Response<Body> {
     let request_start = Instant::now();
     let proxy_start_ms = crate::tracer::now_ms();
@@ -1240,6 +1246,9 @@ async fn run_pipeline(
     // swap does not affect it (the tokenizer ignores the `model` field).
     let mut est = state.tokenizer.estimate_request(&json);
 
+    // The routed `auto` turn, stored once it is answered when stickiness is on.
+    let mut sticky_turn: Option<crate::sticky::Turn> = None;
+
     // ---- auto model selection ----
     // `model: "auto"` is resolved to a concrete registered model from request
     // shape (estimated context size, required capabilities) and live load. From
@@ -1277,20 +1286,36 @@ async fn run_pipeline(
         // neutral default.
         let available_tags = union_candidate_tags(&candidates, allowed);
         let effort_header = headers.get("x-obleth-effort").and_then(|v| v.to_str().ok());
+        // With stickiness on, find the model that answered this conversation's
+        // last turn before deciding anything.
+        let conversation = if router_settings.sticky_enabled {
+            Some(crate::sticky::lookup(&state, &resolved.tenant_id, &json).await)
+        } else {
+            None
+        };
         let classifier_start = if traced { crate::tracer::now_ms() } else { 0 };
-        let intent = derive_intent(
-            &state,
-            &json,
-            est.input_tokens as u64,
-            &available_tags,
-            &router_settings,
-            effort_header,
-            // The classifier model reads the prompt, and on this path intent is
-            // derived before the tenant input guardrails run: under an input
-            // policy, route on the header and heuristics instead.
-            has_input_guardrails(&resolved),
-        )
-        .await;
+        // The classifier model reads the prompt, and on this path intent is
+        // derived before the tenant input guardrails run: under an input
+        // policy, route on the header and heuristics instead.
+        let skip_classifier = has_input_guardrails(&resolved);
+        let (intent, complaint) = tokio::join!(
+            derive_intent(
+                &state,
+                &json,
+                est.input_tokens as u64,
+                &available_tags,
+                &router_settings,
+                effort_header,
+                skip_classifier,
+            ),
+            crate::sticky::complaint(
+                &state,
+                &router_settings,
+                conversation.as_ref(),
+                &json,
+                skip_classifier,
+            ),
+        );
         // Wall-clock around the whole of intent derivation (header parse,
         // classifier round-trip when active, heuristic fallback otherwise), not
         // an isolated classifier timer — `derive_intent` is where that round-trip
@@ -1318,6 +1343,31 @@ async fn run_pipeline(
         } else {
             0.0
         };
+        // A sticky turn routes over a narrowed pool: the incumbent alone, or
+        // the models at or above the conversation's rung.
+        let choice = conversation.as_ref().map(|c| {
+            let mut observed = c.observed.clone();
+            observed.complaint = complaint;
+            crate::sticky::choose(&candidates, c.record.as_ref(), &intent, &observed, |pool| {
+                crate::router::select_model(
+                    pool,
+                    &features,
+                    &busyness,
+                    &expected_output,
+                    allowed,
+                    &intent.tags,
+                    grants,
+                    &weights,
+                    uniform,
+                    intent.difficulty,
+                )
+                .is_some()
+            })
+        });
+        let pool: &[crate::router::Candidate] = choice
+            .as_ref()
+            .and_then(|c| c.pool.as_deref())
+            .unwrap_or(&candidates);
         // Traced requests get the full explanation from a single `route()` call
         // (one `evaluate`, one `uniform` draw) so the span describes exactly the
         // sample that was served. Untraced requests call `select_model` instead,
@@ -1325,7 +1375,7 @@ async fn run_pipeline(
         // that is the whole cost story for this feature: zero by default.
         let picked = if let Some(ref mut t) = tracer {
             let (picked, mut explain) = crate::router::route(
-                &candidates,
+                pool,
                 &features,
                 &busyness,
                 &expected_output,
@@ -1337,23 +1387,39 @@ async fn run_pipeline(
                 &intent,
             );
             explain.classifier_ms = classifier_ms;
+            let mut span = serde_json::to_value(&explain).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "chosen": explain.chosen,
+                    "error": "explanation failed to serialize",
+                })
+            });
+            if let (Some(c), Some(obj)) = (choice.as_ref(), span.as_object_mut()) {
+                obj.insert(
+                    "sticky".into(),
+                    serde_json::json!({
+                        "reason": c.reason.as_str(),
+                        "incumbent": conversation
+                            .as_ref()
+                            .and_then(|c| c.record.as_ref())
+                            .map(|r| r.model.clone()),
+                        "floor": c.floor,
+                        "domains": c.domains,
+                        "strikes": c.strikes,
+                    }),
+                );
+            }
             t.record(
                 "auto_route",
                 "proxy_request",
                 auto_start,
                 (crate::tracer::now_ms() - auto_start) as u32,
                 "ok",
-                serde_json::to_value(&explain).unwrap_or_else(|_| {
-                    serde_json::json!({
-                        "chosen": explain.chosen,
-                        "error": "explanation failed to serialize",
-                    })
-                }),
+                span,
             );
             picked
         } else {
             crate::router::select_model(
-                &candidates,
+                pool,
                 &features,
                 &busyness,
                 &expected_output,
@@ -1368,6 +1434,28 @@ async fn run_pipeline(
         match picked {
             Some(chosen) => {
                 tracing::debug!(chosen = %chosen.model_name, "auto-routed request");
+                let reason = choice.as_ref().map(|c| c.reason);
+                state.metrics.record_auto_route(
+                    &chosen.model_name,
+                    reason.map_or("per_turn", |r| r.as_str()),
+                );
+                if let (Some(conversation), Some(choice)) = (conversation, choice.as_ref()) {
+                    if let Some(c) = pool
+                        .iter()
+                        .find(|c| c.model.model_name == chosen.model_name)
+                    {
+                        sticky_turn = Some(crate::sticky::Turn::new(
+                            resolved.tenant_id,
+                            conversation,
+                            choice,
+                            c,
+                        ));
+                    }
+                }
+                *auto_note = Some(crate::sticky::Note {
+                    model: chosen.model_name.clone(),
+                    reason,
+                });
                 model = chosen.model_name.clone();
                 // Candidates are real models only, never variants.
                 (Some(Arc::new(chosen)), None)
@@ -2843,7 +2931,12 @@ async fn run_pipeline(
                 && matches!(p.action, obleth_config::GuardrailsAction::LogOnly)
         })
         .cloned();
-    let mut output_monitor = scan_policy.as_ref().map(|_| {
+    // A sticky `auto` turn is stored under the answer the client receives,
+    // so only a successful one is watched for it.
+    if status_code != 200 {
+        sticky_turn = None;
+    }
+    let mut output_monitor = (scan_policy.is_some() || sticky_turn.is_some()).then(|| {
         crate::output_monitor::OutputMonitor::new(content_type_str.contains("text/event-stream"))
     });
 
@@ -2918,7 +3011,13 @@ async fn run_pipeline(
                         )
                     };
                     let total_ms = request_start.elapsed().as_millis() as u32;
-                    accounting.monitor(scan_policy.as_ref(), output_monitor);
+                    let finished = output_monitor.map(crate::output_monitor::OutputMonitor::finish);
+                    accounting.monitor(scan_policy.as_ref(), finished.as_ref());
+                    if let (false, 200, Some(turn), Some(Ok(done))) =
+                        (cut, settled.status, sticky_turn, finished.as_ref())
+                    {
+                        turn.record(&accounting.state, done);
+                    }
                     let _ = settle_guard.complete(accounting.settle_with(
                         settled.tokens, ttft_ms, total_ms, settled.status, None, settled.billed,
                     )).await;
@@ -3195,6 +3294,9 @@ async fn run_pipeline(
         let _ = settle_guard
             .complete(accounting.settle(tokens, ttft_ms, total_ms, status_code, cache_put))
             .await;
+        if let (Some(turn), Some(done)) = (sticky_turn.take(), completion.as_ref()) {
+            turn.record(&state, done);
+        }
 
         let mut builder = Response::builder()
             .status(status_code)
@@ -3339,7 +3441,8 @@ async fn run_pipeline(
 
         let usage = extract_usage(&String::from_utf8_lossy(&tail));
         let total_ms = request_start.elapsed().as_millis() as u32;
-        accounting.monitor(scan_policy.as_ref(), output_monitor);
+        let finished = output_monitor.map(crate::output_monitor::OutputMonitor::finish);
+        accounting.monitor(scan_policy.as_ref(), finished.as_ref());
 
         // A failure the upstream reported in the bytes it sent.
         let failure = failure_watch.as_mut().and_then(|w| w.finish());
@@ -3398,6 +3501,9 @@ async fn run_pipeline(
                 yield item;
             }
         } else {
+            if let (None, Some(turn), Some(Ok(done))) = (&failure, sticky_turn, finished.as_ref()) {
+                turn.record(&accounting.state, done);
+            }
             // The bytes already went to the client as the upstream sent them;
             // a failure it reported in them is recorded as one.
             if let Some(failure) = &failure {
@@ -3916,10 +4022,10 @@ impl StreamAccounting {
     fn monitor(
         &self,
         policy: Option<&obleth_config::GuardrailsPolicy>,
-        monitor: Option<crate::output_monitor::OutputMonitor>,
+        finished: Option<&Result<serde_json::Value, &'static str>>,
     ) {
-        if let (Some(policy), Some(monitor)) = (policy, monitor) {
-            match monitor.finish() {
+        if let (Some(policy), Some(finished)) = (policy, finished) {
+            match finished {
                 Ok(completion) => crate::boons::guardrails::monitor_output(
                     &self.state,
                     &self.state.boons.settings().guardrails,
@@ -3927,7 +4033,7 @@ impl StreamAccounting {
                     &self.resolved,
                     &self.meta.session_id,
                     self.request_id,
-                    &completion,
+                    completion,
                 ),
                 Err(reason) => {
                     tracing::warn!(request_id = %self.request_id, reason, "output monitoring skipped")
@@ -6843,8 +6949,13 @@ mod tests {
         key.internal = true;
         assert!(!has_input_guardrails(&key));
         let src = include_str!("proxy.rs");
-        assert!(src
-            .contains("            has_input_guardrails(&resolved),\n        )\n        .await;"));
+        // Intent and the sticky complaint question both honor the policy.
+        assert!(src.contains("let skip_classifier = has_input_guardrails(&resolved);"));
+        assert_eq!(
+            src.matches("                skip_classifier,\n            ),")
+                .count(),
+            2
+        );
     }
 
     #[test]

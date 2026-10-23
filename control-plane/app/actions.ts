@@ -2104,6 +2104,7 @@ export async function saveSettingsAction(formData: FormData): Promise<SettingsSa
         default_soft_cap: num("routing", "soft_cap"),
         difficulty_enabled: g("routing", "difficulty") === "on",
         tier_source: (trimmed(g("routing", "tier_source")) || "hybrid") as "hybrid" | "derived" | "declared",
+        sticky_enabled: g("routing", "sticky") === "on",
         messages_default_model: trimmed(g("routing", "messages_default_model")),
         verdicts_default_model: trimmed(g("routing", "verdicts_default_model")),
       });
@@ -2174,6 +2175,7 @@ const autoRouterUpdateSchema = z.object({
   temperature: z.number().min(0).max(2).optional(),
   difficulty_enabled: z.boolean().optional(),
   tier_source: z.enum(["hybrid", "derived", "declared"]).optional(),
+  sticky_enabled: z.boolean().optional(),
   messages_default_model: z.string().optional(),
   verdicts_default_model: z.string().optional(),
 });

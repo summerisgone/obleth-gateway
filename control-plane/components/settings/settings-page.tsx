@@ -51,6 +51,7 @@ const SEARCH: { id: string; label: string; words: string }[] = [
   { id: "set-router-weights", label: "Routing weights", words: "capacity price cost tag task fit" },
   { id: "set-classifier", label: "Router classifier", words: "intent tags classify auto" },
   { id: "set-difficulty", label: "Hard questions", words: "difficulty tier stronger" },
+  { id: "set-sticky", label: "Conversations", words: "sticky conversation escalate stay model" },
   { id: "set-anthropic", label: "Anthropic clients", words: "messages claude default model" },
   { id: "boon-vision", label: "Vision", words: "image describe boon" },
   { id: "boon-structured_output", label: "Structured output", words: "json schema fixer boon" },

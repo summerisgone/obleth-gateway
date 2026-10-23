@@ -34,6 +34,7 @@
 //! data-plane call site has to name a different path.
 
 pub mod route_explain;
+pub mod sticky;
 
 use std::collections::HashMap;
 
@@ -1294,7 +1295,7 @@ fn head_bytes(s: &str, max: usize) -> &str {
 mod tests {
     use super::*;
 
-    fn model(name: &str) -> ResolvedModel {
+    pub(super) fn model(name: &str) -> ResolvedModel {
         ResolvedModel {
             description: String::new(),
             model_name: name.to_string(),
@@ -1353,7 +1354,7 @@ mod tests {
         }
     }
 
-    fn healthy(m: ResolvedModel) -> Candidate {
+    pub(super) fn healthy(m: ResolvedModel) -> Candidate {
         Candidate {
             model: m,
             healthy: true,

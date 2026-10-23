@@ -22,6 +22,7 @@ mod router;
 mod search;
 mod speech;
 mod state;
+mod sticky;
 mod upstream_failure;
 mod verdicts;
 

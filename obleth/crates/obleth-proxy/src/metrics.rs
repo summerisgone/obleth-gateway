@@ -31,6 +31,7 @@ pub struct Metrics {
     jwt_verify: IntCounterVec,
     jwks_refresh: IntCounterVec,
     knowledge_retrievals: IntCounterVec,
+    auto_routes: IntCounterVec,
 }
 
 impl Metrics {
@@ -171,6 +172,14 @@ impl Metrics {
             &["outcome"],
         )
         .unwrap();
+        let auto_routes = IntCounterVec::new(
+            Opts::new(
+                "obleth_auto_routes_total",
+                "auto requests by the model served and why it was chosen",
+            ),
+            &["model", "reason"],
+        )
+        .unwrap();
 
         registry.register(Box::new(requests.clone())).unwrap();
         registry.register(Box::new(tokens_in.clone())).unwrap();
@@ -208,6 +217,7 @@ impl Metrics {
         registry
             .register(Box::new(knowledge_retrievals.clone()))
             .unwrap();
+        registry.register(Box::new(auto_routes.clone())).unwrap();
 
         Metrics {
             registry,
@@ -231,6 +241,7 @@ impl Metrics {
             jwt_verify,
             jwks_refresh,
             knowledge_retrievals,
+            auto_routes,
         }
     }
 
@@ -320,6 +331,13 @@ impl Metrics {
         self.knowledge_retrievals
             .with_label_values(&[outcome])
             .inc();
+    }
+
+    /// Record an `auto` pick. `model` is a registered model name (operator
+    /// configured, so bounded); `reason` is a sticky reason, or `per_turn`
+    /// when stickiness is off.
+    pub fn record_auto_route(&self, model: &str, reason: &str) {
+        self.auto_routes.with_label_values(&[model, reason]).inc();
     }
 
     pub fn encode(&self) -> String {

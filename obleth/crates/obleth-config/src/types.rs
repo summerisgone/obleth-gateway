@@ -2349,6 +2349,11 @@ pub struct AutoRouterSettings {
     pub difficulty_enabled: bool,
     #[serde(default)]
     pub tier_source: TierSource,
+    /// When true, a conversation stays on the model that answered its last
+    /// turn until there is evidence that model is not doing a good job, and
+    /// then moves up a level (see `routing::sticky`).
+    #[serde(default)]
+    pub sticky_enabled: bool,
     /// Model or alias served when a request on the Anthropic Messages surface
     /// names a model the gateway does not know (Claude Code sends Anthropic
     /// model ids). `None` means such requests get `not_found_error`.
@@ -2389,6 +2394,7 @@ impl Default for AutoRouterSettings {
             temperature: 0.0,
             difficulty_enabled: false,
             tier_source: TierSource::default(),
+            sticky_enabled: false,
             messages_default_model: None,
             verdicts_default_model: None,
         }

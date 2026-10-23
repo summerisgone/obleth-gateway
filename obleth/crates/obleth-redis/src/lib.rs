@@ -63,6 +63,8 @@ const COMPRESS_PREFIX: &str = "obleth:compress:";
 /// built here from the hash the proxy supplies (see `query_vector_key`),
 /// mirroring `compress_key`.
 const KNOWLEDGE_QUERY_PREFIX: &str = "obleth:knowledge:q:";
+/// `auto` conversation records and answered-request markers, per tenant.
+const AUTO_TURN_PREFIX: &str = "obleth:auto:";
 const INVALIDATE_CHANNEL: &str = "obleth:invalidate";
 /// Single shared key holding the provisioner's last-seen epoch seconds. Shared
 /// via Redis (not per-pod memory) so the dashboard reads a consistent value no
@@ -415,6 +417,36 @@ impl RedisStore {
         let mut conn = self.conn.clone();
         let v: Option<String> = conn.get(Self::compress_key(tenant, hash)).await?;
         Ok(v)
+    }
+
+    fn auto_turn_key(tenant: &Uuid, hash: &str) -> String {
+        format!("{AUTO_TURN_PREFIX}{tenant}:{hash}")
+    }
+
+    /// Fetch an `auto` conversation entry stored under `hash` for `tenant`.
+    pub async fn auto_turn_get(&self, tenant: &Uuid, hash: &str) -> Result<Option<String>> {
+        let mut conn = self.conn.clone();
+        let v: Option<String> = conn.get(Self::auto_turn_key(tenant, hash)).await?;
+        Ok(v)
+    }
+
+    /// Store an `auto` conversation entry, expiring after `ttl_secs`. A
+    /// `ttl_secs` of 0 skips the write, as with `compress_put`.
+    pub async fn auto_turn_put(
+        &self,
+        tenant: &Uuid,
+        hash: &str,
+        value: &str,
+        ttl_secs: u64,
+    ) -> Result<()> {
+        if ttl_secs == 0 {
+            return Ok(());
+        }
+        let mut conn = self.conn.clone();
+        let _: () = conn
+            .set_ex(Self::auto_turn_key(tenant, hash), value, ttl_secs)
+            .await?;
+        Ok(())
     }
 
     fn query_vector_key(hash: &str) -> String {
