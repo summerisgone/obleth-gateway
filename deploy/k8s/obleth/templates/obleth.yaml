@@ -67,6 +67,14 @@ spec:
             - { name: OBLETH_FAIRSHARE_REPLICA_AWARE, value: {{ .Values.obleth.fairshareReplicaAware | quote }} }
             - { name: OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS, value: {{ .Values.obleth.fairshareReplicaHeartbeatSecs | quote }} }
             - { name: OBLETH_FAIRSHARE_REPLICA_TTL_SECS, value: {{ .Values.obleth.fairshareReplicaTtlSecs | quote }} }
+            {{- with .Values.obleth.fairshareSessionAffinity }}
+            - { name: OBLETH_FAIRSHARE_SESSION_AFFINITY, value: {{ .enabled | quote }} }
+            - { name: OBLETH_FAIRSHARE_SESSION_AFFINITY_WARM_SECS, value: {{ .warmSecs | quote }} }
+            - { name: OBLETH_FAIRSHARE_SESSION_AFFINITY_HOLD_MS, value: {{ .holdMs | quote }} }
+            - { name: OBLETH_FAIRSHARE_SESSION_AFFINITY_MAX_JUMPS, value: {{ .maxJumps | quote }} }
+            - { name: OBLETH_FAIRSHARE_SESSION_AFFINITY_MAX_BYPASS_SECS, value: {{ .maxBypassSecs | quote }} }
+            - { name: OBLETH_FAIRSHARE_SESSION_AFFINITY_MAX_HELD_PERCENT, value: {{ .maxHeldPercent | quote }} }
+            {{- end }}
             - { name: OBLETH_CAPACITY_DISCOVERY_ENABLED, value: {{ .Values.obleth.capacityDiscovery.enabled | quote }} }
             - { name: OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS, value: {{ .Values.obleth.capacityDiscovery.intervalSecs | quote }} }
             - { name: OBLETH_CAPACITY_DISCOVERY_NAMESPACES, value: {{ join "," (uniq .Values.obleth.capacityDiscovery.namespaces) | quote }} }

@@ -1957,17 +1957,20 @@ async fn run_pipeline(
     let admission_start = crate::tracer::now_ms();
     let pool = admission_pool(route.as_deref());
     let admit_wait = admission_timeout();
-    let admit = state.fairshare.admit_to(
-        pool,
-        admit_request_for(
-            &resolved,
-            &model,
-            route.as_deref(),
-            effective_weight,
-            est.total(),
-            end_user.as_deref(),
-        ),
+    // Session affinity can only keep a conversation warm on an upstream it
+    // keeps going back to.
+    let mut admit_req = admit_request_for(
+        &resolved,
+        &model,
+        route.as_deref(),
+        effective_weight,
+        est.total(),
+        end_user.as_deref(),
     );
+    if route_keeps_sessions(route.as_deref()) {
+        admit_req = admit_req.session(req_meta.session_id.as_str());
+    }
+    let admit = state.fairshare.admit_to(pool, admit_req);
     let admitted = match timeout(admit_wait, admit).await {
         Ok(Some(a)) => a,
         Err(_) => {
@@ -4578,7 +4581,24 @@ pub(crate) fn admit_request_for(
         key_max_in_flight: positive(resolved.key_max_in_flight),
         cost,
         end_user,
+        session: None,
     }
+}
+
+/// Whether a route sends every request of one conversation to the same
+/// upstream, so the conversation's prompt cache can stay warm there: one
+/// usable endpoint (or none, the model's own base), or any selection mode
+/// but `load_balance`, which spreads requests across endpoints.
+fn route_keeps_sessions(route: Option<&ResolvedModel>) -> bool {
+    let Some(route) = route else {
+        return false;
+    };
+    let usable = route
+        .endpoints
+        .iter()
+        .filter(|e| e.enabled && e.healthy)
+        .count();
+    usable <= 1 || route.endpoint_selection_mode != "load_balance"
 }
 
 /// Header a shared front end names each request's end user with, for keys
@@ -6724,9 +6744,9 @@ mod tests {
         looks_like_context_length_error, messages_input_estimate, multipart_text_view,
         output_guardrails_unenforceable, parse_multipart, prepare_upstream_body, redress_error,
         request_type_for_path, requires_registered_model, resolve_conversation,
-        response_cache_name, session_hash_order, should_translate_as_stream, strip_beta_query,
-        surface, tenant_active_now, weighted_order, MultipartField, RequestMeta, TooLong,
-        END_USER_HEADER, REGISTERED_MODEL_PATHS, SEED_CAP,
+        response_cache_name, route_keeps_sessions, session_hash_order, should_translate_as_stream,
+        strip_beta_query, surface, tenant_active_now, weighted_order, MultipartField, RequestMeta,
+        TooLong, END_USER_HEADER, REGISTERED_MODEL_PATHS, SEED_CAP,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
@@ -9044,6 +9064,34 @@ mod tests {
             after[0].base, survivor,
             "re-pinned to the survivor, not the global fallback"
         );
+    }
+
+    #[test]
+    fn sessions_stay_put_unless_load_balanced_across_endpoints() {
+        let two = || {
+            vec![
+                endpoint("a", "http://a/v1", 100, 100, true, true),
+                endpoint("b", "http://b/v1", 100, 100, true, true),
+            ]
+        };
+        let mode = |endpoints, mode: &str| {
+            let mut m = model_with(endpoints);
+            m.endpoint_selection_mode = mode.to_string();
+            m
+        };
+        assert!(!route_keeps_sessions(None));
+        assert!(route_keeps_sessions(Some(&mode(
+            Vec::new(),
+            "load_balance"
+        ))));
+        assert!(route_keeps_sessions(Some(&mode(two(), "failover"))));
+        assert!(route_keeps_sessions(Some(&mode(two(), "session_hash"))));
+        assert!(!route_keeps_sessions(Some(&mode(two(), "load_balance"))));
+        let one_up = vec![
+            endpoint("a", "http://a/v1", 100, 100, true, true),
+            endpoint("b", "http://b/v1", 100, 100, true, false),
+        ];
+        assert!(route_keeps_sessions(Some(&mode(one_up, "load_balance"))));
     }
 
     #[test]

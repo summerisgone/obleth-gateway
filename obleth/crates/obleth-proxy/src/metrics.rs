@@ -21,6 +21,8 @@ pub struct Metrics {
     fairshare_replicas: IntGauge,
     fairshare_slot_mode: IntGaugeVec,
     fairshare_cluster_in_flight: IntGauge,
+    fairshare_held: IntGauge,
+    fairshare_affinity: IntCounterVec,
     capacity_discovery_models: IntGaugeVec,
     telemetry_dropped: IntGauge,
     cache_lookups: IntCounterVec,
@@ -96,6 +98,22 @@ impl Metrics {
             "In-flight requests across every gateway replica, as the shared slots last \
              reported them; this replica's own count outside shared mode",
         ))
+        .unwrap();
+        let fairshare_held = IntGauge::with_opts(Opts::new(
+            "obleth_fairshare_held_slots",
+            "Slots this replica holds for agent sessions' next steps (session affinity)",
+        ))
+        .unwrap();
+        // Labelled by event only (a fixed set of four).
+        let fairshare_affinity = IntCounterVec::new(
+            Opts::new(
+                "obleth_fairshare_affinity_total",
+                "What session affinity did on this replica: jump (a request went ahead of an \
+                 older one), hold (a slot was held for a session's next step), redeem (the \
+                 next step took it) or expire (it was given back unused)",
+            ),
+            &["event"],
+        )
         .unwrap();
         // Labelled by state only (a fixed set of three), not by model, in
         // keeping with the low-cardinality rule above; per-model detail is in
@@ -197,6 +215,10 @@ impl Metrics {
         registry
             .register(Box::new(fairshare_cluster_in_flight.clone()))
             .unwrap();
+        registry.register(Box::new(fairshare_held.clone())).unwrap();
+        registry
+            .register(Box::new(fairshare_affinity.clone()))
+            .unwrap();
         registry
             .register(Box::new(capacity_discovery_models.clone()))
             .unwrap();
@@ -231,6 +253,8 @@ impl Metrics {
             fairshare_replicas,
             fairshare_slot_mode,
             fairshare_cluster_in_flight,
+            fairshare_held,
+            fairshare_affinity,
             capacity_discovery_models,
             telemetry_dropped,
             cache_lookups,
@@ -304,6 +328,23 @@ impl Metrics {
                 .set(i64::from(m == mode));
         }
         self.fairshare_cluster_in_flight.set(cluster_in_flight);
+    }
+
+    /// Mirror the scheduler's session affinity figures: the held slots now,
+    /// and its running totals, which only ever grow.
+    pub fn set_session_affinity(&self, held: i64, totals: &obleth_fairshare::AffinityStats) {
+        use std::sync::atomic::Ordering;
+        self.fairshare_held.set(held);
+        for (event, total) in [
+            ("jump", &totals.jumps),
+            ("hold", &totals.holds),
+            ("redeem", &totals.redeemed),
+            ("expire", &totals.expired),
+        ] {
+            let counter = self.fairshare_affinity.with_label_values(&[event]);
+            let total = total.load(Ordering::Relaxed);
+            counter.inc_by(total.saturating_sub(counter.get()));
+        }
     }
 
     pub fn set_capacity_discovery_models(&self, state: &str, count: i64) {
@@ -398,6 +439,23 @@ mod tests {
         let text = m.encode();
         assert!(text.contains("obleth_fairshare_shared_slots_mode{mode=\"shared\"} 0"));
         assert!(text.contains("obleth_fairshare_shared_slots_mode{mode=\"fallback\"} 1"));
+    }
+
+    #[test]
+    fn session_affinity_figures_render() {
+        use std::sync::atomic::Ordering;
+        let m = Metrics::new();
+        let totals = obleth_fairshare::AffinityStats::default();
+        totals.holds.store(5, Ordering::Relaxed);
+        totals.redeemed.store(4, Ordering::Relaxed);
+        m.set_session_affinity(2, &totals);
+        totals.holds.store(7, Ordering::Relaxed);
+        m.set_session_affinity(1, &totals);
+        let text = m.encode();
+        assert!(text.contains("obleth_fairshare_held_slots 1"));
+        assert!(text.contains("obleth_fairshare_affinity_total{event=\"hold\"} 7"));
+        assert!(text.contains("obleth_fairshare_affinity_total{event=\"redeem\"} 4"));
+        assert!(text.contains("obleth_fairshare_affinity_total{event=\"expire\"} 0"));
     }
 
     #[test]

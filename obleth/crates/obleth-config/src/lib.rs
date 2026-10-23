@@ -13,7 +13,7 @@ pub mod reasoning;
 pub mod routing;
 pub mod types;
 
-pub use config::{CapacityDiscoveryConfig, Config, SlackAlertConfig};
+pub use config::{CapacityDiscoveryConfig, Config, SessionAffinityConfig, SlackAlertConfig};
 pub use jwt::{
     identity_key_hash, jwt_issuers_from_env, parse_jwt_issuers, sanitize_device_id, JwtConfigError,
     JwtIssuerConfig, ALLOWED_JWT_ALGORITHMS, DEVICE_ID_MAX_LEN,

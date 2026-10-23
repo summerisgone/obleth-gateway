@@ -46,11 +46,19 @@
 //! and is divided across the replicas in split mode like any other, and a
 //! change resizes the pool the same way a replica-count change does.
 //!
+//! # Session affinity
+//! With [`FairShare::set_session_affinity`], a pool favours agent sessions
+//! whose context is still cached upstream: a warm session goes ahead of older
+//! requests from the same key, and the slot a step frees can be held briefly
+//! for the session's next step (see [`affinity`]). A held slot counts like a
+//! taken one, against the pool, the global ceiling, the tenant and the key.
+//!
 //! Requests with no resolved route share one [`PoolKey::Unrouted`] pool. A
 //! pool with no permits and no waiters for [`IDLE_POOL_TTL`] is dropped by the
 //! scheduler's housekeeping timer, which also drops queued waiters whose
 //! caller has gone.
 
+mod affinity;
 mod algorithm;
 mod capacity;
 pub mod history;
@@ -58,6 +66,7 @@ mod replicas;
 pub mod shared;
 pub mod view;
 
+pub use affinity::AffinityStats;
 pub use algorithm::{
     group_slot_caps, pool_shares, weighted_caps, PoolShares, ShareKey, ShareTenant,
 };
@@ -82,7 +91,7 @@ use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-use obleth_config::{Admission, FairshareAlgorithm};
+use obleth_config::{Admission, FairshareAlgorithm, SessionAffinityConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -150,6 +159,10 @@ pub struct Stats {
     /// Cluster-wide in-flight requests as last reported by the shared slot
     /// backend. Meaningful only in [`SlotMode::Shared`].
     pub cluster_in_flight: AtomicUsize,
+    /// Slots this replica holds for sessions' next steps, across every pool.
+    pub held: AtomicUsize,
+    /// What session affinity did, as running totals.
+    pub affinity: Arc<AffinityStats>,
 }
 
 impl Stats {
@@ -239,6 +252,9 @@ pub struct ModelPoolFairshare {
     pub cluster_in_flight: Option<usize>,
     pub queued: usize,
     pub borrowed: usize,
+    /// Slots held for sessions' next steps (counted in `in_flight`).
+    #[serde(default)]
+    pub held: usize,
     pub groups: Vec<GroupFairshare>,
     pub tenants: Vec<TenantFairshare>,
     pub keys: Vec<KeyFairshare>,
@@ -323,6 +339,8 @@ pub struct AdmitRequest {
     pub cost: u32,
     /// Set when `key` is an end user's derived key (see [`EndUser`]).
     pub end_user: Option<EndUser>,
+    /// The conversation this request is a step of, for session affinity.
+    pub session: Option<String>,
 }
 
 impl AdmitRequest {
@@ -347,6 +365,7 @@ impl AdmitRequest {
             key_max_in_flight: None,
             cost,
             end_user: None,
+            session: None,
         }
     }
 
@@ -393,6 +412,13 @@ impl AdmitRequest {
         });
         self
     }
+
+    /// The conversation id; empty means none.
+    pub fn session(mut self, id: impl Into<String>) -> Self {
+        let id = id.into();
+        self.session = (!id.is_empty()).then_some(id);
+        self
+    }
 }
 
 /// A held admission slot. Dropping it returns capacity to the scheduler.
@@ -401,6 +427,7 @@ pub struct Permit {
     tenant: Uuid,
     key: Uuid,
     pool: PoolKey,
+    session: Option<String>,
 }
 
 impl Drop for Permit {
@@ -410,6 +437,7 @@ impl Drop for Permit {
                 tenant: self.tenant,
                 key: self.key,
                 pool: std::mem::replace(&mut self.pool, PoolKey::Unrouted),
+                session: self.session.take(),
             });
         }
     }
@@ -433,6 +461,7 @@ enum Ctl {
         tenant: Uuid,
         key: Uuid,
         pool: PoolKey,
+        session: Option<String>,
     },
     Snapshot {
         respond: oneshot::Sender<FairshareSnapshot>,
@@ -445,6 +474,7 @@ enum Ctl {
     },
     SetReplicas(usize),
     SetModelCaps(HashMap<String, usize>),
+    SetSessionAffinity(Option<SessionAffinityConfig>),
     EnableShared {
         backend: Arc<dyn SharedSlots>,
         config: SharedSlotsConfig,
@@ -523,6 +553,7 @@ impl FairShare {
             shared: None,
             next_op_id: 0,
             model_caps: HashMap::new(),
+            session_affinity: None,
             pools: HashMap::new(),
             pool_order: Vec::new(),
             cursor: 0,
@@ -641,6 +672,7 @@ impl FairShare {
                     cluster_in_flight: None,
                     queued: 0,
                     borrowed: 0,
+                    held: 0,
                     groups: Vec::new(),
                     tenants: Vec::new(),
                     keys: Vec::new(),
@@ -665,6 +697,12 @@ impl FairShare {
     pub fn set_model_caps(&self, caps: HashMap<String, usize>) {
         let caps = caps.into_iter().map(|(m, c)| (m, c.max(1))).collect();
         let _ = self.ctl.send(Ctl::SetModelCaps(caps));
+    }
+
+    /// Turn session affinity on (`Some`) or off for every pool; see
+    /// [`affinity`]. Turning it off releases every held slot.
+    pub fn set_session_affinity(&self, config: Option<SessionAffinityConfig>) {
+        let _ = self.ctl.send(Ctl::SetSessionAffinity(config));
     }
 
     pub async fn snapshot(&self) -> Option<FairshareSnapshot> {
@@ -716,11 +754,34 @@ struct Waiter {
     key_max_in_flight: Option<usize>,
     cost: u32,
     end_user: Option<EndUser>,
+    session: Option<String>,
+    /// Session affinity put it ahead of an older request when it was taken.
+    jumped: bool,
     enqueued: Instant,
     /// The local fast path would have admitted it on arrival; in shared mode
     /// it is still reported as fast if its first claim succeeds.
     fast: bool,
     respond: oneshot::Sender<Admitted>,
+}
+
+/// Who a grant goes to, for [`Pool::send`].
+struct Grant {
+    tenant: Uuid,
+    key: Uuid,
+    session: Option<String>,
+    /// It went ahead of an older request.
+    jumped: bool,
+}
+
+impl Grant {
+    fn new(tenant: Uuid, key: Uuid, session: Option<String>, jumped: bool) -> Self {
+        Grant {
+            tenant,
+            key,
+            session,
+            jumped,
+        }
+    }
 }
 
 /// A waiter whose cluster-wide slot claim is outstanding. It already holds
@@ -759,9 +820,9 @@ impl TenantQueue {
         self.len += 1;
     }
 
-    fn pop(&mut self, key: &Uuid) -> Option<Waiter> {
+    fn pop_at(&mut self, key: &Uuid, at: usize) -> Option<Waiter> {
         let queue = self.keys.get_mut(key)?;
-        let waiter = queue.pop_front()?;
+        let waiter = queue.remove(at)?;
         if queue.is_empty() {
             self.keys.remove(key);
         }
@@ -827,6 +888,9 @@ struct Pool {
     blocked_keys: HashSet<Uuid>,
     /// Shared mode: the pool's cluster-wide occupancy as last reported.
     cluster_in_flight: Option<usize>,
+    /// Session affinity. Not cleared by [`Pool::reset`]: a session stays
+    /// cached upstream while the pool is idle between its steps.
+    affinity: affinity::Affinity,
     ctl_tx: mpsc::UnboundedSender<Ctl>,
 }
 
@@ -868,6 +932,7 @@ impl Pool {
             blocked_tenants: HashSet::new(),
             blocked_keys: HashSet::new(),
             cluster_in_flight: None,
+            affinity: affinity::Affinity::default(),
             ctl_tx,
         }
     }
@@ -1100,6 +1165,13 @@ impl Pool {
         self.in_flight += 1;
         *self.tenant_in_flight.entry(tenant).or_insert(0) += 1;
         *self.key_in_flight.entry(key).or_insert(0) += 1;
+        self.charge(tenant, key, cost);
+    }
+
+    /// Bill a grant's cost to its tenant and key. [`Pool::occupy`] does it
+    /// for a new slot; a held slot taken by its session is billed alone,
+    /// since it was never given back.
+    fn charge(&mut self, tenant: Uuid, key: Uuid, cost: u32) {
         let vt = self.virtual_time;
         *self.served.entry(tenant).or_insert_with(|| {
             self.served_base.insert(tenant, vt);
@@ -1108,19 +1180,14 @@ impl Pool {
         *self.key_served.entry(key).or_insert(self.virtual_time) += cost as f64;
     }
 
-    fn make_admitted(
-        &self,
-        tenant: Uuid,
-        key: Uuid,
-        admission: Admission,
-        waited: Duration,
-    ) -> Admitted {
+    fn make_admitted(&self, grant: Grant, admission: Admission, waited: Duration) -> Admitted {
         Admitted {
             permit: Permit {
                 release: Some(self.ctl_tx.clone()),
-                tenant,
-                key,
+                tenant: grant.tenant,
+                key: grant.key,
                 pool: self.key.clone(),
+                session: grant.session,
             },
             admission,
             waited,
@@ -1128,29 +1195,42 @@ impl Pool {
     }
 
     fn send(
-        &self,
-        tenant: Uuid,
-        key: Uuid,
+        &mut self,
+        grant: Grant,
         respond: oneshot::Sender<Admitted>,
         admission: Admission,
         waited: Duration,
     ) {
+        let arrived = Instant::now()
+            .checked_sub(waited)
+            .unwrap_or_else(Instant::now);
+        self.affinity
+            .granted(grant.session.as_deref(), grant.jumped, arrived);
         // If the caller is gone, `send` hands the `Admitted` back as `Err` and
         // dropping it here drops its `Permit`, which already releases the
         // slot via `Permit::drop`. An explicit release here would double up:
         // this grant would be released twice for one occupy.
-        let _ = respond.send(self.make_admitted(tenant, key, admission, waited));
+        let _ = respond.send(self.make_admitted(grant, admission, waited));
     }
 
     fn grant_fast(&mut self, req: AdmitRequest, respond: oneshot::Sender<Admitted>) {
         self.occupy(req.tenant, req.key, req.cost);
-        self.send(
-            req.tenant,
-            req.key,
-            respond,
-            Admission::Fast,
-            Duration::ZERO,
-        );
+        let grant = Grant::new(req.tenant, req.key, req.session, false);
+        self.send(grant, respond, Admission::Fast, Duration::ZERO);
+    }
+
+    /// Give `req` the slot held for its session: it was never given back,
+    /// so only the cost is billed. It goes ahead of anyone queued.
+    fn grant_held(
+        &mut self,
+        hold: affinity::Hold,
+        req: AdmitRequest,
+        respond: oneshot::Sender<Admitted>,
+    ) {
+        self.charge(hold.tenant, hold.key, req.cost);
+        let jumped = self.queued_total > 0;
+        let grant = Grant::new(hold.tenant, hold.key, req.session, jumped);
+        self.send(grant, respond, Admission::Fast, Duration::ZERO);
     }
 
     fn enqueue(
@@ -1202,6 +1282,8 @@ impl Pool {
                 key_max_in_flight: req.key_max_in_flight,
                 cost: req.cost,
                 end_user: req.end_user,
+                session: req.session,
+                jumped: false,
                 enqueued,
                 fast,
                 respond,
@@ -1220,7 +1302,8 @@ impl Pool {
             return (false, dropped);
         };
         let waited = waiter.enqueued.elapsed();
-        self.send(tenant, key, waiter.respond, Admission::Queued, waited);
+        let grant = Grant::new(tenant, key, waiter.session, waiter.jumped);
+        self.send(grant, waiter.respond, Admission::Queued, waited);
         (true, dropped)
     }
 
@@ -1239,14 +1322,21 @@ impl Pool {
             let Some(key) = self.pick_key(&tenant) else {
                 return (None, dropped);
             };
-            let waiter = {
+            let at = self.affinity.pick(
+                self.queues[&tenant].keys[&key]
+                    .iter()
+                    .map(|w| (w.session.as_deref(), w.enqueued)),
+                Instant::now(),
+            );
+            let mut waiter = {
                 let queue = self.queues.get_mut(&tenant).expect("picked tenant exists");
-                let waiter = queue.pop(&key).expect("picked key non-empty");
+                let waiter = queue.pop_at(&key, at).expect("picked waiter exists");
                 if queue.is_empty() {
                     self.queues.remove(&tenant);
                 }
                 waiter
             };
+            waiter.jumped = at > 0;
             self.queued_total -= 1;
             if waiter.respond.is_closed() {
                 dropped += 1;
@@ -1287,6 +1377,7 @@ impl Pool {
             *served -= waiter.cost as f64;
         }
         waiter.fast = false;
+        waiter.jumped = false;
         self.queues.entry(tenant).or_default().reinsert(key, waiter);
         self.queued_total += 1;
     }
@@ -1502,6 +1593,102 @@ impl Pool {
             }
         }
         self.forget_if_quiet(tenant, key);
+    }
+
+    /// A step of `session` finished in a slot of `tenant` and `key`. Returns
+    /// whether the slot is now held for the session's next step rather than
+    /// given back. `may_hold` is false where this replica cannot hold one.
+    fn finish_step(
+        &mut self,
+        tenant: Uuid,
+        key: Uuid,
+        session: Option<&str>,
+        may_hold: bool,
+    ) -> bool {
+        let now = Instant::now();
+        let wants = self.affinity.finished(session, now);
+        let Some(session) = session.filter(|_| wants && may_hold) else {
+            return false;
+        };
+        let aged = self
+            .oldest_queued()
+            .is_some_and(|t| self.affinity.aged(t, now));
+        if aged || !self.affinity.can_hold(self.cap) {
+            return false;
+        }
+        self.affinity.hold(session, tenant, key, now);
+        true
+    }
+
+    /// Arrival of the oldest request queued in the pool.
+    fn oldest_queued(&self) -> Option<Instant> {
+        self.queues
+            .values()
+            .flat_map(|q| q.keys.values())
+            .filter_map(|d| d.front().map(|w| w.enqueued))
+            .min()
+    }
+
+    /// The held slots to give back now: all of them once a request here has
+    /// waited too long to keep yielding to them.
+    fn holds_to_give_up(&mut self, now: Instant) -> Vec<affinity::Hold> {
+        let aged = self
+            .oldest_queued()
+            .is_some_and(|t| self.affinity.aged(t, now));
+        if aged {
+            self.affinity.give_up()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Hand held slots to queued requests of their sessions. Each keeps the
+    /// slot it was held in and is billed its cost. Returns how many were
+    /// granted and how many waiters whose caller had gone were dropped.
+    fn redeem_queued(&mut self) -> (usize, usize) {
+        let (mut granted, mut dropped) = (0, 0);
+        let held: Vec<(String, Uuid, Uuid)> = self
+            .affinity
+            .holds()
+            .map(|h| (h.session.clone(), h.tenant, h.key))
+            .collect();
+        for (session, tenant, key) in held {
+            let find = |pool: &Pool| {
+                pool.queues
+                    .get(&tenant)
+                    .and_then(|q| q.keys.get(&key))
+                    .and_then(|d| {
+                        d.iter()
+                            .position(|w| w.session.as_deref() == Some(session.as_str()))
+                    })
+            };
+            while let Some(at) = find(self) {
+                let queue = self.queues.get_mut(&tenant).expect("waiter just found");
+                let waiter = queue.pop_at(&key, at).expect("waiter just found");
+                if queue.is_empty() {
+                    self.queues.remove(&tenant);
+                }
+                self.queued_total -= 1;
+                if waiter.respond.is_closed() {
+                    dropped += 1;
+                    continue;
+                }
+                let hold = self
+                    .affinity
+                    .redeem(Some(&session))
+                    .expect("hold just listed");
+                let jumped = at > 0 || self.oldest_queued().is_some_and(|t| t < waiter.enqueued);
+                self.track_waiter_meta(tenant, key, &waiter);
+                self.charge(tenant, key, waiter.cost);
+                self.advance_virtual_time();
+                let waited = waiter.enqueued.elapsed();
+                let grant = Grant::new(hold.tenant, hold.key, waiter.session, jumped);
+                self.send(grant, waiter.respond, Admission::Queued, waited);
+                granted += 1;
+                break;
+            }
+        }
+        (granted, dropped)
     }
 
     fn forget_if_quiet(&mut self, tenant: Uuid, key: Uuid) {
@@ -1885,6 +2072,7 @@ impl Pool {
             cluster_in_flight: self.cluster_in_flight,
             queued: self.queued_total,
             borrowed: groups.iter().map(|g| g.borrowed).sum(),
+            held: self.affinity.held(),
             groups,
             tenants,
             keys,
@@ -1949,6 +2137,8 @@ struct Scheduler {
     /// Configured pool sizes set with [`FairShare::set_model_caps`], which win
     /// over the cap an admission carries.
     model_caps: HashMap<String, usize>,
+    /// Set with [`FairShare::set_session_affinity`]; applies to every pool.
+    session_affinity: Option<SessionAffinityConfig>,
     pools: HashMap<PoolKey, Pool>,
     /// Insertion order of pools, for round-robin when the ceiling binds.
     pool_order: Vec<PoolKey>,
@@ -1969,6 +2159,7 @@ impl Scheduler {
         housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let deadline = self.shared_deadline();
+            let holds_due = self.next_hold_expiry();
             tokio::select! {
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break };
@@ -1981,6 +2172,12 @@ impl Scheduler {
                 _ = tokio::time::sleep_until(deadline.unwrap_or_else(far_future).into()),
                     if deadline.is_some() => {
                     self.shared_timer();
+                }
+                _ = tokio::time::sleep_until(holds_due.unwrap_or_else(far_future).into()),
+                    if holds_due.is_some() => {
+                    self.expire_holds();
+                    self.dispatch_all();
+                    self.publish_stats();
                 }
             }
         }
@@ -2057,10 +2254,14 @@ impl Scheduler {
         match msg {
             Ctl::Admit {
                 pool: key,
-                req,
+                mut req,
                 respond,
                 enqueued,
             } => {
+                req.session = match self.session_affinity {
+                    Some(_) => req.session.take().map(|s| affinity::scoped(req.key, &s)),
+                    None => None,
+                };
                 let ceiling = self.ceiling();
                 let headroom = ceiling.saturating_sub(self.in_flight);
                 let default_cap = self.default_model_cap;
@@ -2082,6 +2283,12 @@ impl Scheduler {
                 });
                 pool.idle_since = None;
                 pool.track_meta(&req);
+                // A slot held for this session's next step is this request's.
+                if let Some(hold) = pool.affinity.redeem(req.session.as_deref()) {
+                    pool.grant_held(hold, req, respond);
+                    self.publish_stats();
+                    return;
+                }
                 let effective = pool.effective_cap(headroom);
                 let fast = headroom > 0 && pool.can_grant_immediately(&req, effective);
                 if shared_mode {
@@ -2105,22 +2312,16 @@ impl Scheduler {
                 tenant,
                 key,
                 pool: pool_key,
+                session,
             } => {
-                self.in_flight = self.in_flight.saturating_sub(1);
-                if let Some(pool) = self.pools.get_mut(&pool_key) {
-                    pool.release(tenant, key);
-                    pool.settle_idle();
+                // In shared mode the slot is the backend's; it is not held here.
+                let may_hold = self.mode != SlotMode::Shared;
+                let held = self.pools.get_mut(&pool_key).is_some_and(|pool| {
+                    pool.finish_step(tenant, key, session.as_deref(), may_hold)
+                });
+                if !held {
+                    self.release_slot(&pool_key, tenant, key);
                 }
-                if self.mode == SlotMode::Shared || self.quiesced_reconcile_running() {
-                    self.release_shared(SlotRelease {
-                        pool: pool_key.slot_id(),
-                        tenant,
-                        key,
-                    });
-                } else {
-                    self.note_unrecorded();
-                }
-                self.publish_model_load(&pool_key);
                 self.dispatch_all();
                 self.publish_stats();
             }
@@ -2185,6 +2386,21 @@ impl Scheduler {
                 self.dispatch_all();
                 self.publish_stats();
             }
+            Ctl::SetSessionAffinity(config) => {
+                self.session_affinity = config;
+                let stats = self.stats.affinity.clone();
+                let mut given_up = Vec::new();
+                for (key, pool) in self.pools.iter_mut() {
+                    for hold in pool.affinity.configure(config, stats.clone()) {
+                        given_up.push((key.clone(), hold));
+                    }
+                }
+                for (key, hold) in given_up {
+                    self.release_slot(&key, hold.tenant, hold.key);
+                }
+                self.dispatch_all();
+                self.publish_stats();
+            }
             Ctl::EnableShared { backend, config } => {
                 if self.shared.is_some() {
                     return;
@@ -2243,6 +2459,87 @@ impl Scheduler {
                 self.publish_stats();
             }
             Ctl::ViewPublished { result } => self.view_published(result),
+        }
+    }
+
+    /// Give back one slot of `tenant` and `key` in `pool_key`: locally, and
+    /// to the shared backend when it records the slot.
+    fn release_slot(&mut self, pool_key: &PoolKey, tenant: Uuid, key: Uuid) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if let Some(pool) = self.pools.get_mut(pool_key) {
+            pool.release(tenant, key);
+            pool.settle_idle();
+        }
+        if self.mode == SlotMode::Shared || self.quiesced_reconcile_running() {
+            self.release_shared(SlotRelease {
+                pool: pool_key.slot_id(),
+                tenant,
+                key,
+            });
+        } else {
+            self.note_unrecorded();
+        }
+        self.publish_model_load(pool_key);
+    }
+
+    // ---- session affinity ---------------------------------------------------
+
+    /// When the next held slot runs out, or a request in a pool holding one
+    /// has waited long enough for the holds to give way to it.
+    fn next_hold_expiry(&self) -> Option<Instant> {
+        let bypass = self.session_affinity?.max_bypass;
+        self.pools
+            .values()
+            .filter(|p| p.affinity.held() > 0)
+            .flat_map(|p| {
+                [
+                    p.affinity.next_expiry(),
+                    p.oldest_queued().map(|t| t + bypass),
+                ]
+            })
+            .flatten()
+            .min()
+    }
+
+    /// Give back the held slots that ran out.
+    fn expire_holds(&mut self) {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        for (key, pool) in self.pools.iter_mut() {
+            for hold in pool.affinity.expire(now) {
+                expired.push((key.clone(), hold));
+            }
+        }
+        for (key, hold) in expired {
+            self.release_slot(&key, hold.tenant, hold.key);
+        }
+    }
+
+    /// Hand held slots to queued requests of their sessions, after giving
+    /// back those of pools where a request has waited too long.
+    /// Nothing is granted while a reconcile is quiesced; giving back is not
+    /// held up.
+    fn serve_holds(&mut self) {
+        if self.session_affinity.is_none() {
+            return;
+        }
+        let grant = !self.quiescing();
+        let now = Instant::now();
+        let mut given_up = Vec::new();
+        for (key, pool) in self.pools.iter_mut() {
+            if pool.affinity.held() == 0 {
+                continue;
+            }
+            for hold in pool.holds_to_give_up(now) {
+                given_up.push((key.clone(), hold));
+            }
+            if grant {
+                let (granted, dropped) = pool.redeem_queued();
+                self.queued_total = self.queued_total.saturating_sub(granted + dropped);
+            }
+        }
+        for (key, hold) in given_up {
+            self.release_slot(&key, hold.tenant, hold.key);
         }
     }
 
@@ -2529,7 +2826,8 @@ impl Scheduler {
                     Admission::Queued
                 };
                 let waited = waiter.enqueued.elapsed();
-                pool.send(tenant, key_id, waiter.respond, admission, waited);
+                let grant = Grant::new(tenant, key_id, waiter.session, waiter.jumped);
+                pool.send(grant, waiter.respond, admission, waited);
                 if let Some(s) = self.shared.as_mut() {
                     s.cluster_in_flight = Some(counts.global);
                 }
@@ -2719,6 +3017,8 @@ impl Scheduler {
                 self.ctl_tx.clone(),
             );
             pool.set_divisor(self.divisor);
+            pool.affinity
+                .configure(self.session_affinity, self.stats.affinity.clone());
             self.pools.insert(key.clone(), pool);
             self.pool_order.push(key.clone());
         }
@@ -2729,8 +3029,10 @@ impl Scheduler {
     /// caller has gone, then drop pools that have been idle for the TTL.
     fn sweep(&mut self) {
         let mut dropped = 0;
+        let now = Instant::now();
         for pool in self.pools.values_mut() {
             dropped += pool.prune_dead_waiters();
+            pool.affinity.prune(now);
             pool.settle_idle();
         }
         self.queued_total = self.queued_total.saturating_sub(dropped);
@@ -2766,6 +3068,7 @@ impl Scheduler {
     /// pool starting from a rotating cursor, so a binding ceiling is shared
     /// round-robin rather than by map order.
     fn dispatch_all(&mut self) {
+        self.serve_holds();
         if self.mode == SlotMode::Shared {
             self.dispatch_shared();
             return;
@@ -2838,6 +3141,8 @@ impl Scheduler {
             .store(self.queued_total as i64, Ordering::Relaxed);
         self.stats.replicas.store(self.replicas, Ordering::Relaxed);
         self.stats.mode.store(self.mode.to_u8(), Ordering::Relaxed);
+        let held = self.pools.values().map(|p| p.affinity.held()).sum();
+        self.stats.held.store(held, Ordering::Relaxed);
         let cluster = self
             .shared
             .as_ref()

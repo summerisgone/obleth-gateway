@@ -159,6 +159,8 @@ services:
       OBLETH_FAIRSHARE_REPLICA_AWARE: ${OBLETH_FAIRSHARE_REPLICA_AWARE:-true}
       OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS: ${OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS:-5}
       OBLETH_FAIRSHARE_REPLICA_TTL_SECS: ${OBLETH_FAIRSHARE_REPLICA_TTL_SECS:-15}
+      # Session affinity for agent sessions; see .env.example.
+      OBLETH_FAIRSHARE_SESSION_AFFINITY: ${OBLETH_FAIRSHARE_SESSION_AFFINITY:-false}
       # Capacity discovery for models in the `discovered` capacity mode. Off by
       # default. The `endpoints` source (a model's own endpoints) works here;
       # the `kubernetes` source needs the gateway to run in a Kubernetes pod,
