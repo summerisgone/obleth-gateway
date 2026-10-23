@@ -3,33 +3,38 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
-import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { ArrowUpRight, X } from "lucide-react";
-import { axisTick, chartGrid, compactAxis, timeCursor } from "@/components/chart-tooltip";
-import { Meter, Panel, Segmented, Sparkline } from "@/components/overview/ui";
+import { ChevronRight } from "lucide-react";
+import { Panel, Segmented } from "@/components/overview/ui";
 import type { ModelSpeedPoint } from "@/lib/obleth";
 import { linkTime, type LogsLink } from "@/lib/log-links";
 import { modelHref } from "@/lib/model-links";
 import { compact, formatMs } from "@/lib/overview-model";
-import { SPLIT_TONES, type DayRange } from "@/lib/reports-model";
+import type { DayRange } from "@/lib/reports-model";
 import {
+  bucketLabel,
   bucketStarts,
-  CHART_MAX,
   changeLabel,
+  columnLabels,
+  describeSpeed,
+  detailPaths,
   FEW_REQUESTS,
+  shade,
+  SHADE_STEPS,
   SLOWDOWN,
   sortSpeedRows,
   speedBucket,
-  speedChartRows,
   speedRows,
   SPEED_SORTS,
   tps,
   type SpeedBucket,
+  type SpeedRow,
   type SpeedSort,
 } from "@/lib/speed-model";
 import { cn, getJson } from "@/lib/utils";
 
-const SLOW_TONE = "hsl(240 4% 46%)";
+const COLUMNS = "grid grid-cols-[minmax(12rem,250px)_76px_104px_84px_minmax(0,1fr)_20px] gap-x-3.5";
+const CHART_W = 1400;
+const CHART_H = 176;
 
 function zone(): string | undefined {
   try {
@@ -60,193 +65,188 @@ function useSpeed(range: DayRange | null, filters: { tenantId: string; keyId: st
   });
 }
 
-function bucketLabel(t: number, bucket: SpeedBucket) {
-  const d = new Date(t);
-  return bucket === "day"
-    ? d.toLocaleDateString([], { month: "short", day: "numeric" })
-    : d.toLocaleString([], { weekday: "short", hour: "numeric" });
+function Squares({ count, children }: { count: number; children: React.ReactNode }) {
+  return <span className="grid" style={{ gridTemplateColumns: `repeat(${count}, minmax(0, 1fr))`, gap: count > 31 ? 1 : 3 }}>{children}</span>;
 }
 
-function SpeedTip({ active, payload, label, bucket, lines }: { active?: boolean; payload?: { payload: Record<string, number | null> }[]; label?: number; bucket: SpeedBucket; lines: { key: string; label: string; color: string; dashed?: boolean }[] }) {
-  if (!active || !payload?.length || label === undefined) return null;
-  const row = payload[0].payload;
+function Fact({ label, value, unit }: { label: string; value: string; unit?: string }) {
   return (
-    <div className="min-w-48 rounded-lg border border-border bg-[hsl(240_5%_9%)] px-3 py-2 text-xs shadow-xl">
-      <p className="mb-1.5 font-mono text-muted-foreground">{bucketLabel(label, bucket)}</p>
-      {lines.map((l) => (
-        <div key={l.key} className="flex justify-between gap-6">
-          <span className="inline-flex items-center gap-1.5">
-            {l.dashed ? <span className="w-3 border-t-2 border-dashed" style={{ borderColor: l.color }} /> : <span className="h-2 w-2 rounded-[2px]" style={{ background: l.color }} />}
-            {l.label}
-          </span>
-          <span className="font-mono tabular-nums">{row[l.key] == null ? "no requests" : `${tps(Number(row[l.key]))} tok/s`}</span>
+    <div>
+      <p className="text-[11px] uppercase tracking-[0.07em] text-muted-foreground">{label}</p>
+      <p className="mt-0.5 font-mono text-[18px] font-medium">{value}{unit && value !== "—" && <span className="ml-1 text-[12px] text-muted-foreground">{unit}</span>}</p>
+    </div>
+  );
+}
+
+function Detail({ row, bucket, onModel, logsFor, single }: { row: SpeedRow; bucket: SpeedBucket; onModel: (m: string) => void; logsFor: (extra?: LogsLink) => string; single: boolean }) {
+  const paths = detailPaths(row.cells, row.tps, CHART_W, CHART_H);
+  return (
+    <div className={cn(COLUMNS, "bg-muted/20 px-[18px] pb-[18px] pt-1.5")}>
+      <div className="col-span-4 flex flex-col gap-3 pt-1.5">
+        <div className="grid grid-cols-2 gap-x-4 gap-y-3">
+          <Fact label="Median" value={tps(row.tps)} unit="tok/s" />
+          <Fact label="Slowest tenth" value={tps(row.slowTps)} unit="tok/s" />
+          <Fact label="First token" value={formatMs(row.ttftMs)} />
+          <Fact label="Prompt" value={row.promptTps ? compact(row.promptTps) : "—"} unit="tok/s" />
         </div>
-      ))}
+        <p className="text-[12.5px] leading-relaxed text-secondary-foreground">{describeSpeed(row, bucket)}</p>
+        <div className="flex flex-wrap gap-4 text-[12.5px] text-secondary-foreground">
+          <Link href={logsFor({ model: row.model })} className="hover:text-foreground">See its {row.requests.toLocaleString()} requests →</Link>
+          <Link href={modelHref(row.model)} className="hover:text-foreground">Open the model →</Link>
+          {!single && <button type="button" onClick={() => onModel(row.model)} className="hover:text-foreground">Report on this model only</button>}
+        </div>
+      </div>
+      <div className="flex min-w-0 flex-col gap-1.5">
+        <div className="relative h-[176px] border-l border-border">
+          <svg role="img" aria-label={`${row.model}: median tokens a second ${bucket === "hour" ? "by hour" : "by day"}`} viewBox={`0 0 ${CHART_W} ${CHART_H}`} preserveAspectRatio="none" className="block h-[176px] w-full">
+            <path d={`M0 0.5 H${CHART_W} M0 ${CHART_H / 2} H${CHART_W} M0 ${CHART_H - 0.5} H${CHART_W}`} stroke="hsl(240 4% 16%)" strokeWidth={1} vectorEffect="non-scaling-stroke" fill="none" />
+            <path d={paths.usual} stroke="hsl(240 4% 34%)" strokeWidth={1} strokeDasharray="4 4" vectorEffect="non-scaling-stroke" fill="none" />
+            <path d={paths.band} fill="hsl(240 4% 26%)" fillOpacity={0.55} />
+            <path d={paths.median} stroke="hsl(240 5% 90%)" strokeWidth={2} vectorEffect="non-scaling-stroke" fill="none" strokeLinejoin="round" />
+          </svg>
+          <span className="absolute left-1 top-0.5 font-mono text-[10.5px] text-muted-foreground">{paths.top} tok/s</span>
+          <span className="absolute left-1 top-[calc(50%+2px)] font-mono text-[10.5px] text-muted-foreground">{+(paths.top / 2).toFixed(1)}</span>
+        </div>
+        <div className="flex flex-wrap gap-4 text-[11.5px] text-secondary-foreground">
+          <span className="inline-flex items-center gap-1.5"><span className="h-0.5 w-4 bg-[hsl(240_5%_90%)]" />Median request</span>
+          <span className="inline-flex items-center gap-1.5"><span className="h-2.5 w-4 rounded-[2px] bg-[hsl(240_4%_26%)]" />Down to the slowest tenth</span>
+          <span className="inline-flex items-center gap-1.5"><span className="w-4 border-t border-dashed border-muted-foreground" />Its usual speed</span>
+          <span>Gaps are {bucket === "hour" ? "hours" : "days"} with no requests</span>
+        </div>
+      </div>
+      <span />
     </div>
   );
 }
 
 /**
- * How fast each model answered over the report's days: one row per model with
- * its median speed against the period before, and a chart of the chosen
- * models over time. Speeds come from the request log, so they cover only the
- * days it still keeps.
+ * How fast each model answered over the report's days. One row per model:
+ * its median speed against the period before, and a square per hour or day
+ * shaded by how that hour or day compared with the model's own usual speed.
+ * Opening a model charts its median and slowest tenth in the same columns.
+ * Speeds come from the request log, so they cover only the days it keeps.
  */
-export function ModelSpeed({ range, previous, filters, against, retentionDays, onModel, logsFor }: {
+export function ModelSpeed({ range, previous, filters, against, retentionDays, modelTypes = {}, onModel, logsFor }: {
   range: DayRange | null;
   previous: DayRange | null;
   filters: { tenantId: string; keyId: string; model: string };
   against: string;
   retentionDays: number | null;
+  /** Each registered model's type: only chat models have a speed worth showing. */
+  modelTypes?: Record<string, string>;
   onModel: (model: string) => void;
   logsFor: (extra?: LogsLink) => string;
 }) {
   const [sort, setSort] = useState<SpeedSort>("busiest");
-  const [picked, setPicked] = useState<string[] | null>(null);
+  const [open, setOpen] = useState<string | null>(null);
+  const [showFew, setShowFew] = useState(false);
   const bucket = range ? speedBucket(range) : "day";
+  const starts = range ? bucketStarts(range, bucket) : [];
 
   const now = useSpeed(range, filters, "none");
   const before = useSpeed(previous, filters, "none");
   const series = useSpeed(range, filters, bucket);
 
-  const rows = speedRows(now.data ?? [], before.data ?? null, series.data ?? []);
-  const sorted = sortSpeedRows(rows, sort);
-  const busiest = sortSpeedRows(rows, "busiest");
-  const known = new Set(rows.map((r) => r.model));
-  const shown = (filters.model ? [filters.model] : (picked ?? busiest.slice(0, CHART_MAX).map((r) => r.model))).filter((m) => known.has(m));
-  const single = shown.length === 1;
-  const starts = range ? bucketStarts(range, bucket) : [];
-  const chartRows = speedChartRows(starts, series.data ?? [], shown);
-  const lines: { key: string; label: string; color: string; dashed?: boolean }[] = [
-    ...shown.map((m, i) => ({ key: m, label: single ? `${m} · median` : m, color: SPLIT_TONES[i % SPLIT_TONES.length] })),
-    ...(single ? [{ key: "__slow", label: "Slowest tenth of requests", color: SLOW_TONE, dashed: true }] : []),
-  ];
-  const slowed = rows.filter((r) => r.slowedDown);
-  const reliable = rows.filter((r) => !r.few);
+  const single = !!filters.model;
+  const all = speedRows(now.data ?? [], before.data ?? null, series.data ?? [], starts).filter((r) => (modelTypes[r.model] ?? "chat") === "chat");
+  const sorted = sortSpeedRows(all, sort);
+  const few = sorted.filter((r) => r.few);
+  const rows = single || showFew ? sorted : sorted.filter((r) => !r.few);
+  const opened = single ? filters.model : open;
+  const slowed = all.filter((r) => r.slowedDown);
+  const reliable = all.filter((r) => !r.few);
   const fastest = [...reliable].sort((a, b) => b.tps - a.tps)[0];
   const slowest = [...reliable].sort((a, b) => a.tps - b.tps)[0];
-  const maxTps = Math.max(...rows.map((r) => r.tps), 0);
+  const labels = columnLabels(starts, bucket);
   const olderThanLog = !!(range && retentionDays && linkTime(range.start, false)! < Date.now() - retentionDays * 86_400_000);
-
-  const toggle = (model: string) => {
-    if (filters.model) return;
-    const cur = picked ?? busiest.slice(0, CHART_MAX).map((r) => r.model);
-    setPicked(cur.includes(model) ? cur.filter((m) => m !== model) : [...cur, model].slice(-CHART_MAX));
-  };
-
-  const summary = rows.length === 0 ? null : [
-    `${rows.length} model${rows.length === 1 ? "" : "s"}`,
-    fastest && !filters.model ? `fastest ${fastest.model} at ${tps(fastest.tps)} tok/s` : null,
-    slowest && !filters.model && slowest !== fastest ? `slowest ${slowest.model} at ${tps(slowest.tps)} tok/s` : null,
-    previous ? (slowed.length ? `${slowed.length} slowed down by ${SLOWDOWN * 100}% or more vs ${against}` : `none slowed down by ${SLOWDOWN * 100}% or more vs ${against}`) : null,
-  ].filter(Boolean).join(" · ");
+  const unit = bucket === "hour" ? "hour" : "day";
 
   return (
     <Panel
       label="Model speed"
-      title={filters.model ? `How fast ${filters.model} answered` : "How fast each model answered"}
-      subtitle={`Output tokens a second per request, after the first token, for the median request${single ? " (the dashed line is the slowest tenth)" : ""} · successful, uncached requests only${olderThanLog ? ` · the request log keeps ${retentionDays} days, so older days have no speed` : ""}`}
-      action={!filters.model && rows.length > 1 ? <Segmented<SpeedSort> label="Order" value={sort} onChange={setSort} options={SPEED_SORTS} /> : undefined}
+      title={single ? `How fast ${filters.model} answered, ${unit} by ${unit}` : `How fast each model answered, ${unit} by ${unit}`}
+      subtitle={`Median output tokens a second per request, after the first token. Each square is one ${unit}, shaded by how it compared with the model's own usual speed.${single ? "" : " Open a model to see its " + unit + "s in detail."}${olderThanLog ? ` The request log keeps ${retentionDays} days, so older days have no speed.` : ""}`}
+      action={!single && reliable.length > 1 ? <Segmented<SpeedSort> label="Order" value={sort} onChange={setSort} options={SPEED_SORTS} /> : undefined}
     >
-      <div className="px-[18px] pb-4 pt-3">
-        {summary && <p className="mb-3 text-[12.5px] text-secondary-foreground">{summary}</p>}
-        {series.isLoading || now.isLoading ? (
-          <div className="skeleton h-[240px] rounded-lg" />
-        ) : shown.length === 0 ? (
-          <div className="flex h-[240px] items-center justify-center rounded-lg border border-dashed border-border text-sm text-muted-foreground">
-            {rows.length ? "Pick models below to chart them" : "No token-producing requests in these days"}
-          </div>
-        ) : (
-          <>
-            <div className="h-[240px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={chartRows} margin={{ top: 8, right: 4, left: 0, bottom: 0 }}>
-                  <CartesianGrid {...chartGrid} vertical={false} />
-                  <XAxis dataKey="t" type="category" tick={axisTick} axisLine={false} tickLine={false} minTickGap={28} height={20} tickFormatter={(t: number) => bucketLabel(t, bucket)} />
-                  <YAxis tick={axisTick} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => compactAxis(v)} />
-                  <Tooltip cursor={timeCursor} content={<SpeedTip bucket={bucket} lines={lines} />} />
-                  {lines.map((l) => (
-                    <Line key={l.key} type="monotone" dataKey={l.key} stroke={l.color} strokeWidth={2} strokeDasharray={l.dashed ? "5 4" : undefined} dot={chartRows.length <= 31 ? { r: 2, strokeWidth: 0, fill: l.color } : false} connectNulls isAnimationActive={false} />
-                  ))}
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-3 text-xs text-secondary-foreground">
-              {lines.map((l) => (
-                <span key={l.key} className="inline-flex items-center gap-1.5">
-                  {l.dashed ? <span className="w-4 border-t-2 border-dashed" style={{ borderColor: l.color }} /> : <span className="h-2.5 w-2.5 rounded-[2px]" style={{ background: l.color }} />}
-                  <span className={cn(!l.dashed && "font-mono")}>{l.label}</span>
-                  {!filters.model && !l.dashed && (
-                    <button type="button" onClick={() => toggle(l.key)} aria-label={`Take ${l.key} off the chart`} className="text-muted-foreground hover:text-foreground"><X className="h-3 w-3" /></button>
-                  )}
-                </span>
-              ))}
-              <span className="text-muted-foreground">{bucket === "hour" ? "Per hour" : "Per day"} · tok/s{!filters.model ? ` · click a row to chart it (up to ${CHART_MAX})` : ""}</span>
-            </div>
-          </>
-        )}
-      </div>
-      {rows.length > 0 && (
-        <div className="overflow-x-auto border-t border-border">
-          <table className="w-full min-w-[980px] text-[13px]">
-            <thead>
-              <tr className="border-b border-border text-left text-[11px] uppercase tracking-[0.07em] text-muted-foreground">
-                <th className="py-2.5 pl-[18px] pr-3 font-semibold">Model</th>
-                <th className="py-2.5 pr-3 text-right font-semibold">Requests</th>
-                <th className="py-2.5 pr-3 font-semibold">Median tok/s</th>
-                <th className="py-2.5 pr-3 text-right font-semibold">Slowest tenth</th>
-                <th className="py-2.5 pr-3 text-right font-semibold">{previous ? "vs before" : "Change"}</th>
-                <th className="py-2.5 pr-3 text-right font-semibold">First token</th>
-                <th className="py-2.5 pr-3 text-right font-semibold">Prompt tok/s</th>
-                <th className="w-40 py-2.5 pr-[18px] font-semibold">{bucket === "hour" ? "By hour" : "By day"}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sorted.map((r) => {
-                const on = shown.includes(r.model);
+      {!single && reliable.length > 0 && (
+        <div className="flex flex-wrap gap-x-7 gap-y-2.5 px-[18px] pb-3.5 text-[12.5px] text-secondary-foreground">
+          <span>{reliable.length} model{reliable.length === 1 ? "" : "s"}</span>
+          {fastest && <span>Fastest <span className="font-mono text-foreground">{fastest.model}</span> · {tps(fastest.tps)} tok/s</span>}
+          {slowest && slowest !== fastest && <span>Slowest <span className="font-mono text-foreground">{slowest.model}</span> · {tps(slowest.tps)} tok/s</span>}
+          {previous && <span className={cn(slowed.length > 0 && "font-medium text-foreground")}>{slowed.length ? `${slowed.length} slowed down` : "None slowed down"} by {SLOWDOWN * 100}% or more vs {against}</span>}
+        </div>
+      )}
+      {now.isLoading || series.isLoading ? (
+        <div className="px-[18px] pb-4"><div className="skeleton h-[240px] rounded-lg" /></div>
+      ) : all.length === 0 ? (
+        <div className="px-[18px] pb-4">
+          <div className="flex h-[120px] items-center justify-center rounded-lg border border-dashed border-border text-sm text-muted-foreground">No token-producing requests in these days</div>
+        </div>
+      ) : (
+        <>
+          <div className="overflow-x-auto border-t border-border">
+            <div className="min-w-[1040px]">
+              <div className={cn(COLUMNS, "items-end border-b border-border px-[18px] pb-2 pt-2.5 text-[11px] uppercase tracking-[0.07em] text-muted-foreground")}>
+                <span>Model</span>
+                <span className="text-right">Requests</span>
+                <span className="text-right">Median tok/s</span>
+                <span className="text-right">{previous ? "vs before" : "Change"}</span>
+                <Squares count={starts.length}>
+                  {labels.map((l, i) => <span key={starts[i]} className={cn("overflow-visible whitespace-nowrap text-center font-mono text-[10.5px] normal-case tracking-normal", i === starts.length - 1 && "text-foreground")}>{l}</span>)}
+                </Squares>
+                <span />
+              </div>
+              {rows.map((r) => {
+                const isOpen = opened === r.model;
                 const label = changeLabel(r.change);
                 return (
-                  <tr
-                    key={r.model}
-                    onClick={() => toggle(r.model)}
-                    className={cn("border-t border-border/70 first:border-t-0", !filters.model && "cursor-pointer hover:bg-muted/30", on && !filters.model && "bg-muted/20")}
-                    aria-selected={on}
-                  >
-                    <td className="max-w-[20rem] py-2 pl-[18px] pr-3">
-                      <span className="inline-flex min-w-0 items-center gap-2">
-                        {!filters.model && <span className="h-2 w-2 shrink-0 rounded-[2px]" style={{ background: on ? SPLIT_TONES[shown.indexOf(r.model) % SPLIT_TONES.length] : "transparent", outline: on ? undefined : "1px solid hsl(240 4% 30%)" }} />}
-                        <span className="truncate font-mono text-[12.5px]">{r.model}</span>
-                        {!filters.model && (
-                          <button type="button" onClick={(e) => { e.stopPropagation(); onModel(r.model); }} className="shrink-0 text-[11.5px] text-muted-foreground hover:text-foreground" title="Report on this model only">only</button>
-                        )}
-                        <Link href={modelHref(r.model)} onClick={(e) => e.stopPropagation()} className="shrink-0 text-muted-foreground hover:text-foreground" title="Open the model"><ArrowUpRight className="h-3.5 w-3.5" /></Link>
-                      </span>
-                    </td>
-                    <td className="py-2 pr-3 text-right font-mono text-[12px]">
-                      <Link href={logsFor({ model: r.model })} onClick={(e) => e.stopPropagation()} className="underline-offset-2 hover:underline" title={`${r.rated.toLocaleString()} of ${r.requests.toLocaleString()} measured · see these requests`}>{compact(r.requests)}</Link>
-                      {r.few && <span className="ml-1.5 text-[11px] text-muted-foreground" title={`Fewer than ${FEW_REQUESTS} measured requests, so the median says little`}>few</span>}
-                    </td>
-                    <td className="py-2 pr-3">
-                      <div className="flex items-center gap-2">
-                        <span className={cn("w-12 text-right font-mono text-[12.5px]", r.few && "text-muted-foreground")}>{tps(r.tps)}</span>
-                        <Meter value={r.tps} max={maxTps || 1} className="w-28" strong={r.slowedDown} />
-                      </div>
-                    </td>
-                    <td className="py-2 pr-3 text-right font-mono text-[12px] text-muted-foreground">{tps(r.slowTps)}</td>
-                    <td className={cn("py-2 pr-3 text-right font-mono text-[12px]", r.slowedDown ? "font-semibold text-foreground" : "text-muted-foreground")} title={r.previousTps !== null ? `${tps(r.previousTps)} tok/s ${against}` : `Not used ${against}`}>
-                      {label ?? (previous ? "new" : "—")}
-                    </td>
-                    <td className="py-2 pr-3 text-right font-mono text-[12px] text-muted-foreground">{formatMs(r.ttftMs)}</td>
-                    <td className="py-2 pr-3 text-right font-mono text-[12px] text-muted-foreground">{r.promptTps ? compact(r.promptTps) : "—"}</td>
-                    <td className="py-1 pr-[18px]">
-                      <Sparkline values={r.trend} className="h-7" label={`${r.model} median tok/s ${bucket === "hour" ? "by hour" : "by day"}`} />
-                    </td>
-                  </tr>
+                  <div key={r.model} className="border-b border-border/70">
+                      <button
+                        type="button"
+                        aria-expanded={isOpen}
+                        disabled={single}
+                        onClick={() => setOpen(isOpen ? null : r.model)}
+                        className={cn(COLUMNS, "w-full items-center px-[18px] py-[9px] text-left text-[13px] disabled:cursor-default", !single && "hover:bg-muted/30", isOpen && "bg-muted/20")}
+                      >
+                        <span className="flex min-w-0 items-center gap-2">
+                          <span className={cn("truncate font-mono text-[12.5px]", r.few && "text-muted-foreground")}>{r.model}</span>
+                          {r.few && <span className="rounded-[5px] border border-border px-1.5 text-[11px] text-muted-foreground" title={`Fewer than ${FEW_REQUESTS} measured requests, so the median says little`}>few</span>}
+                        </span>
+                        <span className="text-right font-mono text-[12px] text-secondary-foreground">{compact(r.requests)}</span>
+                        <span className={cn("text-right font-mono text-[13px] font-medium", r.few && "text-muted-foreground")}>{tps(r.tps)}</span>
+                        <span className={cn("text-right font-mono text-[12px]", r.slowedDown ? "font-semibold text-foreground" : "text-muted-foreground")} title={r.previousTps !== null ? `${tps(r.previousTps)} tok/s ${against}` : `Not used ${against}`}>
+                          {label ?? "—"}
+                        </span>
+                        <Squares count={starts.length}>
+                          {r.cells.map((c, i) => c ? (
+                            <span key={starts[i]} title={`${bucketLabel(c.t, bucket)}: ${tps(c.tps)} tok/s, ${Math.round(c.ratio * 100)}% of its usual · ${c.rated.toLocaleString()} requests`} className="block h-[22px] rounded-[4px]" style={{ background: r.few ? "hsl(240 5% 13%)" : shade(c.ratio) }} />
+                          ) : (
+                            <span key={starts[i]} title={`${bucketLabel(starts[i], bucket)}: no requests`} className="block h-[22px] rounded-[4px] border border-dashed border-border" />
+                          ))}
+                        </Squares>
+                        <span aria-hidden className="flex justify-end text-muted-foreground">{!single && <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", isOpen && "rotate-90")} />}</span>
+                      </button>
+                    {isOpen && <Detail row={r} bucket={bucket} onModel={onModel} logsFor={logsFor} single={single} />}
+                  </div>
                 );
               })}
-            </tbody>
-          </table>
-        </div>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 px-[18px] py-3 text-[12px] text-secondary-foreground">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <span>Compared with its usual speed:</span>
+              <span className="inline-flex gap-[3px]" aria-hidden>{SHADE_STEPS.map((c) => <span key={c} className="h-3 w-4 rounded-[3px]" style={{ background: c }} />)}</span>
+              <span>usual → half speed or worse</span>
+              <span className="ml-2 inline-flex items-center gap-1.5"><span className="h-2.5 w-3.5 rounded-[3px] border border-dashed border-border" />no requests</span>
+            </div>
+            {!single && few.length > 0 && (
+              <button type="button" onClick={() => setShowFew((v) => !v)} className="hover:text-foreground">
+                {showFew ? `Hide the ${few.length} with few requests` : `Show ${few.length} more with fewer than ${FEW_REQUESTS} requests`}
+              </button>
+            )}
+          </div>
+          <p className="px-[18px] pb-3.5 text-[11.5px] text-muted-foreground">Successful, uncached requests only. Audio, image and embedding models aren&apos;t listed: they don&apos;t produce tokens a second.</p>
+        </>
       )}
     </Panel>
   );

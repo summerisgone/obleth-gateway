@@ -42,7 +42,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-async function render(model = "") {
+async function render(model = "", modelTypes: Record<string, string> = {}) {
   const onModel = vi.fn();
   await act(async () => {
     root.render(
@@ -53,6 +53,7 @@ async function render(model = "") {
           filters={{ tenantId: "", keyId: "", model }}
           against="the previous period"
           retentionDays={180}
+          modelTypes={modelTypes}
           onModel={onModel}
           logsFor={(extra) => `/logs?model=${extra?.model ?? ""}`}
         />
@@ -73,30 +74,38 @@ describe("ModelSpeed", () => {
 
   it("lists models that produced tokens, busiest first, and calls out one that slowed down", async () => {
     await render();
-    const models = [...host.querySelectorAll("tbody tr")].map((tr) => tr.querySelector("td")!.textContent);
+    const models = [...host.querySelectorAll("button[aria-expanded]")].map((b) => b.textContent ?? "");
     expect(models[0]).toContain("muse");
     expect(models[1]).toContain("glm-5-3");
     expect(models.join(" ")).not.toContain("embed");
     expect(host.textContent).toContain("▼ 50%");
     expect(host.textContent).toContain("1 slowed down by 20% or more");
-    expect(host.textContent).toContain("fastest muse at 82.0 tok/s");
+    expect(host.textContent).toContain("Fastest muse · 82.0 tok/s");
   });
 
-  it("takes a model off the chart when its row is clicked, and reports on one model", async () => {
+  it("leaves out models that are not chat models", async () => {
+    await render("", { muse: "audio_speech" });
+    expect(host.textContent).not.toContain("muse");
+  });
+
+  it("opens a model with its facts, its days and a way to report on it alone", async () => {
     const onModel = await render();
-    const row = [...host.querySelectorAll("tbody tr")].find((tr) => tr.textContent!.includes("glm-5-3"))!;
-    expect(row.getAttribute("aria-selected")).toBe("true");
+    const row = [...host.querySelectorAll("button[aria-expanded]")].find((b) => b.textContent!.includes("glm-5-3"))!;
+    expect(row.getAttribute("aria-expanded")).toBe("false");
     await act(async () => { (row as HTMLElement).click(); });
-    expect(row.getAttribute("aria-selected")).toBe("false");
-    const only = [...row.querySelectorAll("button")].find((b) => b.textContent === "only")!;
+    expect(row.getAttribute("aria-expanded")).toBe("true");
+    expect(host.textContent).toContain("Down to the slowest tenth");
+    expect(host.textContent).toContain("No requests on 6 days.");
+    expect(host.querySelector('svg[role="img"]')).not.toBeNull();
+    const only = [...host.querySelectorAll("button")].find((b) => b.textContent === "Report on this model only")!;
     await act(async () => { only.click(); });
     expect(onModel).toHaveBeenCalledWith("glm-5-3");
   });
 
-  it("filters to one model and draws its slowest tenth", async () => {
+  it("filters to one model and opens it", async () => {
     await render("glm-5-3");
     expect(calls.every((u) => u.includes("model=glm-5-3"))).toBe(true);
     expect(host.textContent).toContain("How fast glm-5-3 answered");
-    expect(host.textContent).toContain("Slowest tenth of requests");
+    expect(host.textContent).toContain("Down to the slowest tenth");
   });
 });

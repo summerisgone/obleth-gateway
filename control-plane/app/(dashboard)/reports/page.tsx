@@ -20,6 +20,7 @@ export default async function ReportsPage() {
       keys={keys}
       models={models.map((m) => m.model_name).sort((a, b) => a.localeCompare(b))}
       retentionDays={retention?.days ?? null}
+      modelTypes={Object.fromEntries(models.map((m) => [m.model_name, m.model_type]))}
     />
   );
 }

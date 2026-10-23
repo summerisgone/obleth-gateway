@@ -101,7 +101,7 @@ function ChartTip({ active, payload, label, measure, series }: { active?: boolea
   );
 }
 
-export function ReportsDashboard({ tenants, keys, models, retentionDays = null }: { tenants: Tenant[]; keys: ApiKey[]; models: string[]; retentionDays?: number | null }) {
+export function ReportsDashboard({ tenants, keys, models, retentionDays = null, modelTypes }: { tenants: Tenant[]; keys: ApiKey[]; models: string[]; retentionDays?: number | null; modelTypes?: Record<string, string> }) {
   const [preset, setPreset] = useState<RangePreset>("month");
   const [custom, setCustom] = useState<DateRange | undefined>();
   const [picker, setPicker] = useState(false);
@@ -291,7 +291,7 @@ export function ReportsDashboard({ tenants, keys, models, retentionDays = null }
         </div>
       </Panel>
 
-      <ModelSpeed range={range} previous={prev} filters={filters} against={against} retentionDays={retentionDays} onModel={setModel} logsFor={(extra) => logsFor(extra)} />
+      <ModelSpeed range={range} previous={prev} filters={filters} against={against} retentionDays={retentionDays} modelTypes={modelTypes} onModel={setModel} logsFor={(extra) => logsFor(extra)} />
 
       <div className="grid gap-4 lg:grid-cols-2">
         <Panel title="Teams by spend" subtitle="Click a team to see only its usage">
