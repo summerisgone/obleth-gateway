@@ -29,6 +29,7 @@ export function RoutingSection({ settings, models, readiness }: { settings: Auto
   const [classifier, setClassifier] = useState(settings.classifier_model ?? "");
   const [anthropic, setAnthropic] = useState(settings.messages_default_model ?? "");
   const [verdicts, setVerdicts] = useState(settings.verdicts_default_model ?? "");
+  const [sticky, setSticky] = useState(settings.sticky_enabled);
   const [advanced, setAdvanced] = useState(false);
   const profile = routerProfileOf(v);
   const set = <K extends keyof RouterValues>(k: K, value: RouterValues[K]) => setV((x) => ({ ...x, [k]: value }));
@@ -98,6 +99,9 @@ export function RoutingSection({ settings, models, readiness }: { settings: Auto
           <Switch name="routing.difficulty" label="Send hard questions to stronger models" checked={v.difficulty} onChange={(on) => set("difficulty", on)} />
           {v.difficulty && <div className="w-60"><SelectField label="How strength is judged" value={v.tier_source} onChange={(t) => set("tier_source", t as RouterValues["tier_source"])} options={TIERS} /></div>}
         </div>
+      </Setting>
+      <Setting id="set-sticky" label="Conversations" hint="Keep each conversation on the model that answered it. Move up to a stronger model only when an answer goes wrong: the user says so, asks for a retry, or an agent's tools keep failing." fields={["routing.sticky"]}>
+        <Switch name="routing.sticky" label="Stay with a model while it answers well" checked={sticky} onChange={setSticky} />
       </Setting>
       <Setting id="set-anthropic" label="Anthropic clients" hint="The model a /v1/messages request gets when it names a Claude model obleth doesn't have." fields={["routing.messages_default_model"]} was={{ field: "routing.messages_default_model" }}>
         <div className="w-64"><SelectField name="routing.messages_default_model" label="Default for Anthropic clients" value={anthropic} onChange={setAnthropic} options={[{ value: "", label: "None: refuse the request" }, { value: "auto", label: "auto" }, ...names.map((n) => ({ value: n, label: n }))]} /></div>

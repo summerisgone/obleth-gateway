@@ -948,6 +948,7 @@ async fn proxy_handler_inner(
     let mut variant: Option<String> = None;
     let mut lifecycle: Option<crate::lifecycle::Notice> = None;
     let mut reasoning: Option<crate::reasoning::Note> = None;
+    let mut auto_note: Option<crate::sticky::Note> = None;
     let resp = run_pipeline(
         state,
         req,
@@ -955,6 +956,7 @@ async fn proxy_handler_inner(
         &mut variant,
         &mut lifecycle,
         &mut reasoning,
+        &mut auto_note,
     )
     .await;
     let mut resp = with_variant_header(resp, variant.as_deref());
@@ -962,6 +964,9 @@ async fn proxy_handler_inner(
         crate::lifecycle::apply_headers(&mut resp, notice);
     }
     if let Some(note) = &reasoning {
+        note.apply_headers(&mut resp);
+    }
+    if let Some(note) = &auto_note {
         note.apply_headers(&mut resp);
     }
     resp
@@ -1013,6 +1018,7 @@ async fn run_pipeline(
     served_variant: &mut Option<String>,
     lifecycle_notice: &mut Option<crate::lifecycle::Notice>,
     reasoning_note: &mut Option<crate::reasoning::Note>,
+    auto_note: &mut Option<crate::sticky::Note>,
 ) -> Response<Body> {
     let request_start = Instant::now();
     let proxy_start_ms = crate::tracer::now_ms();
@@ -1240,6 +1246,9 @@ async fn run_pipeline(
     // swap does not affect it (the tokenizer ignores the `model` field).
     let mut est = state.tokenizer.estimate_request(&json);
 
+    // The routed `auto` turn, stored once it is answered when stickiness is on.
+    let mut sticky_turn: Option<crate::sticky::Turn> = None;
+
     // ---- auto model selection ----
     // `model: "auto"` is resolved to a concrete registered model from request
     // shape (estimated context size, required capabilities) and live load. From
@@ -1277,20 +1286,36 @@ async fn run_pipeline(
         // neutral default.
         let available_tags = union_candidate_tags(&candidates, allowed);
         let effort_header = headers.get("x-obleth-effort").and_then(|v| v.to_str().ok());
+        // With stickiness on, find the model that answered this conversation's
+        // last turn before deciding anything.
+        let conversation = if router_settings.sticky_enabled {
+            Some(crate::sticky::lookup(&state, &resolved.tenant_id, &json).await)
+        } else {
+            None
+        };
         let classifier_start = if traced { crate::tracer::now_ms() } else { 0 };
-        let intent = derive_intent(
-            &state,
-            &json,
-            est.input_tokens as u64,
-            &available_tags,
-            &router_settings,
-            effort_header,
-            // The classifier model reads the prompt, and on this path intent is
-            // derived before the tenant input guardrails run: under an input
-            // policy, route on the header and heuristics instead.
-            has_input_guardrails(&resolved),
-        )
-        .await;
+        // The classifier model reads the prompt, and on this path intent is
+        // derived before the tenant input guardrails run: under an input
+        // policy, route on the header and heuristics instead.
+        let skip_classifier = has_input_guardrails(&resolved);
+        let (intent, complaint) = tokio::join!(
+            derive_intent(
+                &state,
+                &json,
+                est.input_tokens as u64,
+                &available_tags,
+                &router_settings,
+                effort_header,
+                skip_classifier,
+            ),
+            crate::sticky::complaint(
+                &state,
+                &router_settings,
+                conversation.as_ref(),
+                &json,
+                skip_classifier,
+            ),
+        );
         // Wall-clock around the whole of intent derivation (header parse,
         // classifier round-trip when active, heuristic fallback otherwise), not
         // an isolated classifier timer — `derive_intent` is where that round-trip
@@ -1318,6 +1343,31 @@ async fn run_pipeline(
         } else {
             0.0
         };
+        // A sticky turn routes over a narrowed pool: the incumbent alone, or
+        // the models at or above the conversation's rung.
+        let choice = conversation.as_ref().map(|c| {
+            let mut observed = c.observed.clone();
+            observed.complaint = complaint;
+            crate::sticky::choose(&candidates, c.record.as_ref(), &intent, &observed, |pool| {
+                crate::router::select_model(
+                    pool,
+                    &features,
+                    &busyness,
+                    &expected_output,
+                    allowed,
+                    &intent.tags,
+                    grants,
+                    &weights,
+                    uniform,
+                    intent.difficulty,
+                )
+                .is_some()
+            })
+        });
+        let pool: &[crate::router::Candidate] = choice
+            .as_ref()
+            .and_then(|c| c.pool.as_deref())
+            .unwrap_or(&candidates);
         // Traced requests get the full explanation from a single `route()` call
         // (one `evaluate`, one `uniform` draw) so the span describes exactly the
         // sample that was served. Untraced requests call `select_model` instead,
@@ -1325,7 +1375,7 @@ async fn run_pipeline(
         // that is the whole cost story for this feature: zero by default.
         let picked = if let Some(ref mut t) = tracer {
             let (picked, mut explain) = crate::router::route(
-                &candidates,
+                pool,
                 &features,
                 &busyness,
                 &expected_output,
@@ -1337,23 +1387,39 @@ async fn run_pipeline(
                 &intent,
             );
             explain.classifier_ms = classifier_ms;
+            let mut span = serde_json::to_value(&explain).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "chosen": explain.chosen,
+                    "error": "explanation failed to serialize",
+                })
+            });
+            if let (Some(c), Some(obj)) = (choice.as_ref(), span.as_object_mut()) {
+                obj.insert(
+                    "sticky".into(),
+                    serde_json::json!({
+                        "reason": c.reason.as_str(),
+                        "incumbent": conversation
+                            .as_ref()
+                            .and_then(|c| c.record.as_ref())
+                            .map(|r| r.model.clone()),
+                        "floor": c.floor,
+                        "domains": c.domains,
+                        "strikes": c.strikes,
+                    }),
+                );
+            }
             t.record(
                 "auto_route",
                 "proxy_request",
                 auto_start,
                 (crate::tracer::now_ms() - auto_start) as u32,
                 "ok",
-                serde_json::to_value(&explain).unwrap_or_else(|_| {
-                    serde_json::json!({
-                        "chosen": explain.chosen,
-                        "error": "explanation failed to serialize",
-                    })
-                }),
+                span,
             );
             picked
         } else {
             crate::router::select_model(
-                &candidates,
+                pool,
                 &features,
                 &busyness,
                 &expected_output,
@@ -1368,6 +1434,28 @@ async fn run_pipeline(
         match picked {
             Some(chosen) => {
                 tracing::debug!(chosen = %chosen.model_name, "auto-routed request");
+                let reason = choice.as_ref().map(|c| c.reason);
+                state.metrics.record_auto_route(
+                    &chosen.model_name,
+                    reason.map_or("per_turn", |r| r.as_str()),
+                );
+                if let (Some(conversation), Some(choice)) = (conversation, choice.as_ref()) {
+                    if let Some(c) = pool
+                        .iter()
+                        .find(|c| c.model.model_name == chosen.model_name)
+                    {
+                        sticky_turn = Some(crate::sticky::Turn::new(
+                            resolved.tenant_id,
+                            conversation,
+                            choice,
+                            c,
+                        ));
+                    }
+                }
+                *auto_note = Some(crate::sticky::Note {
+                    model: chosen.model_name.clone(),
+                    reason,
+                });
                 model = chosen.model_name.clone();
                 // Candidates are real models only, never variants.
                 (Some(Arc::new(chosen)), None)
@@ -1869,17 +1957,30 @@ async fn run_pipeline(
     let admission_start = crate::tracer::now_ms();
     let pool = admission_pool(route.as_deref());
     let admit_wait = admission_timeout();
-    let admit = state.fairshare.admit_to(
-        pool,
-        admit_request_for(
-            &resolved,
-            &model,
-            route.as_deref(),
-            effective_weight,
-            est.total(),
-            end_user.as_deref(),
-        ),
+    // Session affinity can only keep a conversation warm on an upstream it
+    // keeps going back to.
+    let mut admit_req = admit_request_for(
+        &resolved,
+        &model,
+        route.as_deref(),
+        effective_weight,
+        est.total(),
+        end_user.as_deref(),
     );
+    if route_keeps_sessions(route.as_deref()) {
+        admit_req = admit_req.session(req_meta.session_id.as_str());
+    }
+    if let Some(r) = route
+        .as_deref()
+        .filter(|r| !r.session_affinity.is_default())
+    {
+        // The model's own session affinity setting, over the gateway's.
+        admit_req = admit_req.session_affinity(r.session_affinity.resolve(
+            state.session_affinity.is_some(),
+            &state.session_affinity_settings,
+        ));
+    }
+    let admit = state.fairshare.admit_to(pool, admit_req);
     let admitted = match timeout(admit_wait, admit).await {
         Ok(Some(a)) => a,
         Err(_) => {
@@ -2843,7 +2944,12 @@ async fn run_pipeline(
                 && matches!(p.action, obleth_config::GuardrailsAction::LogOnly)
         })
         .cloned();
-    let mut output_monitor = scan_policy.as_ref().map(|_| {
+    // A sticky `auto` turn is stored under the answer the client receives,
+    // so only a successful one is watched for it.
+    if status_code != 200 {
+        sticky_turn = None;
+    }
+    let mut output_monitor = (scan_policy.is_some() || sticky_turn.is_some()).then(|| {
         crate::output_monitor::OutputMonitor::new(content_type_str.contains("text/event-stream"))
     });
 
@@ -2918,7 +3024,13 @@ async fn run_pipeline(
                         )
                     };
                     let total_ms = request_start.elapsed().as_millis() as u32;
-                    accounting.monitor(scan_policy.as_ref(), output_monitor);
+                    let finished = output_monitor.map(crate::output_monitor::OutputMonitor::finish);
+                    accounting.monitor(scan_policy.as_ref(), finished.as_ref());
+                    if let (false, 200, Some(turn), Some(Ok(done))) =
+                        (cut, settled.status, sticky_turn, finished.as_ref())
+                    {
+                        turn.record(&accounting.state, done);
+                    }
                     let _ = settle_guard.complete(accounting.settle_with(
                         settled.tokens, ttft_ms, total_ms, settled.status, None, settled.billed,
                     )).await;
@@ -3195,6 +3307,9 @@ async fn run_pipeline(
         let _ = settle_guard
             .complete(accounting.settle(tokens, ttft_ms, total_ms, status_code, cache_put))
             .await;
+        if let (Some(turn), Some(done)) = (sticky_turn.take(), completion.as_ref()) {
+            turn.record(&state, done);
+        }
 
         let mut builder = Response::builder()
             .status(status_code)
@@ -3339,7 +3454,8 @@ async fn run_pipeline(
 
         let usage = extract_usage(&String::from_utf8_lossy(&tail));
         let total_ms = request_start.elapsed().as_millis() as u32;
-        accounting.monitor(scan_policy.as_ref(), output_monitor);
+        let finished = output_monitor.map(crate::output_monitor::OutputMonitor::finish);
+        accounting.monitor(scan_policy.as_ref(), finished.as_ref());
 
         // A failure the upstream reported in the bytes it sent.
         let failure = failure_watch.as_mut().and_then(|w| w.finish());
@@ -3398,6 +3514,9 @@ async fn run_pipeline(
                 yield item;
             }
         } else {
+            if let (None, Some(turn), Some(Ok(done))) = (&failure, sticky_turn, finished.as_ref()) {
+                turn.record(&accounting.state, done);
+            }
             // The bytes already went to the client as the upstream sent them;
             // a failure it reported in them is recorded as one.
             if let Some(failure) = &failure {
@@ -3916,10 +4035,10 @@ impl StreamAccounting {
     fn monitor(
         &self,
         policy: Option<&obleth_config::GuardrailsPolicy>,
-        monitor: Option<crate::output_monitor::OutputMonitor>,
+        finished: Option<&Result<serde_json::Value, &'static str>>,
     ) {
-        if let (Some(policy), Some(monitor)) = (policy, monitor) {
-            match monitor.finish() {
+        if let (Some(policy), Some(finished)) = (policy, finished) {
+            match finished {
                 Ok(completion) => crate::boons::guardrails::monitor_output(
                     &self.state,
                     &self.state.boons.settings().guardrails,
@@ -3927,7 +4046,7 @@ impl StreamAccounting {
                     &self.resolved,
                     &self.meta.session_id,
                     self.request_id,
-                    &completion,
+                    completion,
                 ),
                 Err(reason) => {
                     tracing::warn!(request_id = %self.request_id, reason, "output monitoring skipped")
@@ -4472,7 +4591,25 @@ pub(crate) fn admit_request_for(
         key_max_in_flight: positive(resolved.key_max_in_flight),
         cost,
         end_user,
+        session: None,
+        affinity: Default::default(),
     }
+}
+
+/// Whether a route sends every request of one conversation to the same
+/// upstream, so the conversation's prompt cache can stay warm there: one
+/// usable endpoint (or none, the model's own base), or any selection mode
+/// but `load_balance`, which spreads requests across endpoints.
+fn route_keeps_sessions(route: Option<&ResolvedModel>) -> bool {
+    let Some(route) = route else {
+        return false;
+    };
+    let usable = route
+        .endpoints
+        .iter()
+        .filter(|e| e.enabled && e.healthy)
+        .count();
+    usable <= 1 || route.endpoint_selection_mode != "load_balance"
 }
 
 /// Header a shared front end names each request's end user with, for keys
@@ -6315,6 +6452,9 @@ pub(crate) fn resolve_conversation(
         json.get("metadata")
             .and_then(|m| m.get("session_id"))
             .and_then(|v| v.as_str()),
+        // OpenAI's prompt-cache routing key: the client's own grouping of
+        // requests that share a prefix.
+        json.get("prompt_cache_key").and_then(|v| v.as_str()),
     ];
     for c in body_ids.into_iter().flatten() {
         if !c.trim().is_empty() {
@@ -6344,22 +6484,34 @@ pub(crate) fn resolve_conversation(
     }
 }
 
-/// Maximum seed text hashed; bounds work on huge system prompts. The same
+/// Maximum seed text hashed from each part (the leading system/developer
+/// text, then the first user message); bounds work on huge prompts. The same
 /// leading bytes are replayed every turn, so capping stays stable.
 const SEED_CAP: usize = 8 * 1024;
 
 /// Build the stable conversation seed: leading system/developer message text up
 /// to and including the first user message. `None` when there are no messages
 /// or no text to hash (e.g. embeddings, image-only first turn with no system).
+///
+/// The first user message has a budget of its own: clients that share one
+/// long system prompt across every conversation are told apart only by it.
+/// A seed that fits in one cap hashes the same as it did under a shared one.
 fn conversation_seed(json: &serde_json::Value) -> Option<String> {
     let messages = json.get("messages")?.as_array()?;
     let mut seed = String::new();
     for msg in messages {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         match role {
-            "system" | "developer" => push_capped(&mut seed, &message_text(msg.get("content"))),
+            "system" | "developer" => {
+                push_capped(&mut seed, &message_text(msg.get("content")), SEED_CAP)
+            }
             "user" => {
-                push_capped(&mut seed, &message_text(msg.get("content")));
+                // The separator `push_capped` adds is not part of the budget.
+                let budget = match seed.len() {
+                    0 => SEED_CAP,
+                    n => n + 1 + SEED_CAP,
+                };
+                push_capped(&mut seed, &message_text(msg.get("content")), budget);
                 break; // first user turn closes the seed
             }
             _ => {}
@@ -6372,16 +6524,16 @@ fn conversation_seed(json: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Append up to the seed cap, with a separator so adjacent messages can't merge
-/// into a colliding blob.
-fn push_capped(seed: &mut String, text: &str) {
-    if seed.len() >= SEED_CAP || text.is_empty() {
+/// Append until the seed is `limit` bytes long, with a separator so adjacent
+/// messages can't merge into a colliding blob.
+fn push_capped(seed: &mut String, text: &str, limit: usize) {
+    if seed.len() >= limit || text.is_empty() {
         return;
     }
     if !seed.is_empty() {
         seed.push('\u{1f}'); // unit separator
     }
-    let room = SEED_CAP - seed.len();
+    let room = limit.saturating_sub(seed.len());
     if text.len() <= room {
         seed.push_str(text);
     } else {
@@ -6596,15 +6748,16 @@ mod tests {
     use super::{
         admit_request_for, anthropic_error, apply_multipart_text_view,
         backfill_max_tokens_for_count_tokens, backoff_for, build_targets, build_upstream_url,
-        canonical_post_path, clamp_max_tokens, compute_modality_cost, effective_request_type,
-        end_user_for, forward_headers, has_input_guardrails, has_path_traversal,
-        input_guardrails_unscannable, is_chat_path, is_models_collection, is_models_endpoint,
-        is_multipart_endpoint, is_retryable_status, looks_like_context_length_error,
-        messages_input_estimate, multipart_text_view, output_guardrails_unenforceable,
-        parse_multipart, prepare_upstream_body, redress_error, request_type_for_path,
-        requires_registered_model, resolve_conversation, response_cache_name, session_hash_order,
-        should_translate_as_stream, strip_beta_query, surface, tenant_active_now, weighted_order,
-        MultipartField, RequestMeta, TooLong, END_USER_HEADER, REGISTERED_MODEL_PATHS,
+        canonical_post_path, clamp_max_tokens, compute_modality_cost, conversation_seed,
+        effective_request_type, end_user_for, forward_headers, has_input_guardrails,
+        has_path_traversal, input_guardrails_unscannable, is_chat_path, is_models_collection,
+        is_models_endpoint, is_multipart_endpoint, is_retryable_status,
+        looks_like_context_length_error, messages_input_estimate, multipart_text_view,
+        output_guardrails_unenforceable, parse_multipart, prepare_upstream_body, redress_error,
+        request_type_for_path, requires_registered_model, resolve_conversation,
+        response_cache_name, route_keeps_sessions, session_hash_order, should_translate_as_stream,
+        strip_beta_query, surface, tenant_active_now, weighted_order, MultipartField, RequestMeta,
+        TooLong, END_USER_HEADER, REGISTERED_MODEL_PATHS, SEED_CAP,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
@@ -6843,8 +6996,13 @@ mod tests {
         key.internal = true;
         assert!(!has_input_guardrails(&key));
         let src = include_str!("proxy.rs");
-        assert!(src
-            .contains("            has_input_guardrails(&resolved),\n        )\n        .await;"));
+        // Intent and the sticky complaint question both honor the policy.
+        assert!(src.contains("let skip_classifier = has_input_guardrails(&resolved);"));
+        assert_eq!(
+            src.matches("                skip_classifier,\n            ),")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -7884,6 +8042,7 @@ mod tests {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "m".into(),
@@ -8800,6 +8959,64 @@ mod tests {
     }
 
     #[test]
+    fn resolve_reads_prompt_cache_key() {
+        let json = serde_json::json!({
+            "prompt_cache_key": "pck-7",
+            "messages":[{"role":"user","content":"hi"}]
+        });
+        let c = resolve_conversation(&HeaderMap::new(), &json, Uuid::nil(), true);
+        assert_eq!(c.value, "pck-7");
+        assert_eq!(c.source.as_str(), "client");
+    }
+
+    #[test]
+    fn derived_tells_apart_conversations_behind_a_long_system_prompt() {
+        let tid = Uuid::nil();
+        let system = "s".repeat(3 * SEED_CAP);
+        let opening = |task: &str| {
+            serde_json::json!({"messages":[
+                {"role":"system","content":system},
+                {"role":"user","content":task}
+            ]})
+        };
+        let a = resolve_conversation(&HeaderMap::new(), &opening("fix the parser"), tid, true);
+        let b = resolve_conversation(&HeaderMap::new(), &opening("write the docs"), tid, true);
+        assert_ne!(
+            a.value, b.value,
+            "the first user message must reach the hash"
+        );
+        let later = serde_json::json!({"messages":[
+            {"role":"system","content":system},
+            {"role":"user","content":"fix the parser"},
+            {"role":"assistant","content":"Reading it."},
+            {"role":"tool","content":"fn parse() {}"},
+            {"role":"user","content":"now run the tests"}
+        ]});
+        let a2 = resolve_conversation(&HeaderMap::new(), &later, tid, true);
+        assert_eq!(
+            a.value, a2.value,
+            "a conversation keeps its id across turns"
+        );
+    }
+
+    #[test]
+    fn seed_under_one_cap_is_unchanged() {
+        // What a single shared cap produced: every part in full, separated.
+        let json = serde_json::json!({"messages":[
+            {"role":"system","content":"You are helpful."},
+            {"role":"developer","content":"Answer briefly."},
+            {"role":"user","content":"What is Rust?"}
+        ]});
+        assert_eq!(
+            conversation_seed(&json).as_deref(),
+            Some("You are helpful.\u{1f}Answer briefly.\u{1f}What is Rust?")
+        );
+        let lone = "u".repeat(2 * SEED_CAP);
+        let json = serde_json::json!({"messages":[{"role":"user","content":lone}]});
+        assert_eq!(conversation_seed(&json).map(|s| s.len()), Some(SEED_CAP));
+    }
+
+    #[test]
     fn derivation_disabled_yields_none() {
         let json = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
         let c = resolve_conversation(&HeaderMap::new(), &json, Uuid::nil(), false);
@@ -8862,6 +9079,34 @@ mod tests {
     }
 
     #[test]
+    fn sessions_stay_put_unless_load_balanced_across_endpoints() {
+        let two = || {
+            vec![
+                endpoint("a", "http://a/v1", 100, 100, true, true),
+                endpoint("b", "http://b/v1", 100, 100, true, true),
+            ]
+        };
+        let mode = |endpoints, mode: &str| {
+            let mut m = model_with(endpoints);
+            m.endpoint_selection_mode = mode.to_string();
+            m
+        };
+        assert!(!route_keeps_sessions(None));
+        assert!(route_keeps_sessions(Some(&mode(
+            Vec::new(),
+            "load_balance"
+        ))));
+        assert!(route_keeps_sessions(Some(&mode(two(), "failover"))));
+        assert!(route_keeps_sessions(Some(&mode(two(), "session_hash"))));
+        assert!(!route_keeps_sessions(Some(&mode(two(), "load_balance"))));
+        let one_up = vec![
+            endpoint("a", "http://a/v1", 100, 100, true, true),
+            endpoint("b", "http://b/v1", 100, 100, true, false),
+        ];
+        assert!(route_keeps_sessions(Some(&mode(one_up, "load_balance"))));
+    }
+
+    #[test]
     fn credential_routing_prefers_key_path_for_secret_keys() {
         // A minted secret must never be mistaken for a JWT even if it were to
         // contain dots; and a JWT must never be hashed as a secret.
@@ -8910,6 +9155,7 @@ mod tests {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: name.to_string(),
@@ -9361,6 +9607,20 @@ mod lifecycle_tests {
         assert!(h[check..ret].contains("finalize("));
         assert!(h[check..ret].contains("Admission::Rejected"));
         assert!(h[check..ret].contains("StatusCode::BAD_REQUEST.as_u16()"));
+    }
+
+    #[test]
+    fn a_models_session_affinity_setting_goes_with_its_admission() {
+        let h = squash(handler());
+        let set = h
+            .find("admit_req=admit_req.session_affinity(r.session_affinity.resolve(")
+            .expect("the model's setting is resolved");
+        let admit = h
+            .find("state.fairshare.admit_to(pool,admit_req)")
+            .expect("admission");
+        assert!(set < admit);
+        // Only a model with a setting of its own overrides the scheduler's.
+        assert!(h[..set].contains(".filter(|r|!r.session_affinity.is_default())"));
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ mod router;
 mod search;
 mod speech;
 mod state;
+mod sticky;
 mod upstream_failure;
 mod verdicts;
 
@@ -113,6 +114,17 @@ async fn main() -> anyhow::Result<()> {
         cfg.fairshare_algorithm,
         cfg.default_model_max_in_flight,
     );
+    if let Some(affinity) = cfg.fairshare_session_affinity {
+        tracing::info!(
+            warm_secs = affinity.warm_ttl.as_secs(),
+            hold_ms = affinity.hold.as_millis() as u64,
+            max_jumps = affinity.max_jumps,
+            max_bypass_secs = affinity.max_bypass.as_secs(),
+            max_held_percent = affinity.max_held_percent,
+            "fairshare session affinity on"
+        );
+        fairshare.set_session_affinity(Some(affinity));
+    }
     // Cluster-wide limits: with shared slots on and more than one replica
     // live, every admission takes a slot in Redis against the configured
     // (undivided) limits; alone, admission stays local. When shared slots are
@@ -440,6 +452,8 @@ async fn main() -> anyhow::Result<()> {
                 )
             })
             .unwrap_or(true),
+        session_affinity: cfg.fairshare_session_affinity,
+        session_affinity_settings: cfg.fairshare_session_affinity_settings,
         compressor: crate::boons::compressor::CompressorClient::from_env(),
         energy: energy.clone(),
         jwt,
@@ -811,6 +825,10 @@ async fn metrics_handler(
     state.metrics.set_fairshare_slot_mode(
         state.fs.mode(),
         state.fs.cluster_in_flight.load(Ordering::Relaxed) as i64,
+    );
+    state.metrics.set_session_affinity(
+        state.fs.held.load(Ordering::Relaxed) as i64,
+        &state.fs.affinity,
     );
     for (discovery_state, count) in state.capacity_discovery.state_counts() {
         state
@@ -1591,6 +1609,7 @@ mod registry_refresh_tests {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             variants: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),

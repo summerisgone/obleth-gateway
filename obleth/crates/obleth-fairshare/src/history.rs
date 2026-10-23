@@ -243,6 +243,7 @@ mod tests {
             cluster_in_flight: None,
             queued,
             borrowed: 0,
+            held: 0,
             groups,
             tenants: Vec::new(),
             keys: Vec::new(),

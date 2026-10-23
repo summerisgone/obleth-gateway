@@ -4,6 +4,17 @@
 use serde_json::{json, Value};
 
 const MAX_BYTES: usize = 512 * 1024;
+/// Streamed tool calls are indexed by the upstream; an index past this is
+/// treated as invalid output rather than allocated.
+const MAX_TOOL_CALLS: usize = 64;
+
+/// One streamed tool call, assembled from its deltas.
+#[derive(Default)]
+struct ToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
 
 pub(crate) struct OutputMonitor {
     sse: bool,
@@ -11,6 +22,8 @@ pub(crate) struct OutputMonitor {
     pending: Vec<u8>,
     event: Vec<u8>,
     channels: [String; 4],
+    tool_calls: Vec<ToolCall>,
+    finish_reason: Option<String>,
     failed: bool,
 }
 
@@ -22,6 +35,8 @@ impl OutputMonitor {
             pending: Vec::new(),
             event: Vec::new(),
             channels: Default::default(),
+            tool_calls: Vec::new(),
+            finish_reason: None,
             failed: false,
         }
     }
@@ -56,6 +71,8 @@ impl OutputMonitor {
         self.pending = Vec::new();
         self.event = Vec::new();
         self.channels = Default::default();
+        self.tool_calls = Vec::new();
+        self.finish_reason = None;
     }
 
     fn line(&mut self) {
@@ -96,6 +113,37 @@ impl OutputMonitor {
                 channel.push_str(text);
             }
         }
+        if let Some(calls) = value
+            .pointer("/choices/0/delta/tool_calls")
+            .and_then(Value::as_array)
+        {
+            for call in calls {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if index >= MAX_TOOL_CALLS {
+                    self.fail();
+                    return;
+                }
+                if self.tool_calls.len() <= index {
+                    self.tool_calls.resize_with(index + 1, ToolCall::default);
+                }
+                let slot = &mut self.tool_calls[index];
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    slot.id = id.to_string();
+                }
+                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                    slot.name.push_str(name);
+                }
+                if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                    slot.arguments.push_str(args);
+                }
+            }
+        }
+        if let Some(reason) = value
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            self.finish_reason = Some(reason.to_string());
+        }
     }
 
     pub(crate) fn finish(mut self) -> Result<Value, &'static str> {
@@ -112,11 +160,22 @@ impl OutputMonitor {
         if self.failed {
             return Err("invalid SSE output");
         }
-        Ok(json!({"choices": [{"message": {
+        let mut message = json!({
             "content": self.channels[0], "reasoning_content": self.channels[1],
             "reasoning": self.channels[2],
             "provider_specific_fields": {"reasoning": self.channels[3]}
-        }}]}))
+        });
+        if !self.tool_calls.is_empty() {
+            message["tool_calls"] = self
+                .tool_calls
+                .iter()
+                .map(|c| {
+                    json!({"id": c.id, "type": "function",
+                        "function": {"name": c.name, "arguments": c.arguments}})
+                })
+                .collect();
+        }
+        Ok(json!({"choices": [{"message": message, "finish_reason": self.finish_reason}]}))
     }
 }
 
@@ -167,6 +226,24 @@ mod tests {
             monitor.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"clean\"}}]}\n\n");
             assert!(monitor.finish().is_err());
         }
+    }
+
+    #[test]
+    fn streamed_tool_calls_and_the_finish_reason_are_assembled() {
+        let wire = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"cmd\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut monitor = OutputMonitor::new(true);
+        monitor.push(wire.as_bytes());
+        let done = monitor.finish().unwrap();
+        let call = &done["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["function"]["name"], "bash");
+        assert_eq!(call["function"]["arguments"], "{\"cmd\":\"ls\"}");
+        assert_eq!(done["choices"][0]["finish_reason"], "tool_calls");
     }
 
     #[test]

@@ -448,6 +448,7 @@ fn merge_pool(
         cluster_in_flight: None,
         queued: acc.queued,
         borrowed: groups.iter().map(|g| g.borrowed).sum(),
+        held: 0,
         groups,
         tenants,
         keys,

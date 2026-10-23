@@ -279,6 +279,7 @@ mod tests {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: name.to_string(),

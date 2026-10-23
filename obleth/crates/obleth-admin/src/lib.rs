@@ -214,6 +214,7 @@ pub fn router(state: AdminState) -> Router {
             get(get_usage_series_tenants),
         )
         .route("/api/v1/usage/series/models", get(get_usage_series_models))
+        .route("/api/v1/usage/speed", get(get_usage_speed))
         .route("/api/v1/usage/breakdown", get(get_usage_breakdown))
         .route("/api/v1/usage/cache", get(get_cache_stats))
         .route("/api/v1/usage/logs", get(get_usage_logs))
@@ -279,6 +280,10 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/api/v1/models/:id/rejected-request-fields",
             put(set_model_rejected_request_fields),
+        )
+        .route(
+            "/api/v1/models/:id/session-affinity",
+            put(set_model_session_affinity),
         )
         .route(
             "/api/v1/model-families",
@@ -1105,6 +1110,10 @@ pub struct CreateModel {
     /// be one. Omitted = none.
     #[serde(default)]
     pub rejected_request_fields: Option<Vec<String>>,
+    /// The model's own session affinity setting. Omitted = follows the
+    /// gateway.
+    #[serde(default)]
+    pub session_affinity: Option<obleth_config::ModelSessionAffinity>,
 }
 
 /// One variant in a model write: a name that resolves to the model with extra
@@ -1226,6 +1235,10 @@ pub struct UpdateModel {
     /// unchanged and `[]` removes them all.
     #[serde(default)]
     pub rejected_request_fields: Option<Vec<String>>,
+    /// Replaces the model's session affinity setting; omitted leaves it
+    /// unchanged and `{}` makes the model follow the gateway again.
+    #[serde(default)]
+    pub session_affinity: Option<obleth_config::ModelSessionAffinity>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1971,6 +1984,9 @@ pub struct ModelRouteView {
     /// because the model's backend cannot handle them. Set with
     /// `PUT /api/v1/models/{id}/rejected-request-fields`.
     pub rejected_request_fields: Vec<String>,
+    /// The model's own session affinity setting; `{}` follows the gateway.
+    /// Set with `PUT /api/v1/models/{id}/session-affinity`.
+    pub session_affinity: obleth_config::ModelSessionAffinity,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -2142,6 +2158,7 @@ impl From<ModelRoute> for ModelRouteView {
             reasoning,
             listed,
             rejected_request_fields,
+            session_affinity,
             description,
             upstream_model,
             api_base,
@@ -2200,6 +2217,7 @@ impl From<ModelRoute> for ModelRouteView {
             reasoning,
             listed,
             rejected_request_fields,
+            session_affinity,
             description,
             upstream_model,
             api_base,
@@ -2582,6 +2600,9 @@ pub struct AutoRouterSettingsView {
     pub difficulty_enabled: bool,
     /// `"hybrid" | "derived" | "declared"`.
     pub tier_source: String,
+    /// Keep a conversation on the model that answered its last turn until
+    /// that model is not doing a good job.
+    pub sticky_enabled: bool,
     /// Model or alias served for unknown model names on `/v1/messages`;
     /// `None` means such requests get `not_found_error`.
     pub messages_default_model: Option<String>,
@@ -2607,6 +2628,7 @@ impl AutoRouterSettingsView {
             temperature: s.temperature,
             difficulty_enabled: s.difficulty_enabled,
             tier_source: tier_source_as_str(s.tier_source).to_string(),
+            sticky_enabled: s.sticky_enabled,
             messages_default_model: s.messages_default_model.clone(),
             verdicts_default_model: s.verdicts_default_model.clone(),
         }
@@ -2638,6 +2660,8 @@ pub struct UpdateAutoRouterSettings {
     /// leave the persisted `tier_source` untouched.
     #[serde(default)]
     pub tier_source: Option<String>,
+    #[serde(default)]
+    pub sticky_enabled: Option<bool>,
     /// Model or alias served for unknown model names on `/v1/messages`.
     /// Empty string clears it.
     #[serde(default)]
@@ -2700,6 +2724,7 @@ fn merge_auto_router(
             .as_deref()
             .and_then(parse_tier_source)
             .unwrap_or(existing.tier_source),
+        sticky_enabled: body.sticky_enabled.unwrap_or(existing.sticky_enabled),
         messages_default_model,
         verdicts_default_model,
     }
@@ -5077,6 +5102,22 @@ async fn get_usage_series_models(
 }
 
 #[utoipa::path(
+    get, path = "/api/v1/usage/speed", tag = "usage",
+    params(usage::UsageSpeedQuery),
+    responses((status = 200, body = [usage::ModelSpeedPoint]))
+)]
+async fn get_usage_speed(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::UsageSpeedQuery>,
+) -> Result<Json<Vec<usage::ModelSpeedPoint>>> {
+    if let Some(tz) = &q.tz {
+        tz.parse::<chrono_tz::Tz>()
+            .map_err(|_| AdminError::BadRequest(format!("unknown time zone: {tz}")))?;
+    }
+    Ok(Json(usage::query_usage_speed(&state.clickhouse, q).await?))
+}
+
+#[utoipa::path(
     get, path = "/api/v1/usage/cache", tag = "usage",
     params(usage::UsageQuery),
     responses((status = 200, body = usage::CacheStats))
@@ -7048,6 +7089,10 @@ async fn create_model(
         .transpose()
         .map_err(AdminError::BadRequest)?
         .unwrap_or_default();
+    let session_affinity = body.session_affinity.unwrap_or_default();
+    session_affinity
+        .validate()
+        .map_err(AdminError::BadRequest)?;
     let aliases = validate_aliases(
         &state,
         body.aliases.as_deref().unwrap_or_default(),
@@ -7149,6 +7194,15 @@ async fn create_model(
             .set_model_rejected_request_fields(model.id, &rejected_request_fields)
             .await?
     };
+    // Set the same way, before the first publish.
+    let model = if session_affinity.is_default() {
+        model
+    } else {
+        state
+            .store
+            .set_model_session_affinity(model.id, &session_affinity)
+            .await?
+    };
     // Staged the same way, before the first publish.
     let model = if initial_status == obleth_config::ModelStatus::Staged {
         let lifecycle = obleth_config::ModelLifecycle {
@@ -7237,6 +7291,9 @@ async fn update_model(
         .map(obleth_config::validate_rejected_request_fields)
         .transpose()
         .map_err(AdminError::BadRequest)?;
+    if let Some(affinity) = &body.session_affinity {
+        affinity.validate().map_err(AdminError::BadRequest)?;
+    }
     let api_key = body.api_key.as_deref().or(existing.api_key.as_deref());
     let quantization = match body.quantization.as_deref() {
         Some(q) => validate_quantization(q)?,
@@ -7348,6 +7405,15 @@ async fn update_model(
             state
                 .store
                 .set_model_rejected_request_fields(id, &fields)
+                .await?
+        }
+        _ => model,
+    };
+    let model = match body.session_affinity {
+        Some(affinity) if affinity != model.session_affinity => {
+            state
+                .store
+                .set_model_session_affinity(id, &affinity)
                 .await?
         }
         _ => model,
@@ -7663,6 +7729,37 @@ async fn set_model_rejected_request_fields(
             serde_json::json!({
                 "model_name": model.model_name,
                 "rejected_request_fields": model.rejected_request_fields,
+            }),
+        )
+        .await?;
+    Ok(Json(model.into()))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/models/{id}/session-affinity", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = obleth_config::ModelSessionAffinity,
+    responses((status = 200, body = ModelRouteView), (status = 400), (status = 404))
+)]
+async fn set_model_session_affinity(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<obleth_config::ModelSessionAffinity>,
+) -> Result<Json<ModelRouteView>> {
+    body.validate().map_err(AdminError::BadRequest)?;
+    let model = state.store.set_model_session_affinity(id, &body).await?;
+    sync_model(&state, &model).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_model_session_affinity",
+            "model",
+            &id.to_string(),
+            serde_json::json!({
+                "model_name": model.model_name,
+                "session_affinity": body,
             }),
         )
         .await?;
@@ -9143,6 +9240,7 @@ fn resolved_model_of(
         reasoning: model.reasoning.clone(),
         listed: model.listed,
         rejected_request_fields: model.rejected_request_fields.clone(),
+        session_affinity: model.session_affinity,
         description: model.description.clone(),
         variants: model.variants.clone(),
         upstream_model: model.upstream_model.clone(),
@@ -9743,6 +9841,102 @@ mod tests {
             .delete_model(created["id"].as_str().unwrap().parse().unwrap())
             .await
             .ok();
+    }
+
+    /// A model's session affinity setting goes through create, update, its
+    /// own endpoint and the read views, checked on every write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn session_affinity_round_trips_through_the_api() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let name = format!("msa-{}", Uuid::new_v4());
+        let base = serde_json::json!({
+            "model_name": name,
+            "upstream_model": "served-model",
+            "api_base": "http://127.0.0.1:9/v1",
+        });
+
+        let mut bad = base.clone();
+        bad["session_affinity"] = serde_json::json!({"max_held_percent": 101});
+        let (status, body) = send(&t.app, json_request("POST", "/api/v1/models", bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let (status, plain) =
+            send(&t.app, json_request("POST", "/api/v1/models", base.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{plain}");
+        assert_eq!(plain["session_affinity"], serde_json::json!({}));
+        t.store
+            .delete_model(plain["id"].as_str().unwrap().parse().unwrap())
+            .await
+            .ok();
+
+        let mut create = base.clone();
+        create["session_affinity"] = serde_json::json!({"enabled": true, "max_held_percent": 50});
+        let (status, created) = send(&t.app, json_request("POST", "/api/v1/models", create)).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(
+            created["session_affinity"],
+            serde_json::json!({"enabled": true, "max_held_percent": 50})
+        );
+        let id = created["id"].as_str().unwrap().to_string();
+
+        // Omitted on update leaves the setting alone.
+        let (status, updated) = send(
+            &t.app,
+            json_request("PUT", &format!("/api/v1/models/{id}"), base.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["session_affinity"]["max_held_percent"], 50);
+
+        let mut replace = base.clone();
+        replace["session_affinity"] = serde_json::json!({"enabled": false});
+        let (status, updated) = send(
+            &t.app,
+            json_request("PUT", &format!("/api/v1/models/{id}"), replace),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(
+            updated["session_affinity"],
+            serde_json::json!({"enabled": false})
+        );
+
+        let path = format!("/api/v1/models/{id}/session-affinity");
+        let (status, body) = send(
+            &t.app,
+            json_request("PUT", &path, serde_json::json!({"max_bypass_secs": 0})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let own = serde_json::json!({
+            "enabled": true,
+            "hold_ms": 5000,
+            "max_held_percent": 50,
+            "max_bypass_secs": 120,
+        });
+        let (status, set) = send(&t.app, json_request("PUT", &path, own.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{set}");
+        assert_eq!(set["session_affinity"], own);
+        let (status, read) = send(
+            &t.app,
+            json_request(
+                "GET",
+                &format!("/api/v1/models/{id}"),
+                serde_json::Value::Null,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(read["session_affinity"], own);
+        let (status, cleared) =
+            send(&t.app, json_request("PUT", &path, serde_json::json!({}))).await;
+        assert_eq!(status, StatusCode::OK, "{cleared}");
+        assert_eq!(cleared["session_affinity"], serde_json::json!({}));
+
+        t.store.delete_model(id.parse().unwrap()).await.ok();
     }
 
     /// The discovered mode's fields go through create, update and the
@@ -11277,6 +11471,9 @@ mod tests {
                 global_cap: 64,
                 tenant_cap: None,
                 key_cap: None,
+                hold: None,
+                redeem_only: false,
+                starving: false,
             };
             use obleth_fairshare::SharedSlots;
             other.acquire(claim).await.expect("claimed");
@@ -11578,6 +11775,7 @@ mod tests {
             ("/api/v1/usage/logs/{request_id}/spans", "get"),
             ("/api/v1/models/{id}/managed/provision-error", "patch"),
             ("/api/v1/models/{id}/rejected-request-fields", "put"),
+            ("/api/v1/models/{id}/session-affinity", "put"),
         ] {
             assert!(
                 doc["paths"][path][method].is_object(),
@@ -12282,6 +12480,7 @@ mod tests {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             variants: Vec::new(),
             description: String::new(),
             upstream_model: name.to_string(),

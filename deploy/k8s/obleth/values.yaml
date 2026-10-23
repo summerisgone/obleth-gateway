@@ -43,6 +43,27 @@ obleth:
   # Seconds of scheduler history each replica keeps in memory for the
   # dashboard's activity chart (sampled every 2 s). 0 disables it.
   fairshareHistorySecs: 3600
+  # Session affinity, for agent workloads that outrun the capacity they
+  # share. An agent sends a session's steps one after another over a growing
+  # prompt, and the backend keeps that prefix cached only until other work
+  # pushes it out. With this on, a session whose last step finished within
+  # warmSecs goes ahead of older requests from the same key (never of other
+  # keys or tenants), and when a step that followed straight on from the
+  # previous one finishes, its slot is held for holdMs for the session's next
+  # step. A held slot counts against the pool, tenant and key like a running
+  # request. A queued request is passed at most maxJumps times, a session is
+  # held for at most maxJumps times in a row while others wait, no more than
+  # maxHeldPercent of a pool's slots are held at once, and a request that has
+  # waited maxBypassSecs is passed by nothing, on any gateway replica. Sessions come from
+  # the client's session id or the derived one, and only on models that keep
+  # a session on one endpoint (not load_balance across several).
+  fairshareSessionAffinity:
+    enabled: false
+    warmSecs: 120
+    holdMs: 3000
+    maxJumps: 8
+    maxBypassSecs: 30
+    maxHeldPercent: 25
   failOpen: true
   # REQUIRED. No default is shipped — supply via `--set obleth.adminToken=...`,
   # a values override, or (preferred) an external Secret. `openssl rand -hex 32`.

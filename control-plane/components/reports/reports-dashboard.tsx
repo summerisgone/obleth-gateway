@@ -9,6 +9,7 @@ import { Bar, CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, 
 import { ArrowDown, ArrowUp, Download, Search } from "lucide-react";
 import { axisTick, chartGrid, compactAxis } from "@/components/chart-tooltip";
 import { ExportSheet } from "@/components/reports/export-sheet";
+import { ModelSpeed } from "@/components/reports/model-speed";
 import { Meter, Panel, Segmented } from "@/components/overview/ui";
 import { Tile } from "@/components/models/ui";
 import { Button } from "@/components/ui/button";
@@ -100,7 +101,7 @@ function ChartTip({ active, payload, label, measure, series }: { active?: boolea
   );
 }
 
-export function ReportsDashboard({ tenants, keys, models }: { tenants: Tenant[]; keys: ApiKey[]; models: string[] }) {
+export function ReportsDashboard({ tenants, keys, models, retentionDays = null, modelTypes }: { tenants: Tenant[]; keys: ApiKey[]; models: string[]; retentionDays?: number | null; modelTypes?: Record<string, string> }) {
   const [preset, setPreset] = useState<RangePreset>("month");
   const [custom, setCustom] = useState<DateRange | undefined>();
   const [picker, setPicker] = useState(false);
@@ -289,6 +290,8 @@ export function ReportsDashboard({ tenants, keys, models }: { tenants: Tenant[];
           </div>
         </div>
       </Panel>
+
+      <ModelSpeed range={range} previous={prev} filters={filters} against={against} retentionDays={retentionDays} modelTypes={modelTypes} onModel={setModel} logsFor={(extra) => logsFor(extra)} />
 
       <div className="grid gap-4 lg:grid-cols-2">
         <Panel title="Teams by spend" subtitle="Click a team to see only its usage">

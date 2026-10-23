@@ -422,6 +422,11 @@ pub struct ModelRoute {
     /// default. `#[serde(default)]` reads older payloads as "none".
     #[serde(default)]
     pub rejected_request_fields: Vec<String>,
+    /// Session affinity for this model's pool: on or off whatever the
+    /// gateway's switch says, and values of its own. `{}` (the default)
+    /// follows the gateway. `#[serde(default)]` reads older payloads so.
+    #[serde(default)]
+    pub session_affinity: ModelSessionAffinity,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -686,6 +691,11 @@ pub struct ResolvedModel {
     /// "none".
     #[serde(default)]
     pub rejected_request_fields: Vec<String>,
+    /// See [`ModelRoute::session_affinity`]. Read per admission.
+    /// `#[serde(default)]` keeps older cached payloads deserializable as
+    /// "follows the gateway".
+    #[serde(default)]
+    pub session_affinity: ModelSessionAffinity,
     /// See [`ModelRoute::description`]. Carried so the discovery endpoints
     /// can say what a model is for. `#[serde(default)]` keeps older cached
     /// payloads deserializable as "no description".
@@ -2349,6 +2359,11 @@ pub struct AutoRouterSettings {
     pub difficulty_enabled: bool,
     #[serde(default)]
     pub tier_source: TierSource,
+    /// When true, a conversation stays on the model that answered its last
+    /// turn until there is evidence that model is not doing a good job, and
+    /// then moves up a level (see `routing::sticky`).
+    #[serde(default)]
+    pub sticky_enabled: bool,
     /// Model or alias served when a request on the Anthropic Messages surface
     /// names a model the gateway does not know (Claude Code sends Anthropic
     /// model ids). `None` means such requests get `not_found_error`.
@@ -2389,6 +2404,7 @@ impl Default for AutoRouterSettings {
             temperature: 0.0,
             difficulty_enabled: false,
             tier_source: TierSource::default(),
+            sticky_enabled: false,
             messages_default_model: None,
             verdicts_default_model: None,
         }
@@ -3415,6 +3431,92 @@ pub fn rejected_request_field<'a>(
         .map(String::as_str)
 }
 
+/// Longest hold a model may set for session affinity, in milliseconds.
+pub const MAX_SESSION_AFFINITY_HOLD_MS: u64 = 60_000;
+
+/// Longest bypass limit a model may set for session affinity, in seconds.
+pub const MAX_SESSION_AFFINITY_BYPASS_SECS: u64 = 3_600;
+
+/// A model's own session affinity setting. Stored as one JSON object on the
+/// model, read tolerantly, so `{}` (the default) follows the gateway: its
+/// `OBLETH_FAIRSHARE_SESSION_AFFINITY` switch and values. Each field set here
+/// replaces the gateway's for this model's pool alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ModelSessionAffinity {
+    /// On or off for this model; absent follows the gateway's switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// How long a slot is held for a session's next step, in ms (0 holds
+    /// nothing, at most 60000); absent uses the gateway's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_ms: Option<u64>,
+    /// The most of the pool's slots held at once, in percent (0 to 100);
+    /// absent uses the gateway's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_held_percent: Option<u8>,
+    /// Seconds after which nothing passes a waiting request and held slots
+    /// give way to it (1 to 3600); absent uses the gateway's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bypass_secs: Option<u64>,
+}
+
+impl ModelSessionAffinity {
+    /// Whether the model follows the gateway in everything.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Refuse values out of range.
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .hold_ms
+            .is_some_and(|ms| ms > MAX_SESSION_AFFINITY_HOLD_MS)
+        {
+            return Err(format!(
+                "session_affinity.hold_ms must be at most {MAX_SESSION_AFFINITY_HOLD_MS}"
+            ));
+        }
+        if self.max_held_percent.is_some_and(|p| p > 100) {
+            return Err("session_affinity.max_held_percent must be 0 to 100".into());
+        }
+        if self
+            .max_bypass_secs
+            .is_some_and(|s| s == 0 || s > MAX_SESSION_AFFINITY_BYPASS_SECS)
+        {
+            return Err(format!(
+                "session_affinity.max_bypass_secs must be 1 to {MAX_SESSION_AFFINITY_BYPASS_SECS}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// What the model's pool runs with, given whether the gateway's switch
+    /// is on and the gateway's values: `None` when affinity is off for it.
+    /// The hold is kept within the bypass limit, as the gateway's is.
+    pub fn resolve(
+        &self,
+        gateway_on: bool,
+        gateway: &crate::config::SessionAffinityConfig,
+    ) -> Option<crate::config::SessionAffinityConfig> {
+        if !self.enabled.unwrap_or(gateway_on) {
+            return None;
+        }
+        let mut c = *gateway;
+        if let Some(secs) = self.max_bypass_secs.filter(|s| *s > 0) {
+            c.max_bypass =
+                std::time::Duration::from_secs(secs.min(MAX_SESSION_AFFINITY_BYPASS_SECS));
+        }
+        if let Some(ms) = self.hold_ms {
+            c.hold = std::time::Duration::from_millis(ms.min(MAX_SESSION_AFFINITY_HOLD_MS));
+        }
+        c.hold = c.hold.min(c.max_bypass);
+        if let Some(p) = self.max_held_percent {
+            c.max_held_percent = p.min(100);
+        }
+        Some(c)
+    }
+}
+
 // ---- config backup / restore ------------------------------------------------
 
 /// File-format discriminator for config backups.
@@ -3610,6 +3712,10 @@ pub struct ModelBackup {
     /// every model as refusing nothing.
     #[serde(default)]
     pub rejected_request_fields: Vec<String>,
+    /// `#[serde(default)]`: a backup taken before the setting existed
+    /// restores every model as following the gateway.
+    #[serde(default)]
+    pub session_affinity: ModelSessionAffinity,
     #[serde(default)]
     pub description: String,
     pub upstream_model: String,
@@ -4562,6 +4668,75 @@ mod tests {
     }
 
     #[test]
+    fn model_session_affinity_follows_the_gateway_unless_set() {
+        use crate::config::SessionAffinityConfig;
+        let gateway = SessionAffinityConfig::settings_from_values(None, None, None, None, None);
+        let follow = ModelSessionAffinity::default();
+        assert!(follow.is_default());
+        assert_eq!(follow.resolve(false, &gateway), None);
+        assert_eq!(follow.resolve(true, &gateway), Some(gateway));
+
+        let off = ModelSessionAffinity {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(off.resolve(true, &gateway), None);
+
+        let own = ModelSessionAffinity {
+            enabled: Some(true),
+            hold_ms: Some(5_000),
+            max_held_percent: Some(50),
+            max_bypass_secs: Some(120),
+        };
+        let c = own.resolve(false, &gateway).expect("on for this model");
+        assert_eq!(c.hold, std::time::Duration::from_millis(5_000));
+        assert_eq!(c.max_held_percent, 50);
+        assert_eq!(c.max_bypass, std::time::Duration::from_secs(120));
+        assert_eq!(c.warm_ttl, gateway.warm_ttl);
+        assert_eq!(c.max_jumps, gateway.max_jumps);
+
+        // The hold stays within the bypass limit.
+        let short = ModelSessionAffinity {
+            enabled: Some(true),
+            hold_ms: Some(10_000),
+            max_bypass_secs: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            short.resolve(false, &gateway).unwrap().hold,
+            std::time::Duration::from_secs(2)
+        );
+
+        assert!(own.validate().is_ok());
+        for bad in [
+            ModelSessionAffinity {
+                hold_ms: Some(60_001),
+                ..Default::default()
+            },
+            ModelSessionAffinity {
+                max_held_percent: Some(101),
+                ..Default::default()
+            },
+            ModelSessionAffinity {
+                max_bypass_secs: Some(0),
+                ..Default::default()
+            },
+            ModelSessionAffinity {
+                max_bypass_secs: Some(3_601),
+                ..Default::default()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        // Stored as only what is set; unknown and missing fields are read
+        // tolerantly.
+        assert_eq!(serde_json::to_string(&follow).unwrap(), "{}");
+        let read: ModelSessionAffinity =
+            serde_json::from_str(r#"{"enabled":true,"later_field":1}"#).unwrap();
+        assert_eq!(read.enabled, Some(true));
+    }
+
+    #[test]
     fn rejected_request_fields_are_trimmed_deduped_and_checked() {
         assert_eq!(
             validate_rejected_request_fields([" bad_words ", "", "bad_words", "Bad_Words"])
@@ -4835,6 +5010,7 @@ mod tests {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             variants: Vec::new(),
             upstream_model: "glm-5-3-mxfp4".into(),
             api_base: "http://upstream/v1".into(),

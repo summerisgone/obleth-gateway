@@ -77,6 +77,21 @@ afterEach(async () => {
 });
 
 describe("the model settings form", () => {
+  it("shows a model's own session affinity values only while it is on", async () => {
+    await render({ ...model, session_affinity: { enabled: true, max_held_percent: 50 } });
+    const held = host.querySelector<HTMLInputElement>('[name="session_affinity_max_held_percent"]');
+    expect(held?.value).toBe("50");
+    expect(host.querySelector<HTMLInputElement>('[name="session_affinity_hold_ms"]')?.value).toBe("");
+    expect(host.querySelector<HTMLInputElement>('[name="session_affinity_mode"]')?.value).toBe("on");
+    expect(bar()).toBeNull();
+  });
+
+  it("follows the gateway with no values of its own by default", async () => {
+    await render();
+    expect(host.querySelector('[name="session_affinity_max_held_percent"]')).toBeNull();
+    expect(host.querySelector<HTMLInputElement>('[name="session_affinity_mode"]')?.value).toBe("gateway");
+  });
+
   it("opens with nothing to save", async () => {
     await render();
     expect(bar()).toBeNull();

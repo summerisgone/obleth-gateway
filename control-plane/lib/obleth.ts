@@ -185,6 +185,18 @@ export interface ModelFamilyWrite {
   members: FamilyMembers;
 }
 
+/** A model's own session affinity setting. Each field left out uses the gateway's. */
+export interface ModelSessionAffinity {
+  /** On or off for this model; left out follows the gateway's switch. */
+  enabled?: boolean;
+  /** How long a freed slot is kept for the same session's next step, in ms. */
+  hold_ms?: number;
+  /** The most of the model's slots kept at once, in percent. */
+  max_held_percent?: number;
+  /** Seconds a request may wait before nothing passes it any more. */
+  max_bypass_secs?: number;
+}
+
 export interface ModelRoute {
   id: string;
   model_name: string;
@@ -220,6 +232,8 @@ export interface ModelRoute {
   listed?: boolean;
   /** Request body fields refused with a 400 before dispatch, because the model's server cannot handle them. Missing on older gateways (none). */
   rejected_request_fields?: string[];
+  /** The model's own session affinity setting; `{}` follows the gateway. Missing on older gateways. */
+  session_affinity?: ModelSessionAffinity;
   description: string;
   upstream_model: string;
   api_base: string;
@@ -969,6 +983,33 @@ export type UsageDailyGroupBy =
   | "day_model"
   | "day_key_model";
 
+/** `GET /usage/speed`: one model's speed over the window, or one hour or day of it. */
+export interface ModelSpeedPoint {
+  /** Start of the hour or day, epoch millis; 0 for a whole-window row. */
+  bucket_ms: number;
+  model: string;
+  requests: number;
+  /** Successful, uncached requests that produced tokens: the ones a speed was measured on. */
+  rated: number;
+  /** Median output tokens a second, after the first token. */
+  gen_tokens_per_sec: number;
+  /** What the slowest tenth of requests got. */
+  slow_tokens_per_sec: number;
+  /** Median prompt tokens a second before the first token. */
+  prompt_tokens_per_sec: number;
+  p50_ttft_ms: number;
+}
+
+export interface UsageSpeedParams {
+  sinceMs: number;
+  untilMs: number;
+  bucket?: "none" | "hour" | "day";
+  tz?: string;
+  tenantId?: string;
+  keyId?: string;
+  model?: string;
+}
+
 export interface UsageDailyParams {
   startDay: string;
   endDay: string;
@@ -1401,6 +1442,7 @@ export interface AutoRouterSettingsView {
   temperature: number;
   difficulty_enabled: boolean;
   tier_source: "hybrid" | "derived" | "declared";
+  sticky_enabled: boolean;
   messages_default_model: string | null;
   verdicts_default_model: string | null;
 }
@@ -1416,6 +1458,7 @@ export interface UpdateAutoRouterSettings {
   temperature?: number;
   difficulty_enabled?: boolean;
   tier_source?: "hybrid" | "derived" | "declared";
+  sticky_enabled?: boolean;
   messages_default_model?: string | null;
   verdicts_default_model?: string | null;
 }
@@ -2653,6 +2696,18 @@ export const obleth = {
     ),
   costs: (sinceMs?: number) =>
     api<CostAgg[]>(`/costs${qs({ since_ms: sinceMs })}`),
+  usageSpeed: (params: UsageSpeedParams) =>
+    api<ModelSpeedPoint[]>(
+      `/usage/speed${qs({
+        since_ms: params.sinceMs,
+        until_ms: params.untilMs,
+        bucket: params.bucket,
+        tz: params.tz,
+        tenant_id: params.tenantId,
+        key_id: params.keyId,
+        model: params.model,
+      })}`,
+    ),
   usageDaily: (params: UsageDailyParams) =>
     api<UsageDailyRow[]>(
       `/usage/daily${qs({

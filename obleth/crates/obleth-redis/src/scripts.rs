@@ -320,9 +320,23 @@ return { tokens, cost }
 //   limit, `g` for every pool together, `p|<pool>` per pool, and
 //   `t|<pool>|<tenant>` and `k|<pool>|<key>` per tenant and key in a pool,
 //   plus wait markers (`w|<pool>`, and `w` for the global ceiling) holding
-//   the Redis time until which some replica is waiting for a slot there;
+//   the Redis time until which some replica is waiting for a slot there, and
+//   starving markers (`wa|<pool>`) until which a request there has waited
+//   too long for slots to be held;
 // - one holdings hash per replica (`obleth:fairshare:held:<instance>`) with
-//   the same count fields for what that replica holds.
+//   the same count fields for what that replica holds;
+// - one holdings hash per held slot (`obleth:fairshare:hold:<id>`, session
+//   affinity), with the fields of the one slot it keeps for a session's next
+//   step and `h|<pool>`, which the totals also count per pool. The held
+//   slots' ids are in a sorted set (`obleth:fairshare:holds`) scored by
+//   expiry on the Redis clock, and every slot script, and the heartbeat,
+//   frees the ones that ran out (`purge_holds`), as a dead replica's
+//   holdings are freed. A second sorted set (`obleth:fairshare:recent`)
+//   scores each session's hold id by when its last step finished, so a
+//   step can be told to have followed straight on from the one before
+//   whichever replica either ran on, and a hash (`obleth:fairshare:chain`)
+//   counts the holds a session has had in a row while the pool was waited
+//   on, so no session keeps a slot from waiters on other replicas for long.
 //
 // Every change to a holdings hash is applied to the totals in the same
 // script, so the totals are always the sum of the holdings. A replica's
@@ -379,6 +393,24 @@ local function reclaim(totals, held, channel, now)
   end
   redis.call('DEL', held)
 end
+local function purge_holds(totals, holds, prefix, channel, now)
+  local expired = redis.call('ZRANGEBYSCORE', holds, '-inf', now)
+  for _, id in ipairs(expired) do
+    reclaim(totals, prefix .. id, channel, now)
+  end
+  if #expired > 0 then redis.call('ZREMRANGEBYSCORE', holds, '-inf', now) end
+end
+local function free_pool_holds(totals, holds, prefix, channel, now, pool, keep)
+  local lead = pool .. '|'
+  local freed = {}
+  for _, id in ipairs(redis.call('ZRANGE', holds, 0, -1)) do
+    if id ~= keep and string.sub(id, 1, #lead) == lead then
+      reclaim(totals, prefix .. id, channel, now)
+      freed[#freed + 1] = id
+    end
+  end
+  if #freed > 0 then redis.call('ZREM', holds, unpack(freed)) end
+end
 "#
     };
 }
@@ -388,11 +420,15 @@ end
 /// one round trip.
 ///
 /// KEYS[1] = replica set (sorted set: member = instance id, score = expiry ms)
-/// KEYS[2] = slot totals hash
+/// KEYS[2] = slot totals hash, KEYS[3] = held slot ids (sorted set)
 /// ARGV[1] = instance id
 /// ARGV[2] = heartbeat TTL in ms
 /// ARGV[3] = holdings hash prefix (the instance id is appended)
 /// ARGV[4] = release channel
+/// ARGV[5] = held slot hash prefix (the id is appended)
+///
+/// Held slots that ran out are freed too, so they never outlast the next
+/// heartbeat when no claim comes along to free them.
 ///
 /// Expiry is scored on the Redis clock (`TIME`), not the caller's, so skew
 /// between pods cannot keep a dead replica counted or drop a live one. Expired
@@ -420,6 +456,7 @@ for _, instance in ipairs(expired) do
   reclaim(KEYS[2], ARGV[3] .. instance, ARGV[4], now)
 end
 redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+purge_holds(KEYS[2], KEYS[3], ARGV[5], ARGV[4], now)
 return redis.call('ZCARD', key)
 "#
 );
@@ -476,22 +513,34 @@ return out
 /// Take one cluster-wide slot, checked against every limit at once.
 ///
 /// KEYS[1] = slot totals hash, KEYS[2] = this replica's holdings,
-/// KEYS[3] = replica set
+/// KEYS[3] = replica set, KEYS[4] = held slot ids
 /// ARGV[1] = instance id, ARGV[2] = pool id, ARGV[3] = tenant, ARGV[4] = key
 /// ARGV[5] = pool cap, ARGV[6] = global cap,
 /// ARGV[7] = tenant cap (0: none), ARGV[8] = key cap (0: none)
 /// ARGV[9] = how long a refusal marks the pool as waited on, in ms
+/// ARGV[10] = held slot hash prefix, ARGV[11] = release channel,
+/// ARGV[12] = id of a slot held for this claim's session ('' for none),
+/// ARGV[13] = '1' to take only that held slot,
+/// ARGV[14] = '1' when a request for the pool has waited too long to keep
+/// yielding to held slots
 ///
 /// A replica whose heartbeat has expired may not take slots: its holdings
-/// are about to be (or have been) reclaimed. Otherwise, if the pool, the
+/// are about to be (or have been) reclaimed. Held slots that ran out are
+/// freed first. A claim with ARGV[14] marks the pool as starving for ARGV[9]
+/// (`wa|<pool>`), so no slot is held there meanwhile, and frees the pool's
+/// held slots other than its own. If a slot is still held under ARGV[12], the claim takes it
+/// over: its counts move into this replica's holdings and the totals stay as
+/// they are, since it never stopped counting. A claim for a held slot alone
+/// stops there when none is held. Otherwise, if the pool, the
 /// global count, the tenant and the key are all under their caps, all four
 /// counters are taken together, in the totals and in the holdings; if any is
 /// at its cap nothing is taken and the pool (or, for the global ceiling, the
 /// ceiling) is marked as waited on, so the next release there publishes.
 ///
 /// Returns `{code, pool count, global count}`, counts after the call. Codes:
-/// 1 granted, 0 pool full, -1 global ceiling full, -2 tenant cap, -3 key cap,
-/// -4 not live.
+/// 1 granted, 2 took over a held slot, 3 no slot held (claim for a held
+/// slot alone), 0 pool full, -1 global ceiling full, -2 tenant cap, -3 key
+/// cap, -4 not live.
 pub const SLOT_ACQUIRE: &str = concat!(
     slot_helpers!(),
     r#"
@@ -501,13 +550,41 @@ local pf = 'p|' .. pool
 local tf = 't|' .. pool .. '|' .. ARGV[3]
 local kf = 'k|' .. pool .. '|' .. ARGV[4]
 local now = now_ms()
+
+local live = tonumber(redis.call('ZSCORE', KEYS[3], ARGV[1]))
+if live == nil or live <= now then
+  local c = redis.call('HMGET', totals, 'g', pf)
+  return { -4, tonumber(c[2]) or 0, tonumber(c[1]) or 0 }
+end
+
+purge_holds(totals, KEYS[4], ARGV[10], ARGV[11], now)
+if ARGV[14] == '1' then
+  redis.call('HSET', totals, 'wa|' .. pool, now + tonumber(ARGV[9]))
+  free_pool_holds(totals, KEYS[4], ARGV[10], ARGV[11], now, pool, ARGV[12])
+end
 local c = redis.call('HMGET', totals, 'g', pf, tf, kf)
 local g, p = tonumber(c[1]) or 0, tonumber(c[2]) or 0
 local tn, kn = tonumber(c[3]) or 0, tonumber(c[4]) or 0
 
-local live = tonumber(redis.call('ZSCORE', KEYS[3], ARGV[1]))
-if live == nil or live <= now then
-  return { -4, p, g }
+if ARGV[12] ~= '' then
+  local hold = ARGV[10] .. ARGV[12]
+  local h = redis.call('HGETALL', hold)
+  if #h > 0 then
+    for i = 1, #h, 2 do
+      local n = tonumber(h[i + 1]) or 0
+      if string.sub(h[i], 1, 2) == 'h|' then
+        adjust(totals, h[i], -n)
+      else
+        redis.call('HINCRBY', held, h[i], n)
+      end
+    end
+    redis.call('DEL', hold)
+    redis.call('ZREM', KEYS[4], ARGV[12])
+    return { 2, p, g }
+  end
+  if ARGV[13] == '1' then
+    return { 3, p, g }
+  end
 end
 
 local tcap, kcap = tonumber(ARGV[7]), tonumber(ARGV[8])
@@ -559,6 +636,101 @@ for _, f in ipairs({ 'g', pf, 't|' .. pool .. '|' .. ARGV[2], 'k|' .. pool .. '|
   end
 end
 if freed == 1 then wake(totals, pool, ARGV[4], now_ms()) end
+local c = redis.call('HMGET', totals, pf, 'g')
+return { freed, tonumber(c[1]) or 0, tonumber(c[2]) or 0 }
+"#
+);
+
+/// Keep one slot this replica holds for a session's next step, instead of
+/// giving it back.
+///
+/// KEYS[1] = slot totals hash, KEYS[2] = this replica's holdings,
+/// KEYS[3] = held slot ids, KEYS[4] = sessions' last finished steps,
+/// KEYS[5] = sessions' holds in a row while waited on
+/// ARGV[1] = pool id, ARGV[2] = tenant, ARGV[3] = key, ARGV[4] = release
+/// channel, ARGV[5] = held slot hash prefix, ARGV[6] = hold id,
+/// ARGV[7] = how long to hold it, in ms, ARGV[8] = most slots the pool may
+/// have held at once, ARGV[9] = how long ago the finished step arrived, in
+/// ms, ARGV[10] = how long a session's last finish is remembered, in ms,
+/// ARGV[11] = most holds in a row while the pool is waited on
+///
+/// Held slots that ran out are freed first, and finishes older than
+/// ARGV[10] forgotten with their counts. This finish is recorded under the
+/// id. Then, if the step arrived within ARGV[7] of the session's previous
+/// step finishing, no claim has marked the pool as starving lately (see
+/// `SLOT_ACQUIRE`), the session has had fewer than ARGV[11] holds in a row
+/// while some replica waited on the pool (or the ceiling) or nobody waits
+/// now, this replica holds a slot in the pool, the pool has fewer than
+/// ARGV[8] held and nothing is held under the id yet, the slot's counts
+/// move from this replica's
+/// holdings to the held slot's hash, which also counts `h|<pool>` (in the
+/// totals too), and the id is scored by expiry. The totals' `g`, `p|`, `t|`
+/// and `k|` stay as they are: a held slot still counts against every limit.
+/// A hold while the pool is waited on adds one to the session's count, one
+/// while nobody waits clears it. Otherwise the slot is released exactly as
+/// `SLOT_RELEASE` does and the count is cleared: the session has given way.
+///
+/// Returns `{code, pool count, global count}`: 2 held, else what
+/// `SLOT_RELEASE` returns (1 freed, 0 nothing to free).
+pub const SLOT_HOLD: &str = concat!(
+    slot_helpers!(),
+    r#"
+local totals, held, holds, recent, chain = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
+local pool = ARGV[1]
+local pf = 'p|' .. pool
+local hf = 'h|' .. pool
+local now = now_ms()
+purge_holds(totals, holds, ARGV[5], ARGV[4], now)
+local cutoff = now - tonumber(ARGV[10])
+for _, id in ipairs(redis.call('ZRANGEBYSCORE', recent, '-inf', cutoff)) do
+  redis.call('HDEL', chain, id)
+end
+redis.call('ZREMRANGEBYSCORE', recent, '-inf', cutoff)
+local prev = tonumber(redis.call('ZSCORE', recent, ARGV[6]))
+redis.call('ZADD', recent, now, ARGV[6])
+local chained = prev ~= nil and (now - tonumber(ARGV[9])) - prev <= tonumber(ARGV[7])
+local w = redis.call('HMGET', totals, 'w|' .. pool, 'w', 'wa|' .. pool)
+local waited = (tonumber(w[1]) or 0) > now or (tonumber(w[2]) or 0) > now
+local starving = (tonumber(w[3]) or 0) > now
+if w[3] and not starving then redis.call('HDEL', totals, 'wa|' .. pool) end
+local run = tonumber(redis.call('HGET', chain, ARGV[6])) or 0
+local fields = { 'g', pf, 't|' .. pool .. '|' .. ARGV[2], 'k|' .. pool .. '|' .. ARGV[3] }
+local hold = ARGV[5] .. ARGV[6]
+
+if chained
+  and not starving
+  and (not waited or run < tonumber(ARGV[11]))
+  and (tonumber(redis.call('HGET', held, pf)) or 0) > 0
+  and (tonumber(redis.call('HGET', totals, hf)) or 0) < tonumber(ARGV[8])
+  and redis.call('EXISTS', hold) == 0 then
+  for _, f in ipairs(fields) do
+    if (tonumber(redis.call('HGET', held, f)) or 0) > 0 then
+      adjust(held, f, -1)
+      redis.call('HINCRBY', hold, f, 1)
+    end
+  end
+  redis.call('HINCRBY', hold, hf, 1)
+  redis.call('HINCRBY', totals, hf, 1)
+  redis.call('ZADD', holds, now + tonumber(ARGV[7]), ARGV[6])
+  if waited then
+    redis.call('HSET', chain, ARGV[6], run + 1)
+  else
+    redis.call('HDEL', chain, ARGV[6])
+  end
+  local c = redis.call('HMGET', totals, pf, 'g')
+  return { 2, tonumber(c[1]) or 0, tonumber(c[2]) or 0 }
+end
+
+redis.call('HDEL', chain, ARGV[6])
+local freed = 0
+for _, f in ipairs(fields) do
+  if (tonumber(redis.call('HGET', held, f)) or 0) > 0 then
+    adjust(held, f, -1)
+    adjust(totals, f, -1)
+    if f == pf then freed = 1 end
+  end
+end
+if freed == 1 then wake(totals, pool, ARGV[4], now) end
 local c = redis.call('HMGET', totals, pf, 'g')
 return { freed, tonumber(c[1]) or 0, tonumber(c[2]) or 0 }
 "#

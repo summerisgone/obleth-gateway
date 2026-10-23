@@ -77,6 +77,29 @@ pub struct UsageBreakdownQuery {
     pub include_internal: Option<bool>,
 }
 
+/// Filters for `GET /api/v1/usage/speed`: how fast each model answered over a
+/// window, as one row per model or one per model per hour or day.
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct UsageSpeedQuery {
+    /// Inclusive lower bound, unix epoch millis. Defaults to the last 24h.
+    pub since_ms: Option<i64>,
+    /// Exclusive upper bound, unix epoch millis. Defaults to now.
+    pub until_ms: Option<i64>,
+    /// `none` (default) for one row per model over the whole window, or
+    /// `hour` / `day` for one row per model per hour or day.
+    pub bucket: Option<String>,
+    /// IANA time zone the hours and days are cut in. Defaults to UTC.
+    pub tz: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub tenant_id: Option<Uuid>,
+    #[schema(value_type = Option<String>)]
+    pub key_id: Option<Uuid>,
+    pub model: Option<String>,
+    /// When true, include internal traffic (health probes, benchmark runs)
+    /// that is excluded from this read by default.
+    pub include_internal: Option<bool>,
+}
+
 /// Date-range read against the permanent daily rollup (`usage_daily`).
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct UsageDailyQuery {
@@ -1272,6 +1295,104 @@ pub async fn query_usage_breakdown_by_model(
         .await
 }
 
+/// One model's speed over a window, or over one hour or day of it. Rates are
+/// per request, so they show what a caller saw whatever the traffic volume.
+/// Only successful, uncached requests that produced tokens are rated.
+#[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
+pub struct ModelSpeedPoint {
+    /// Start of the hour or day, unix epoch millis; 0 for a whole-window row.
+    pub bucket_ms: i64,
+    pub model: String,
+    /// Every request to the model in the bucket, failed and cached included.
+    pub requests: u64,
+    /// The requests a speed was measured on.
+    pub rated: u64,
+    /// Median generation rate: output tokens over the decode window, the
+    /// same definition as `/usage/models`.
+    pub gen_tokens_per_sec: f64,
+    /// The rate the slowest tenth of requests got (10th percentile).
+    pub slow_tokens_per_sec: f64,
+    /// Median prefill rate: prompt tokens over time to first token.
+    pub prompt_tokens_per_sec: f64,
+    /// Median time to first token in milliseconds.
+    pub p50_ttft_ms: f64,
+}
+
+/// Longest window `/usage/speed` cuts into hours; past it, rows are per day.
+const SPEED_MAX_HOURLY_MS: i64 = 31 * 86_400_000;
+
+/// The bucket column for `/usage/speed`. The time zone is a bound value, so
+/// it comes first in the bind order when there is one.
+fn speed_bucket_sql(bucket: &str, span_ms: i64) -> (&'static str, bool) {
+    match bucket {
+        "hour" if span_ms <= SPEED_MAX_HOURLY_MS => (
+            "toInt64(toUnixTimestamp(toStartOfHour(ts, ?))) * 1000",
+            true,
+        ),
+        "hour" | "day" => ("toInt64(toUnixTimestamp(toStartOfDay(ts, ?))) * 1000", true),
+        _ => ("toInt64(0)", false),
+    }
+}
+
+/// Aliases stay clear of the column names the query reads; see [`usage_totals_sql`].
+fn usage_speed_sql(bucket_expr: &str, q: &UsageSpeedQuery) -> String {
+    let rated =
+        "status_code < 400 and cache_status != 'hit' and total_ms >= 20 and output_tokens >= 1";
+    let rate = "output_tokens / (greatest(if(total_ms - ttft_ms >= 20, total_ms - ttft_ms, total_ms - queue_wait_ms), 1) / 1000.)";
+    let prefill =
+        "status_code < 400 and cache_status != 'hit' and ttft_ms >= 20 and input_tokens >= 1";
+    let mut sql = format!(
+        "select {bucket_expr} as bucket_ms, model as model_name, \
+         count() as reqs, \
+         countIf({rated}) as rated_reqs, \
+         round(if(countIf({rated}) > 0, quantileIf(0.5)({rate}, {rated}), 0), 1) as gen_tps, \
+         round(if(countIf({rated}) > 0, quantileIf(0.1)({rate}, {rated}), 0), 1) as slow_tps, \
+         round(if(countIf({prefill}) > 0, quantileIf(0.5)(input_tokens / (greatest(ttft_ms, 1) / 1000.), {prefill}), 0), 1) as prompt_tps, \
+         round(if(countIf({rated} and ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, {rated} and ttft_ms > 0), 0), 1) as p50_ttft \
+         from usage where ts_ms >= ? and ts_ms < ?"
+    );
+    if q.tenant_id.is_some() {
+        sql.push_str(" and tenant_id = toUUID(?)");
+    }
+    if q.key_id.is_some() {
+        sql.push_str(" and key_id = toUUID(?)");
+    }
+    if q.model.is_some() {
+        sql.push_str(" and model = ?");
+    }
+    sql.push_str(&internal_filter(q.include_internal));
+    sql.push_str(" group by bucket_ms, model_name order by bucket_ms, rated_reqs desc");
+    sql
+}
+
+/// Per-model speed for the Reports page. `tz` must already be a valid IANA
+/// name; the handler checks it.
+pub async fn query_usage_speed(
+    client: &clickhouse::Client,
+    q: UsageSpeedQuery,
+) -> Result<Vec<ModelSpeedPoint>, clickhouse::error::Error> {
+    let until = q.until_ms.unwrap_or_else(now_ms);
+    let since = q.since_ms.unwrap_or(until - 86_400_000);
+    let (bucket_expr, binds_tz) =
+        speed_bucket_sql(q.bucket.as_deref().unwrap_or("none"), until - since);
+    let sql = usage_speed_sql(bucket_expr, &q);
+    let mut query = client.query(&sql);
+    if binds_tz {
+        query = query.bind(q.tz.clone().unwrap_or_else(|| "UTC".to_string()));
+    }
+    query = query.bind(since).bind(until);
+    if let Some(tid) = q.tenant_id {
+        query = query.bind(tid.to_string());
+    }
+    if let Some(kid) = q.key_id {
+        query = query.bind(kid.to_string());
+    }
+    if let Some(model) = &q.model {
+        query = query.bind(model.clone());
+    }
+    query.fetch_all::<ModelSpeedPoint>().await
+}
+
 pub async fn query_cache_stats(
     client: &clickhouse::Client,
     q: UsageQuery,
@@ -1822,6 +1943,51 @@ mod alias_tests {
     fn series_aliases_do_not_shadow_columns() {
         assert_no_shadowing(&usage_series_sql(60_000));
         assert_eq!(select_items(&usage_series_sql(60_000)).len(), 10);
+    }
+
+    fn speed_query(filters: bool) -> UsageSpeedQuery {
+        UsageSpeedQuery {
+            since_ms: None,
+            until_ms: None,
+            bucket: None,
+            tz: None,
+            tenant_id: filters.then(Uuid::new_v4),
+            key_id: filters.then(Uuid::new_v4),
+            model: filters.then(|| "m".to_string()),
+            include_internal: None,
+        }
+    }
+
+    #[test]
+    fn speed_aliases_do_not_shadow_columns() {
+        let (expr, _) = speed_bucket_sql("day", 86_400_000);
+        let sql = usage_speed_sql(expr, &speed_query(false));
+        assert_no_shadowing(&sql);
+        assert_eq!(select_items(&sql).len(), 8);
+    }
+
+    #[test]
+    fn speed_binds_one_value_per_placeholder() {
+        for bucket in ["none", "hour", "day", "week"] {
+            for filters in [false, true] {
+                let (expr, tz) = speed_bucket_sql(bucket, 86_400_000);
+                let sql = usage_speed_sql(expr, &speed_query(filters));
+                // tz, then since and until, then one per filter.
+                let binds = usize::from(tz) + 2 + if filters { 3 } else { 0 };
+                assert_eq!(sql.matches('?').count(), binds, "{bucket}: {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn speed_cuts_long_windows_into_days_not_hours() {
+        assert!(speed_bucket_sql("hour", 7 * 86_400_000)
+            .0
+            .contains("toStartOfHour"));
+        assert!(speed_bucket_sql("hour", 90 * 86_400_000)
+            .0
+            .contains("toStartOfDay"));
+        assert_eq!(speed_bucket_sql("none", 0), ("toInt64(0)", false));
     }
 
     #[test]

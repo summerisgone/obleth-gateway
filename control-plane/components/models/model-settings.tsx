@@ -141,6 +141,7 @@ export function ModelSettings({
   const [editType, setEditType] = useState(model.model_type || "chat");
   const [quantization, setQuantization] = useState(model.quantization || "unknown");
   const [selection, setSelection] = useState(model.endpoint_selection_mode);
+  const [affinity, setAffinity] = useState(sessionAffinityMode(model.session_affinity));
   const [bias, setBias] = useState(String(model.route_bias));
   const [mode, setMode] = useState<CapacityMode>(capacityMode(model.capacity_mode));
   const frame = useRef(0);
@@ -441,6 +442,37 @@ export function ModelSettings({
           <Setting id="set-weight" label="Admission weight" hint="This model's share of the gateway when demand is higher than supply." fields={["admission_weight"]} was={{ field: "admission_weight" }}>
             <TextField name="admission_weight" label="Admission weight" type="number" min={1} className="max-w-[10rem]" defaultValue={String(model.admission_weight)} />
           </Setting>
+          <Setting
+            id="set-affinity"
+            label="Session affinity"
+            hint="Lets an agent's next step go first and briefly keeps the slot it just freed, so the model's prompt cache still has its conversation. Other requests can wait a little longer."
+            fields={["session_affinity_mode", "session_affinity_hold_ms", "session_affinity_max_held_percent", "session_affinity_max_bypass_secs"]}
+          >
+            <div className="max-w-sm">
+              <SelectField
+                name="session_affinity_mode"
+                label="Session affinity"
+                value={affinity}
+                onChange={setAffinity}
+                options={[
+                  { value: "gateway", label: "Gateway default", hint: "Follows OBLETH_FAIRSHARE_SESSION_AFFINITY" },
+                  { value: "on", label: "On", hint: "For this model, whatever the gateway default" },
+                  { value: "off", label: "Off", hint: "For this model, whatever the gateway default" },
+                ]}
+              />
+            </div>
+            {affinity === "on" && (
+              <div className="mt-2 flex flex-wrap items-center gap-3 text-[12.5px] text-muted-foreground">
+                keep a freed slot for
+                <TextField name="session_affinity_hold_ms" label="Hold time in milliseconds" type="number" min={0} max={60000} className="w-24" defaultValue={optionalNumber(model.session_affinity?.hold_ms)} placeholder="default" />
+                ms, for at most
+                <TextField name="session_affinity_max_held_percent" label="Most of the slots kept at once, in percent" type="number" min={0} max={100} className="w-20" defaultValue={optionalNumber(model.session_affinity?.max_held_percent)} placeholder="default" />
+                % of the slots; after
+                <TextField name="session_affinity_max_bypass_secs" label="Wait limit in seconds" type="number" min={1} max={3600} className="w-20" defaultValue={optionalNumber(model.session_affinity?.max_bypass_secs)} placeholder="default" />
+                seconds of waiting, nothing goes ahead of a request
+              </div>
+            )}
+          </Setting>
           <Setting id="set-cache" label="Response cache" hint="Answer repeated identical requests from the cache." fields={["cache_enabled", "cache_ttl_secs"]}>
             <div className="flex flex-wrap items-center gap-3 text-[12.5px] text-muted-foreground">
               <Switch name="cache_enabled" label="Response cache" defaultChecked={model.cache_enabled} />
@@ -543,4 +575,15 @@ function RecentChecks({ checks }: { checks: ModelHealthCheck[] }) {
       </table>
     </div>
   );
+}
+
+/** The session affinity picker's value for a model's stored setting. */
+function sessionAffinityMode(setting: ModelRoute["session_affinity"]): string {
+  if (setting?.enabled === true) return "on";
+  if (setting?.enabled === false) return "off";
+  return "gateway";
+}
+
+function optionalNumber(n: number | undefined): string {
+  return n == null ? "" : String(n);
 }

@@ -77,6 +77,15 @@ describe("the Settings page", () => {
     expect(saved().get("routing.difficulty")).toBeNull();
   });
 
+  it("turns on staying with a model for the conversation", async () => {
+    await render(<SettingsPage data={settingsData()} />);
+    await act(async () => host.querySelector<HTMLInputElement>('input[name="routing.sticky"]')!.click());
+    await frame();
+    await act(async () => button("Save changes").click());
+    expect(saved().get("sections")).toBe("routing");
+    expect(saved().get("routing.sticky")).toBe("on");
+  });
+
   it("asks before keeping less history", async () => {
     await render(<SettingsPage data={settingsData()} />);
     await act(async () => button("90 days").click());

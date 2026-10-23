@@ -87,6 +87,12 @@ pub struct Config {
     pub fairshare_replica_ttl: Duration,
     /// Settings for models in the `discovered` capacity mode.
     pub capacity_discovery: CapacityDiscoveryConfig,
+    /// Session affinity in the fairshare queue; `None` while it is off for
+    /// models that do not turn it on themselves.
+    pub fairshare_session_affinity: Option<SessionAffinityConfig>,
+    /// The gateway's session affinity values, whether or not it is on: what
+    /// a model that turns affinity on uses for anything it does not set.
+    pub fairshare_session_affinity_settings: SessionAffinityConfig,
 
     /// Fail-open: keep serving from cache + buffer telemetry to WAL when
     /// Redis/ClickHouse are unavailable. Fail-closed rejects instead.
@@ -202,6 +208,140 @@ impl CapacityDiscoveryConfig {
 impl Default for CapacityDiscoveryConfig {
     fn default() -> Self {
         Self::from_values(None, None, None, None)
+    }
+}
+
+/// Session affinity in the fairshare queue. An agent sends the steps of a
+/// session one after another over a growing prompt, and the upstream keeps
+/// that prefix cached only while other work does not push it out. Affinity
+/// lets a session that is still warm go ahead of older requests from the same
+/// key, and keeps the slot a step frees for the session's next step for a
+/// moment. Off unless `OBLETH_FAIRSHARE_SESSION_AFFINITY` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionAffinityConfig {
+    /// How long after its last step a session counts as warm
+    /// (`OBLETH_FAIRSHARE_SESSION_AFFINITY_WARM_SECS`, default 120).
+    pub warm_ttl: Duration,
+    /// How long a slot is held for a session's next step
+    /// (`OBLETH_FAIRSHARE_SESSION_AFFINITY_HOLD_MS`, default 3000; 0 holds
+    /// nothing). Also the longest gap between one step finishing and the next
+    /// arriving for the session to count as a loop worth holding for. At most
+    /// `max_bypass`.
+    pub hold: Duration,
+    /// How many times a queued request may be passed by later requests of
+    /// its key, by warm sessions or held slots, before it goes next; also
+    /// the most holds in a row a session gets while others wait for the pool
+    /// (`OBLETH_FAIRSHARE_SESSION_AFFINITY_MAX_JUMPS`, default 8, at least 1).
+    pub max_jumps: u32,
+    /// A request that has waited this long is no longer passed over, and
+    /// held slots give way to it
+    /// (`OBLETH_FAIRSHARE_SESSION_AFFINITY_MAX_BYPASS_SECS`, default 30).
+    pub max_bypass: Duration,
+    /// The most of a pool's slots that may be held at once, in percent
+    /// (`OBLETH_FAIRSHARE_SESSION_AFFINITY_MAX_HELD_PERCENT`, default 25,
+    /// at most 100; 0 holds nothing). Rounded up, so any pool can hold one.
+    pub max_held_percent: u8,
+}
+
+impl Default for SessionAffinityConfig {
+    /// The default values, as with no variables set.
+    fn default() -> Self {
+        Self::settings_from_values(None, None, None, None, None)
+    }
+}
+
+impl SessionAffinityConfig {
+    pub const DEFAULT_WARM_SECS: u64 = 120;
+    pub const DEFAULT_HOLD_MS: u64 = 3000;
+    pub const DEFAULT_MAX_JUMPS: u32 = 8;
+    pub const DEFAULT_MAX_BYPASS_SECS: u64 = 30;
+    pub const DEFAULT_MAX_HELD_PERCENT: u8 = 25;
+
+    pub fn from_env() -> Option<Self> {
+        lenient_bool(
+            env::var("OBLETH_FAIRSHARE_SESSION_AFFINITY")
+                .ok()
+                .as_deref(),
+            false,
+        )
+        .then(Self::settings_from_env)
+    }
+
+    /// The configured values whether or not affinity is on, for models that
+    /// turn it on themselves.
+    pub fn settings_from_env() -> Self {
+        let var = |name: &str| env::var(name).ok();
+        Self::settings_from_values(
+            var("OBLETH_FAIRSHARE_SESSION_AFFINITY_WARM_SECS").as_deref(),
+            var("OBLETH_FAIRSHARE_SESSION_AFFINITY_HOLD_MS").as_deref(),
+            var("OBLETH_FAIRSHARE_SESSION_AFFINITY_MAX_JUMPS").as_deref(),
+            var("OBLETH_FAIRSHARE_SESSION_AFFINITY_MAX_BYPASS_SECS").as_deref(),
+            var("OBLETH_FAIRSHARE_SESSION_AFFINITY_MAX_HELD_PERCENT").as_deref(),
+        )
+    }
+
+    /// Build from raw env values; `None` unless `enabled` reads as true.
+    /// Missing or unparseable values take their defaults, and zero where
+    /// zero makes no sense (the warm window, the bypass limit, the jump
+    /// count) does too.
+    pub fn from_values(
+        enabled: Option<&str>,
+        warm_secs: Option<&str>,
+        hold_ms: Option<&str>,
+        max_jumps: Option<&str>,
+        max_bypass_secs: Option<&str>,
+        max_held_percent: Option<&str>,
+    ) -> Option<Self> {
+        lenient_bool(enabled, false).then(|| {
+            Self::settings_from_values(
+                warm_secs,
+                hold_ms,
+                max_jumps,
+                max_bypass_secs,
+                max_held_percent,
+            )
+        })
+    }
+
+    /// [`SessionAffinityConfig::from_values`] without the switch.
+    pub fn settings_from_values(
+        warm_secs: Option<&str>,
+        hold_ms: Option<&str>,
+        max_jumps: Option<&str>,
+        max_bypass_secs: Option<&str>,
+        max_held_percent: Option<&str>,
+    ) -> Self {
+        fn num<T: std::str::FromStr>(v: Option<&str>) -> Option<T> {
+            v.and_then(|s| s.trim().parse().ok())
+        }
+        let warm = num(warm_secs)
+            .filter(|n| *n > 0)
+            .unwrap_or(Self::DEFAULT_WARM_SECS);
+        let max_bypass = Duration::from_secs(
+            num(max_bypass_secs)
+                .filter(|n| *n > 0)
+                .unwrap_or(Self::DEFAULT_MAX_BYPASS_SECS),
+        );
+        let hold = Duration::from_millis(num(hold_ms).unwrap_or(Self::DEFAULT_HOLD_MS));
+        SessionAffinityConfig {
+            warm_ttl: Duration::from_secs(warm),
+            hold: hold.min(max_bypass),
+            max_jumps: num(max_jumps)
+                .filter(|n| *n > 0)
+                .unwrap_or(Self::DEFAULT_MAX_JUMPS),
+            max_bypass,
+            max_held_percent: num::<u8>(max_held_percent)
+                .unwrap_or(Self::DEFAULT_MAX_HELD_PERCENT)
+                .min(100),
+        }
+    }
+
+    /// How many of a pool's `cap` slots may be held at once.
+    pub fn max_held(&self, cap: usize) -> usize {
+        if self.hold.is_zero() {
+            return 0;
+        }
+        (cap * self.max_held_percent as usize).div_ceil(100)
     }
 }
 
@@ -327,6 +467,8 @@ impl Config {
             fairshare_replica_heartbeat,
             fairshare_replica_ttl,
             capacity_discovery: CapacityDiscoveryConfig::from_env(),
+            fairshare_session_affinity: SessionAffinityConfig::from_env(),
+            fairshare_session_affinity_settings: SessionAffinityConfig::settings_from_env(),
             fail_open: require_bool("OBLETH_FAIL_OPEN", true),
             wal_path: env_or("OBLETH_WAL_PATH", "./obleth-telemetry.wal"),
             telemetry_flush_interval: telemetry_flush_interval(
@@ -528,6 +670,52 @@ mod tests {
         assert!(lenient_bool(Some("yes"), false));
         assert!(lenient_bool(Some("garbage"), true));
         assert!(!lenient_bool(None, false));
+    }
+
+    #[test]
+    fn session_affinity_is_off_unless_enabled() {
+        let off = |v| SessionAffinityConfig::from_values(v, None, None, None, None, None);
+        assert_eq!(off(None), None);
+        assert_eq!(off(Some("false")), None);
+        assert_eq!(off(Some("garbage")), None);
+        let on = off(Some("true")).expect("on");
+        assert_eq!(on.warm_ttl, Duration::from_secs(120));
+        assert_eq!(on.hold, Duration::from_millis(3000));
+        assert_eq!(on.max_jumps, 8);
+        assert_eq!(on.max_bypass, Duration::from_secs(30));
+        assert_eq!(on.max_held_percent, 25);
+    }
+
+    #[test]
+    fn session_affinity_parses_and_bounds_its_values() {
+        let c = SessionAffinityConfig::from_values(
+            Some("on"),
+            Some("60"),
+            Some("90000"),
+            Some("0"),
+            Some("20"),
+            Some("250"),
+        )
+        .expect("on");
+        assert_eq!(c.warm_ttl, Duration::from_secs(60));
+        assert_eq!(c.hold, Duration::from_secs(20), "hold capped at max_bypass");
+        assert_eq!(c.max_jumps, 8, "zero jumps falls back to the default");
+        assert_eq!(c.max_held_percent, 100);
+        let none = SessionAffinityConfig::from_values(Some("1"), None, Some("0"), None, None, None)
+            .expect("on");
+        assert_eq!(none.max_held(64), 0, "hold 0 holds nothing");
+    }
+
+    #[test]
+    fn session_affinity_max_held_rounds_up() {
+        let c = SessionAffinityConfig::from_values(Some("1"), None, None, None, None, None)
+            .expect("on");
+        assert_eq!(c.max_held(1), 1);
+        assert_eq!(c.max_held(8), 2);
+        assert_eq!(c.max_held(10), 3);
+        let c = SessionAffinityConfig::from_values(Some("1"), None, None, None, None, Some("0"))
+            .expect("on");
+        assert_eq!(c.max_held(10), 0);
     }
 
     #[test]

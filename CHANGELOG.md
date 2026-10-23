@@ -4,6 +4,50 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v2.4.0
+
+Agent sessions can keep their place on a busy model: with session affinity on, the fairshare scheduler serves a key's warm sessions first and can hold a slot for a session's next step, so its cached prompt is still there when the step arrives. It is off by default and can be turned on for the whole gateway or one model at a time. `auto` can keep a conversation on the model that answered it until an answer goes wrong, and Reports gains a Model speed section.
+
+> **Upgrade notes.** No breaking changes. Postgres migration `0038` only adds a column, and the gateway applies it when it starts. Session affinity and sticky `auto` routing are both off until they are configured. With session affinity off, v2.3.0 and v2.4.0 replicas can share slots during a rolling update; turn it on once every replica runs v2.4.0.
+>
+> - **Behaviour to expect after upgrading:**
+>   - Derived session ids change once for conversations whose system prompt and first user message together were longer than 8 KiB. Those conversations get their own ids instead of sharing one, so the request log groups them apart and `session_hash` routing spreads them across endpoints. Shorter openings hash exactly as before.
+>   - OpenAI's `prompt_cache_key` is read as a session id when the request has no `session_id` or `metadata.session_id`. Clients that send it are grouped into sessions by it and, under `session_hash`, kept on one endpoint per key.
+>   - Responses to `auto` carry `x-obleth-auto-model`.
+
+**Gateway**
+
+- **Session affinity** (off by default). Agents send a session's steps one after another over a growing prompt, and when capacity is short a step that waits behind other sessions often finds its prefix evicted upstream and is prefilled again from scratch. With affinity on, each model pool favours sessions that are still warm.
+  - **Ordering:** a session with a step running, or whose last step finished within `OBLETH_FAIRSHARE_SESSION_AFFINITY_WARM_SECS` (120), goes ahead of older requests from the same key. Which tenant and key is served next is still the fairshare decision.
+  - **Held slots:** when a step that arrived within `..._HOLD_MS` (3000) of the session's previous step finishing is done, its slot is held for that long for the session's next step. A held slot counts against the pool, the global ceiling, the tenant and the key like a running request, so it never lets anyone past a cap or a share, and it is billed to the step that takes it.
+  - **Bounds:** at most `..._MAX_HELD_PERCENT` (25, rounded up) of a pool's slots are held at once. A queued request is passed by later requests of its key at most `..._MAX_JUMPS` (8) times; then it goes next and its key holds nothing until it is served. Once a request has waited `..._MAX_BYPASS_SECS` (30) on any replica, its pool's held slots are freed and no new ones are held until it is served. Holds give way only to queued requests a free slot would actually go to.
+  - **Across replicas:** in shared slot mode holds live in Redis, so a session's next step takes its held slot on whichever replica it lands. New keys: `obleth:fairshare:hold:<id>`, `obleth:fairshare:holds`, `obleth:fairshare:recent` and `obleth:fairshare:chain`, plus `h|<pool>` and `wa|<pool>` fields in the totals hash. A hold nobody takes is freed when it runs out, the way a dead replica's holdings are.
+  - **Scope:** sessions are the client's or the derived session id, scoped to the scheduler key, and only models that send a session to one upstream take part (any endpoint selection but `load_balance` across several endpoints).
+  - **Per model:** a model's `session_affinity` turns it on or off whatever the gateway default, and can set its own `hold_ms` (up to 60000), `max_held_percent` (0 to 100) and `max_bypass_secs` (1 to 3600). Anything left out uses the gateway's values, which are read even while the gateway default is off; `{}` (the default) follows the gateway. Set it with `PUT /api/v1/models/{id}/session-affinity` or the field on model create and update. It is stored in Postgres (migration `0038`) and carried in manifests (exported only when set) and backups. A model that turns affinity off gives back the slots its pool held.
+  - **Metrics:** `obleth_fairshare_held_slots` and `obleth_fairshare_affinity_total{event}` (`jump`, `hold`, `redeem`, `expire`), and each pool in the fairshare snapshot reports `held`.
+- **Sticky `auto` routing** (off by default). With `sticky_enabled` in the routing settings, a conversation stays on the model that answered its last turn and moves up a level only on evidence the model is not doing a good job:
+  - the client sends the same request again after it was answered;
+  - the classifier reads the user's newest message as reporting the last answer as wrong (one more single-token question, asked only on follow-up turns);
+  - the last answer was broken: no content and no tool call, or tool-call arguments that are not JSON;
+  - the model made the same tool calls three turns in a row, or two tool turns in a row came back with errors.
+  
+  A move up raises the conversation's floor one level and leaves the incumbent out. A harder turn raises the floor to its difficulty, and the level never drops. On a topic change the incumbent stays when it holds a level in the new topic at least the turn's difficulty. When the incumbent cannot take a request (down, too little context, a missing capability, no longer allowed) the turn goes to another model at its level or above. The first turn routes as before.
+  
+  The gateway keeps no conversation id and stores none of the conversation's text: after a turn it records the model and level in Redis (`obleth:auto:`, two-hour expiry) under a hash of the user message and the answer, and the next request finds it by hashing its last assistant message. Responses carry `x-obleth-auto-reason` when stickiness is on, `obleth_auto_routes_total{model,reason}` counts picks, and the `auto_route` trace span records the decision.
+- **Derived session ids** give the first user message an 8 KiB budget of its own after the system and developer text. A client whose system prompt alone filled the old shared cap had every conversation of a tenant hashed to one id. `prompt_cache_key` is now read as a client session id (see the upgrade notes).
+- **Model speed API.** `GET /api/v1/usage/speed` returns each model's median and slowest-tenth output tokens a second, first token and prompt speed, for a window or per hour or day cut in the caller's time zone (`bucket`, `tz`), filtered by tenant, key or model. It counts only successful, uncached requests that produced tokens, with the same decode rate as `/usage/models`.
+
+**Dashboard**
+
+- **Reports → Model speed:** one row per chat model with a square per day (or hour, over a day or two), shaded by how that period compared with the model's own usual speed, so a slowdown shows whatever the model's speed. Opening a model shows its median, slowest tenth, first token and prompt speed, a sentence on how its speed went, and a chart aligned with the squares. Models with too few requests to judge sit behind "show more".
+- **Models → Capacity → Session affinity:** Gateway default, On or Off, with the hold time, held share and wait limit shown while it is On (blank uses the gateway's).
+- **Settings → Routing:** a switch for sticky `auto` routing.
+- Next.js 16.4.2 and React 19.3.1, which pick up the Next.js 16.4.1 security fixes (image optimization for SVGs, `use cache` functions returning typed arrays, and a Server Actions denial of service).
+
+**Deployment**
+
+- The Helm chart exposes the session affinity settings under `obleth.fairshareSessionAffinity` (`enabled`, `warmSecs`, `holdMs`, `maxJumps`, `maxBypassSecs`, `maxHeldPercent`), and Docker Compose passes every `OBLETH_FAIRSHARE_SESSION_AFFINITY*` variable through from `.env`.
+
 ## v2.3.0
 
 A new job API, `/v1/meshes`, turns an image into a 3D model, and the Playground has a 3D mode to try it. Energy can be measured per model instead of shared out by hand-set slot counts. The request log now covers MCP calls, keeps a deleted key's name, searches with `*` and filters by several keys, teams or models at once. A model can refuse request fields its server can't handle, and first-token time is recorded only for streamed replies.

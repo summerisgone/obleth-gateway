@@ -39,6 +39,8 @@ pub struct Classifier {
     settings: Arc<ArcSwap<AutoRouterSettings>>,
     /// hash(brain + prompt + available tags) -> classified intent.
     cache: Cache<u64, Intent>,
+    /// hash(brain + message) -> p(the message says the last answer was wrong).
+    complaints: Cache<u64, Option<f64>>,
 }
 
 impl Classifier {
@@ -46,6 +48,10 @@ impl Classifier {
         Self {
             settings: Arc::new(ArcSwap::from_pointee(initial)),
             cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(300))
+                .build(),
+            complaints: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(300))
                 .build(),
@@ -109,6 +115,40 @@ impl Classifier {
     }
 }
 
+impl Classifier {
+    /// p(yes) that `message` says the previous answer was wrong, did not
+    /// work, or missed what was asked; `None` when the brain gave no usable
+    /// answer. Bounded by the same timeout as [`Classifier::classify`].
+    pub async fn complaint(
+        &self,
+        http: &reqwest::Client,
+        brain: &ResolvedModel,
+        message: &str,
+    ) -> Option<f64> {
+        let key = cache_key(&brain.model_name, message, &[COMPLAINT_ID.to_string()]);
+        if let Some(hit) = self.complaints.get(&key).await {
+            return hit;
+        }
+        let timeout = Duration::from_millis(self.settings().classifier_timeout_ms.max(1));
+        let questions = vec![(COMPLAINT_ID.to_string(), complaint_question())];
+        let p = match tokio::time::timeout(timeout, ask(http, brain, message, questions, timeout))
+            .await
+        {
+            Ok(Ok(outcomes)) => complaint_from_outcomes(&outcomes),
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, model = %brain.model_name, "complaint call failed");
+                None
+            }
+            Err(_) => {
+                tracing::debug!(model = %brain.model_name, "complaint call timed out");
+                None
+            }
+        };
+        self.complaints.insert(key, p).await;
+        p
+    }
+}
+
 /// The brain is part of the key: after `classifier_model` changes, answers
 /// cached from the previous brain -- including the empty ones cached after a
 /// failure -- must not be served as the new brain's for the rest of the TTL.
@@ -135,6 +175,9 @@ const TAG_THRESHOLD: f64 = 0.5;
 /// `tag:<name>`.
 const DIFFICULTY_ID: &str = "difficulty";
 
+/// The question id for "does the user say the last answer was wrong".
+const COMPLAINT_ID: &str = "complaint";
+
 /// Ask the brain one single-token verdict question per available tag plus one
 /// for difficulty, concurrently, and assemble the [`Intent`] from the
 /// first-token label distributions. Thinking and harmony-format brains are
@@ -146,6 +189,24 @@ async fn call_brain(
     available_tags: &[String],
     timeout: Duration,
 ) -> anyhow::Result<Intent> {
+    let mut questions: Vec<(String, Question)> =
+        vec![(DIFFICULTY_ID.to_string(), difficulty_question())];
+    for tag in available_tags.iter().take(MAX_TAG_QUESTIONS) {
+        questions.push((format!("tag:{tag}"), tag_question(tag)));
+    }
+    let outcomes = ask(http, brain, prompt, questions, timeout).await?;
+    Ok(intent_from_outcomes(&outcomes))
+}
+
+/// Ask the brain `questions` about `prompt`, one single-token call each,
+/// concurrently over a shared prompt prefix.
+async fn ask(
+    http: &reqwest::Client,
+    brain: &ResolvedModel,
+    prompt: &str,
+    questions: Vec<(String, Question)>,
+    timeout: Duration,
+) -> anyhow::Result<Vec<QuestionOutcome>> {
     // Cap the prompt we forward so the classifier stays fast and cheap,
     // floored to a char boundary (`String::truncate` panics mid-code-point).
     let mut user = prompt.trim();
@@ -163,12 +224,6 @@ async fn call_brain(
          answer label and nothing else — no explanation, no punctuation, no preamble.\n\n\
          # Request\n{user}"
     );
-
-    let mut questions: Vec<(String, Question)> =
-        vec![(DIFFICULTY_ID.to_string(), difficulty_question())];
-    for tag in available_tags.iter().take(MAX_TAG_QUESTIONS) {
-        questions.push((format!("tag:{tag}"), tag_question(tag)));
-    }
 
     let shared = std::sync::Arc::new(SharedPrompt {
         upstream_model: brain.upstream_model.clone(),
@@ -202,7 +257,7 @@ async fn call_brain(
         timeout,
     )
     .await;
-    Ok(intent_from_outcomes(&outcomes))
+    Ok(outcomes)
 }
 
 /// Difficulty as a 3-level score question; level i maps to difficulty i.
@@ -226,6 +281,28 @@ fn tag_question(tag: &str) -> Question {
         )),
         criteria: None,
     }
+}
+
+/// Whether the user is reporting a problem with the answer they got.
+fn complaint_question() -> Question {
+    Question::Boolean {
+        instructions: serde_json::json!(
+            "Is this message saying that a previous answer was wrong, did not work, \
+             or missed what was asked?"
+        ),
+        criteria: None,
+    }
+}
+
+/// p(yes) of the complaint question, or `None` when it failed.
+fn complaint_from_outcomes(outcomes: &[QuestionOutcome]) -> Option<f64> {
+    let outcome = outcomes.iter().find(|o| o.id == COMPLAINT_ID)?;
+    let success = outcome.result.as_ref().ok()?;
+    let labels: Vec<String> = ["yes", "no"].iter().map(|s| s.to_string()).collect();
+    let (masses, in_set) = answers::label_masses(&success.entries, &labels, true);
+    answers::score_masses(&masses, in_set)
+        .ok()
+        .map(|scored| scored.probs[0])
 }
 
 /// Assemble tags and difficulty from the per-question outcomes: tags whose
@@ -415,6 +492,18 @@ mod tests {
     }
 
     #[test]
+    fn the_complaint_answer_is_its_yes_probability_or_none_on_failure() {
+        let yes =
+            complaint_from_outcomes(&[ok_outcome("complaint", &[(" yes", -0.1), (" no", -3.0)])]);
+        assert!(yes.unwrap() > 0.9);
+        assert_eq!(
+            complaint_from_outcomes(&[failed_outcome("complaint")]),
+            None
+        );
+        assert_eq!(complaint_from_outcomes(&[]), None);
+    }
+
+    #[test]
     fn difficulty_is_clamped_to_the_tier_ceiling() {
         let outcomes = vec![ok_outcome(
             "difficulty",
@@ -472,6 +561,7 @@ mod tests {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "brain-upstream".to_string(),

@@ -59,6 +59,12 @@ pub struct AppState {
     pub alerts: obleth_admin::AlertDispatcher,
     /// When false, never derive a conversation id from content (client ids only).
     pub session_id_derivation: bool,
+    /// The gateway's session affinity switch: its values while on, for
+    /// models without a setting of their own.
+    pub session_affinity: Option<obleth_config::SessionAffinityConfig>,
+    /// The gateway's session affinity values, on or not, for models that
+    /// turn affinity on themselves.
+    pub session_affinity_settings: obleth_config::SessionAffinityConfig,
     /// Optional compressor neural scoring sidecar. `None` when `OBLETH_COMPRESSOR_URL`
     /// is unset; the lossy compression pass skips neural scoring gracefully.
     pub compressor: Option<crate::boons::compressor::CompressorClient>,
