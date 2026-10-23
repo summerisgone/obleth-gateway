@@ -561,6 +561,7 @@ mod tests {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "brain-upstream".to_string(),

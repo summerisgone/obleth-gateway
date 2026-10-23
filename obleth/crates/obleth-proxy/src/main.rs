@@ -452,6 +452,8 @@ async fn main() -> anyhow::Result<()> {
                 )
             })
             .unwrap_or(true),
+        session_affinity: cfg.fairshare_session_affinity,
+        session_affinity_settings: cfg.fairshare_session_affinity_settings,
         compressor: crate::boons::compressor::CompressorClient::from_env(),
         energy: energy.clone(),
         jwt,
@@ -1607,6 +1609,7 @@ mod registry_refresh_tests {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             variants: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),

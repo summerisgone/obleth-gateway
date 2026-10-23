@@ -185,6 +185,18 @@ export interface ModelFamilyWrite {
   members: FamilyMembers;
 }
 
+/** A model's own session affinity setting. Each field left out uses the gateway's. */
+export interface ModelSessionAffinity {
+  /** On or off for this model; left out follows the gateway's switch. */
+  enabled?: boolean;
+  /** How long a freed slot is kept for the same session's next step, in ms. */
+  hold_ms?: number;
+  /** The most of the model's slots kept at once, in percent. */
+  max_held_percent?: number;
+  /** Seconds a request may wait before nothing passes it any more. */
+  max_bypass_secs?: number;
+}
+
 export interface ModelRoute {
   id: string;
   model_name: string;
@@ -220,6 +232,8 @@ export interface ModelRoute {
   listed?: boolean;
   /** Request body fields refused with a 400 before dispatch, because the model's server cannot handle them. Missing on older gateways (none). */
   rejected_request_fields?: string[];
+  /** The model's own session affinity setting; `{}` follows the gateway. Missing on older gateways. */
+  session_affinity?: ModelSessionAffinity;
   description: string;
   upstream_model: string;
   api_base: string;

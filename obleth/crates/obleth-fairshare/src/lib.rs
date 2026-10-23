@@ -344,6 +344,20 @@ pub struct AdmitRequest {
     pub end_user: Option<EndUser>,
     /// The conversation this request is a step of, for session affinity.
     pub session: Option<String>,
+    /// Session affinity for the request's pool: the scheduler's setting, or
+    /// the model's own.
+    pub affinity: PoolAffinity,
+}
+
+/// Where a pool's session affinity setting comes from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PoolAffinity {
+    /// The scheduler's, set with [`FairShare::set_session_affinity`].
+    #[default]
+    Scheduler,
+    /// The model's own, already resolved against the gateway's values;
+    /// `None` is off.
+    Model(Option<SessionAffinityConfig>),
 }
 
 impl AdmitRequest {
@@ -369,6 +383,7 @@ impl AdmitRequest {
             cost,
             end_user: None,
             session: None,
+            affinity: PoolAffinity::Scheduler,
         }
     }
 
@@ -420,6 +435,13 @@ impl AdmitRequest {
     pub fn session(mut self, id: impl Into<String>) -> Self {
         let id = id.into();
         self.session = (!id.is_empty()).then_some(id);
+        self
+    }
+
+    /// The model's own session affinity setting, resolved: `None` turns it
+    /// off for the pool whatever the scheduler's setting.
+    pub fn session_affinity(mut self, config: Option<SessionAffinityConfig>) -> Self {
+        self.affinity = PoolAffinity::Model(config);
         self
     }
 }
@@ -934,6 +956,9 @@ struct Pool {
     /// Session affinity. Not cleared by [`Pool::reset`]: a session stays
     /// cached upstream while the pool is idle between its steps.
     affinity: affinity::Affinity,
+    /// Where `affinity`'s setting comes from: the scheduler's, which
+    /// [`FairShare::set_session_affinity`] changes, or the model's own.
+    affinity_source: PoolAffinity,
     ctl_tx: mpsc::UnboundedSender<Ctl>,
 }
 
@@ -976,6 +1001,7 @@ impl Pool {
             blocked_keys: HashSet::new(),
             cluster_in_flight: None,
             affinity: affinity::Affinity::default(),
+            affinity_source: PoolAffinity::Scheduler,
             ctl_tx,
         }
     }
@@ -2440,10 +2466,15 @@ impl Scheduler {
                 respond,
                 enqueued,
             } => {
-                req.session = match self.session_affinity {
+                let affinity = match req.affinity {
+                    PoolAffinity::Scheduler => self.session_affinity,
+                    PoolAffinity::Model(config) => config,
+                };
+                req.session = match affinity {
                     Some(_) => req.session.take().map(|s| affinity::scoped(req.key, &s)),
                     None => None,
                 };
+                self.set_pool_affinity(&key, req.affinity, affinity);
                 let ceiling = self.ceiling();
                 let headroom = ceiling.saturating_sub(self.in_flight);
                 let default_cap = self.default_model_cap;
@@ -2587,7 +2618,12 @@ impl Scheduler {
                 self.session_affinity = config;
                 let stats = self.stats.affinity.clone();
                 let mut given_up = Vec::new();
-                for (key, pool) in self.pools.iter_mut() {
+                // Pools whose model has a setting of its own keep it.
+                for (key, pool) in self
+                    .pools
+                    .iter_mut()
+                    .filter(|(_, p)| p.affinity_source == PoolAffinity::Scheduler)
+                {
                     for hold in pool.affinity.configure(config, stats.clone()) {
                         given_up.push((key.clone(), hold));
                     }
@@ -2702,7 +2738,11 @@ impl Scheduler {
         session: &str,
         arrived: Instant,
     ) {
-        let (Some(cfg), Some(pool)) = (self.session_affinity, self.pools.get_mut(pool_key)) else {
+        let Some((cfg, pool)) = self
+            .pools
+            .get_mut(pool_key)
+            .and_then(|p| Some((p.affinity.config()?, p)))
+        else {
             self.release_slot(pool_key, tenant, key);
             return;
         };
@@ -2740,14 +2780,14 @@ impl Scheduler {
     /// When the next held slot runs out, or a request in a pool holding one
     /// has waited long enough for the holds to give way to it.
     fn next_hold_expiry(&self) -> Option<Instant> {
-        let bypass = self.session_affinity?.max_bypass;
         self.pools
             .values()
             .filter(|p| p.affinity.held() > 0)
             .flat_map(|p| {
+                let bypass = p.affinity.config().map(|c| c.max_bypass);
                 [
                     p.affinity.next_expiry(),
-                    p.oldest_eligible().map(|t| t + bypass),
+                    p.oldest_eligible().zip(bypass).map(|(t, b)| t + b),
                 ]
             })
             .flatten()
@@ -2773,7 +2813,7 @@ impl Scheduler {
     /// Nothing is granted while a reconcile is quiesced; giving back is not
     /// held up.
     fn serve_holds(&mut self) {
-        if self.session_affinity.is_none() {
+        if !self.pools.values().any(|p| p.affinity.held() > 0) {
             return;
         }
         let grant = !self.quiescing();
@@ -2943,7 +2983,6 @@ impl Scheduler {
         let global_blocked = s.global_blocked;
         let max_pending = s.config.max_pending_per_pool.max(1);
         let global_cap = self.capacity.max_in_flight();
-        let holds = self.session_affinity.is_some_and(|c| !c.hold.is_zero());
         let n = self.pool_order.len();
         if n == 0 {
             return;
@@ -2978,6 +3017,7 @@ impl Scheduler {
                 };
                 let id = self.next_op_id;
                 self.next_op_id += 1;
+                let holds = pool.affinity.holds_on();
                 let claim = pool.claim(tenant, key_id, &waiter, global_cap, holds, false);
                 pool.pending.insert(
                     id,
@@ -2998,7 +3038,7 @@ impl Scheduler {
         // replica while the step before it ran on another: each such queued
         // request tries once for the held slot alone, out of queue order.
         for key in self.pool_order.iter() {
-            let Some(pool) = self.pools.get_mut(key).filter(|_| holds) else {
+            let Some(pool) = self.pools.get_mut(key).filter(|p| p.affinity.holds_on()) else {
                 continue;
             };
             let limit = if pool.probing { 1 } else { max_pending };
@@ -3309,6 +3349,26 @@ impl Scheduler {
         }
         self.maybe_start_reconcile();
         self.dispatch_all();
+    }
+
+    /// Give `key`'s pool the session affinity setting a request brought,
+    /// handing back the slots it held if that turns affinity off there.
+    fn set_pool_affinity(
+        &mut self,
+        key: &PoolKey,
+        source: PoolAffinity,
+        config: Option<SessionAffinityConfig>,
+    ) {
+        let stats = self.stats.affinity.clone();
+        let pool = self.pool_mut(key);
+        pool.affinity_source = source;
+        if pool.affinity.config() == config {
+            return;
+        }
+        let given_up = pool.affinity.configure(config, stats);
+        for hold in given_up {
+            self.release_slot(key, hold.tenant, hold.key);
+        }
     }
 
     fn pool_mut(&mut self, key: &PoolKey) -> &mut Pool {

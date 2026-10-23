@@ -1970,6 +1970,16 @@ async fn run_pipeline(
     if route_keeps_sessions(route.as_deref()) {
         admit_req = admit_req.session(req_meta.session_id.as_str());
     }
+    if let Some(r) = route
+        .as_deref()
+        .filter(|r| !r.session_affinity.is_default())
+    {
+        // The model's own session affinity setting, over the gateway's.
+        admit_req = admit_req.session_affinity(r.session_affinity.resolve(
+            state.session_affinity.is_some(),
+            &state.session_affinity_settings,
+        ));
+    }
     let admit = state.fairshare.admit_to(pool, admit_req);
     let admitted = match timeout(admit_wait, admit).await {
         Ok(Some(a)) => a,
@@ -4582,6 +4592,7 @@ pub(crate) fn admit_request_for(
         cost,
         end_user,
         session: None,
+        affinity: Default::default(),
     }
 }
 
@@ -8031,6 +8042,7 @@ mod tests {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: "m".into(),
@@ -9143,6 +9155,7 @@ mod tests {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             variants: Vec::new(),
             quantization: "unknown".into(),
             upstream_model: name.to_string(),
@@ -9594,6 +9607,20 @@ mod lifecycle_tests {
         assert!(h[check..ret].contains("finalize("));
         assert!(h[check..ret].contains("Admission::Rejected"));
         assert!(h[check..ret].contains("StatusCode::BAD_REQUEST.as_u16()"));
+    }
+
+    #[test]
+    fn a_models_session_affinity_setting_goes_with_its_admission() {
+        let h = squash(handler());
+        let set = h
+            .find("admit_req=admit_req.session_affinity(r.session_affinity.resolve(")
+            .expect("the model's setting is resolved");
+        let admit = h
+            .find("state.fairshare.admit_to(pool,admit_req)")
+            .expect("admission");
+        assert!(set < admit);
+        // Only a model with a setting of its own overrides the scheduler's.
+        assert!(h[..set].contains(".filter(|r|!r.session_affinity.is_default())"));
     }
 
     #[tokio::test]

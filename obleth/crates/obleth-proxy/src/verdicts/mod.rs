@@ -2090,6 +2090,8 @@ mod model_choice_tests {
             fail_open: false,
             alerts: obleth_admin::AlertDispatcher::new(http, Default::default()),
             session_id_derivation: false,
+            session_affinity: None,
+            session_affinity_settings: Default::default(),
             compressor: None,
             energy: crate::energy::EnergyEngine::new(Default::default()),
             jwt: None,

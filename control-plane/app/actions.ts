@@ -23,6 +23,7 @@ import type {
   ModelFamilyWrite,
   ModelReasoning,
   ModelRoute,
+  ModelSessionAffinity,
   SetModelStatus,
   ModelVariantInput,
   RestoreReport,
@@ -1315,6 +1316,7 @@ function modelSettingsBody(formData: FormData, current: ModelRoute) {
     quantization: text("quantization", current.quantization),
     ...(has("aliases") ? { aliases: aliasesFromForm(formData) } : {}),
     ...(has("rejected_request_fields") ? { rejected_request_fields: namesFromForm(formData, "rejected_request_fields") } : {}),
+    ...(has("session_affinity_mode") ? { session_affinity: sessionAffinityFromForm(formData) } : {}),
     ...(has("variants") ? { variants: variantsFromForm(formData) } : {}),
     upstream_model: text("upstream_model", current.upstream_model),
     api_base: text("api_base", current.api_base),
@@ -2538,6 +2540,23 @@ function toolServersFromForm(formData: FormData): string[] {
 function strOrNull(v: FormDataEntryValue | null): string | undefined {
   const s = String(v ?? "").trim();
   return s || undefined;
+}
+
+// The session affinity picker and its values as the model's setting: "gateway"
+// is `{}`, "off" turns it off, and "on" keeps only the values filled in (the
+// rest use the gateway's).
+function sessionAffinityFromForm(formData: FormData): ModelSessionAffinity {
+  const mode = String(formData.get("session_affinity_mode") ?? "gateway");
+  if (mode === "off") return { enabled: false };
+  if (mode !== "on") return {};
+  const out: ModelSessionAffinity = { enabled: true };
+  const hold = numOrUndef(formData.get("session_affinity_hold_ms"));
+  const held = numOrUndef(formData.get("session_affinity_max_held_percent"));
+  const bypass = numOrUndef(formData.get("session_affinity_max_bypass_secs"));
+  if (hold !== undefined) out.hold_ms = hold;
+  if (held !== undefined) out.max_held_percent = held;
+  if (bypass !== undefined) out.max_bypass_secs = bypass;
+  return out;
 }
 
 function numOrUndef(v: FormDataEntryValue | null): number | undefined {

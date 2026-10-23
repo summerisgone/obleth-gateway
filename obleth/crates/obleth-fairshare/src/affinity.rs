@@ -114,6 +114,16 @@ impl Affinity {
         self.config.is_some()
     }
 
+    /// The setting the pool runs with; `None` while affinity is off here.
+    pub(crate) fn config(&self) -> Option<SessionAffinityConfig> {
+        self.config
+    }
+
+    /// Whether slots are held here for sessions' next steps.
+    pub(crate) fn holds_on(&self) -> bool {
+        self.config.is_some_and(|c| !c.hold.is_zero())
+    }
+
     fn warm(&self, cfg: &SessionAffinityConfig, session: &str, now: Instant) -> bool {
         self.sessions.get(session).is_some_and(|s| {
             s.in_flight > 0

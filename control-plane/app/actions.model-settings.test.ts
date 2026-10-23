@@ -88,6 +88,20 @@ describe("saving a model's settings", () => {
     expect("rejected_request_fields" in obleth.updateModel.mock.calls[1][1]).toBe(false);
   });
 
+  it("sends the session affinity setting only when the form has it", async () => {
+    mockAdmin();
+    const obleth = gateway();
+    const { saveModelSettingsAction } = await import("./actions");
+    await saveModelSettingsAction(form({ sections: "model", session_affinity_mode: "on", session_affinity_max_held_percent: "50", session_affinity_hold_ms: "" }));
+    expect(obleth.updateModel.mock.calls[0][1].session_affinity).toEqual({ enabled: true, max_held_percent: 50 });
+    await saveModelSettingsAction(form({ sections: "model", session_affinity_mode: "off", session_affinity_max_held_percent: "50" }));
+    expect(obleth.updateModel.mock.calls[1][1].session_affinity).toEqual({ enabled: false });
+    await saveModelSettingsAction(form({ sections: "model", session_affinity_mode: "gateway" }));
+    expect(obleth.updateModel.mock.calls[2][1].session_affinity).toEqual({});
+    await saveModelSettingsAction(form({ sections: "model", description: "new" }));
+    expect("session_affinity" in obleth.updateModel.mock.calls[3][1]).toBe(false);
+  });
+
   it("keeps the route switch, the stored key, and every group the form leaves out", async () => {
     mockAdmin();
     const obleth = gateway();

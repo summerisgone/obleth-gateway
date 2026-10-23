@@ -1304,6 +1304,7 @@ mod tests {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             variants: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),

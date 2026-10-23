@@ -141,6 +141,11 @@ pub struct ManifestModel {
     /// rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejected_request_fields: Option<Vec<String>>,
+    /// The model's own session affinity setting. Replaced as a whole when
+    /// present; absent leaves the stored setting alone. Out-of-range values
+    /// are rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_affinity: Option<crate::types::ModelSessionAffinity>,
     /// Serving format from the fixed `QUANTIZATIONS` vocabulary. An
     /// unrecognized value is rejected rather than silently defaulted, on the
     /// same reasoning as `model_type`.
@@ -316,6 +321,7 @@ pub struct ModelConfig {
     pub reasoning: crate::reasoning::ModelReasoning,
     pub listed: bool,
     pub rejected_request_fields: Vec<String>,
+    pub session_affinity: crate::types::ModelSessionAffinity,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -372,6 +378,7 @@ impl Default for ModelConfig {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             upstream_model: String::new(),
             api_base: String::new(),
             api_key: None,
@@ -429,6 +436,7 @@ impl From<&ModelRoute> for ModelConfig {
             reasoning: m.reasoning.clone(),
             listed: m.listed,
             rejected_request_fields: m.rejected_request_fields.clone(),
+            session_affinity: m.session_affinity,
             upstream_model: m.upstream_model.clone(),
             api_base: m.api_base.clone(),
             api_key: m.api_key.clone(),
@@ -499,6 +507,10 @@ impl ModelConfig {
         note(
             self.rejected_request_fields != other.rejected_request_fields,
             "rejected_request_fields",
+        );
+        note(
+            self.session_affinity != other.session_affinity,
+            "session_affinity",
         );
         note(
             self.upstream_model != other.upstream_model,
@@ -913,6 +925,10 @@ pub fn resolve_model(
         next.rejected_request_fields = crate::types::validate_rejected_request_fields(raw)
             .map_err(|e| reject(format!("rejected_request_fields: {e}")))?;
     }
+    if let Some(affinity) = &entry.session_affinity {
+        affinity.validate().map_err(reject)?;
+        next.session_affinity = *affinity;
+    }
     if let Some(r) = &entry.reasoning {
         r.validate()
             .map_err(|e| reject(format!("reasoning: {e}")))?;
@@ -1184,6 +1200,9 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
         // shape.
         rejected_request_fields: (!m.rejected_request_fields.is_empty())
             .then(|| m.rejected_request_fields.clone()),
+        // Only a model with a setting of its own says so, keeping older
+        // files' shape.
+        session_affinity: (!m.session_affinity.is_default()).then_some(m.session_affinity),
         upstream_model: Some(m.upstream_model.clone()),
         api_base: Some(m.api_base.clone()),
         api_key: None,
@@ -1247,6 +1266,7 @@ mod tests {
             reasoning: Default::default(),
             listed: true,
             rejected_request_fields: Vec::new(),
+            session_affinity: Default::default(),
             variants: Vec::new(),
             description: "original".into(),
             upstream_model: "upstream/original".into(),
@@ -1610,6 +1630,31 @@ mod tests {
             model_to_manifest_entry(&existing).rejected_request_fields,
             None
         );
+
+        // `session_affinity` is replaced when present, checked, and exported
+        // only when the model has a setting of its own.
+        let own = crate::types::ModelSessionAffinity {
+            enabled: Some(true),
+            max_held_percent: Some(50),
+            ..Default::default()
+        };
+        let mut affine = entry("m");
+        affine.session_affinity = Some(own);
+        let r = resolve_model(&affine, Some(&existing), &[]).unwrap();
+        assert_eq!(r.config.session_affinity, own);
+        assert!(r.changed_fields.contains(&"session_affinity".to_string()));
+        affine.session_affinity = Some(crate::types::ModelSessionAffinity {
+            max_held_percent: Some(101),
+            ..Default::default()
+        });
+        assert!(resolve_model(&affine, Some(&existing), &[]).is_err());
+        let mut affine_route = route("m");
+        affine_route.session_affinity = own;
+        assert_eq!(
+            model_to_manifest_entry(&affine_route).session_affinity,
+            Some(own)
+        );
+        assert_eq!(model_to_manifest_entry(&existing).session_affinity, None);
 
         assert_eq!(model_to_manifest_entry(&existing).reasoning, None);
         assert_eq!(

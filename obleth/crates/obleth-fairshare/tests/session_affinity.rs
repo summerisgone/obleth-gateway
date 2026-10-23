@@ -344,6 +344,113 @@ async fn requests_without_a_session_are_unaffected() {
     assert_eq!(held(&fs).await, 0);
 }
 
+// ---- per-model settings ------------------------------------------------------
+
+/// A request of `key` in the test pool, carrying the model's own setting.
+fn model_req(
+    key: Uuid,
+    cap: usize,
+    session: &str,
+    own: Option<SessionAffinityConfig>,
+) -> AdmitRequest {
+    req(key, cap, session).session_affinity(own)
+}
+
+#[tokio::test]
+async fn a_model_turns_affinity_on_for_its_pool_alone() {
+    let fs = start(None);
+    let (agent, other) = (Uuid::new_v4(), Uuid::new_v4());
+    let own = Some(config(2_000));
+    let step_own = |key, session| {
+        let fs = fs.clone();
+        async move {
+            let a = admit(&fs, model_req(key, 1, session, own)).await;
+            drop(a.permit);
+        }
+    };
+    step_own(agent, "loop").await;
+    let second = admit(&fs, model_req(agent, 1, "loop", own)).await;
+    let mut waiting = spawn_admit(&fs, model_req(other, 1, "other", own));
+    wait_for_queued(&fs, 1).await;
+    drop(second.permit);
+    assert_eq!(
+        held(&fs).await,
+        1,
+        "held although the scheduler's switch is off"
+    );
+    assert!(!waiting.is_finished());
+    let third = admit(&fs, model_req(agent, 1, "loop", own)).await;
+    assert_eq!(third.admission, Admission::Fast);
+    drop(third.permit);
+    granted_within(&mut waiting, Duration::from_secs(3))
+        .await
+        .expect("granted after the hold");
+
+    // Another model with no setting of its own follows the scheduler: off.
+    let plain = |session| {
+        AdmitRequest::new(agent, "plain", 10)
+            .model_cap(1)
+            .session(session)
+    };
+    for _ in 0..2 {
+        let a = admit(&fs, plain("loop")).await;
+        drop(a.permit);
+    }
+    let snap = fs.snapshot().await.expect("snapshot");
+    let plain_held = snap
+        .pools
+        .iter()
+        .find(|p| p.model == "plain")
+        .map_or(0, |p| p.held);
+    assert_eq!(plain_held, 0);
+}
+
+#[tokio::test]
+async fn a_model_turns_affinity_off_for_its_pool() {
+    let fs = start(Some(config(2_000)));
+    let agent = Uuid::new_v4();
+    for _ in 0..3 {
+        let a = admit(&fs, model_req(agent, 1, "loop", None)).await;
+        drop(a.permit);
+    }
+    assert_eq!(
+        held(&fs).await,
+        0,
+        "off for this model though on for the scheduler"
+    );
+}
+
+#[tokio::test]
+async fn turning_a_model_off_hands_back_what_its_pool_held() {
+    let fs = start(None);
+    let (agent, other) = (Uuid::new_v4(), Uuid::new_v4());
+    let own = Some(config(30_000));
+    let a = admit(&fs, model_req(agent, 1, "loop", own)).await;
+    drop(a.permit);
+    let second = admit(&fs, model_req(agent, 1, "loop", own)).await;
+    drop(second.permit);
+    assert_eq!(held(&fs).await, 1);
+    // The next request brings the model's new setting: off.
+    let off = admit(&fs, model_req(other, 1, "other", None)).await;
+    assert_eq!(held(&fs).await, 0);
+    drop(off.permit);
+}
+
+#[tokio::test]
+async fn the_scheduler_switch_leaves_a_model_with_its_own_setting_alone() {
+    let fs = start(None);
+    let agent = Uuid::new_v4();
+    let own = Some(config(30_000));
+    let a = admit(&fs, model_req(agent, 1, "loop", own)).await;
+    drop(a.permit);
+    let second = admit(&fs, model_req(agent, 1, "loop", own)).await;
+    drop(second.permit);
+    assert_eq!(held(&fs).await, 1);
+    fs.set_session_affinity(Some(config(1_000)));
+    fs.set_session_affinity(None);
+    assert_eq!(held(&fs).await, 1, "still the model's");
+}
+
 // ---- shared slots: holds kept in the backend --------------------------------
 
 /// `n` gateways sharing `cluster` in shared mode, with affinity on.

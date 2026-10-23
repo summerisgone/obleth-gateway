@@ -87,8 +87,12 @@ pub struct Config {
     pub fairshare_replica_ttl: Duration,
     /// Settings for models in the `discovered` capacity mode.
     pub capacity_discovery: CapacityDiscoveryConfig,
-    /// Session affinity in the fairshare queue; `None` while it is off.
+    /// Session affinity in the fairshare queue; `None` while it is off for
+    /// models that do not turn it on themselves.
     pub fairshare_session_affinity: Option<SessionAffinityConfig>,
+    /// The gateway's session affinity values, whether or not it is on: what
+    /// a model that turns affinity on uses for anything it does not set.
+    pub fairshare_session_affinity_settings: SessionAffinityConfig,
 
     /// Fail-open: keep serving from cache + buffer telemetry to WAL when
     /// Redis/ClickHouse are unavailable. Fail-closed rejects instead.
@@ -239,6 +243,13 @@ pub struct SessionAffinityConfig {
     pub max_held_percent: u8,
 }
 
+impl Default for SessionAffinityConfig {
+    /// The default values, as with no variables set.
+    fn default() -> Self {
+        Self::settings_from_values(None, None, None, None, None)
+    }
+}
+
 impl SessionAffinityConfig {
     pub const DEFAULT_WARM_SECS: u64 = 120;
     pub const DEFAULT_HOLD_MS: u64 = 3000;
@@ -247,9 +258,20 @@ impl SessionAffinityConfig {
     pub const DEFAULT_MAX_HELD_PERCENT: u8 = 25;
 
     pub fn from_env() -> Option<Self> {
+        lenient_bool(
+            env::var("OBLETH_FAIRSHARE_SESSION_AFFINITY")
+                .ok()
+                .as_deref(),
+            false,
+        )
+        .then(Self::settings_from_env)
+    }
+
+    /// The configured values whether or not affinity is on, for models that
+    /// turn it on themselves.
+    pub fn settings_from_env() -> Self {
         let var = |name: &str| env::var(name).ok();
-        Self::from_values(
-            var("OBLETH_FAIRSHARE_SESSION_AFFINITY").as_deref(),
+        Self::settings_from_values(
             var("OBLETH_FAIRSHARE_SESSION_AFFINITY_WARM_SECS").as_deref(),
             var("OBLETH_FAIRSHARE_SESSION_AFFINITY_HOLD_MS").as_deref(),
             var("OBLETH_FAIRSHARE_SESSION_AFFINITY_MAX_JUMPS").as_deref(),
@@ -270,9 +292,25 @@ impl SessionAffinityConfig {
         max_bypass_secs: Option<&str>,
         max_held_percent: Option<&str>,
     ) -> Option<Self> {
-        if !lenient_bool(enabled, false) {
-            return None;
-        }
+        lenient_bool(enabled, false).then(|| {
+            Self::settings_from_values(
+                warm_secs,
+                hold_ms,
+                max_jumps,
+                max_bypass_secs,
+                max_held_percent,
+            )
+        })
+    }
+
+    /// [`SessionAffinityConfig::from_values`] without the switch.
+    pub fn settings_from_values(
+        warm_secs: Option<&str>,
+        hold_ms: Option<&str>,
+        max_jumps: Option<&str>,
+        max_bypass_secs: Option<&str>,
+        max_held_percent: Option<&str>,
+    ) -> Self {
         fn num<T: std::str::FromStr>(v: Option<&str>) -> Option<T> {
             v.and_then(|s| s.trim().parse().ok())
         }
@@ -285,7 +323,7 @@ impl SessionAffinityConfig {
                 .unwrap_or(Self::DEFAULT_MAX_BYPASS_SECS),
         );
         let hold = Duration::from_millis(num(hold_ms).unwrap_or(Self::DEFAULT_HOLD_MS));
-        Some(SessionAffinityConfig {
+        SessionAffinityConfig {
             warm_ttl: Duration::from_secs(warm),
             hold: hold.min(max_bypass),
             max_jumps: num(max_jumps)
@@ -295,7 +333,7 @@ impl SessionAffinityConfig {
             max_held_percent: num::<u8>(max_held_percent)
                 .unwrap_or(Self::DEFAULT_MAX_HELD_PERCENT)
                 .min(100),
-        })
+        }
     }
 
     /// How many of a pool's `cap` slots may be held at once.
@@ -430,6 +468,7 @@ impl Config {
             fairshare_replica_ttl,
             capacity_discovery: CapacityDiscoveryConfig::from_env(),
             fairshare_session_affinity: SessionAffinityConfig::from_env(),
+            fairshare_session_affinity_settings: SessionAffinityConfig::settings_from_env(),
             fail_open: require_bool("OBLETH_FAIL_OPEN", true),
             wal_path: env_or("OBLETH_WAL_PATH", "./obleth-telemetry.wal"),
             telemetry_flush_interval: telemetry_flush_interval(
