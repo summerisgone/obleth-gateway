@@ -6421,6 +6421,9 @@ pub(crate) fn resolve_conversation(
         json.get("metadata")
             .and_then(|m| m.get("session_id"))
             .and_then(|v| v.as_str()),
+        // OpenAI's prompt-cache routing key: the client's own grouping of
+        // requests that share a prefix.
+        json.get("prompt_cache_key").and_then(|v| v.as_str()),
     ];
     for c in body_ids.into_iter().flatten() {
         if !c.trim().is_empty() {
@@ -6450,22 +6453,34 @@ pub(crate) fn resolve_conversation(
     }
 }
 
-/// Maximum seed text hashed; bounds work on huge system prompts. The same
+/// Maximum seed text hashed from each part (the leading system/developer
+/// text, then the first user message); bounds work on huge prompts. The same
 /// leading bytes are replayed every turn, so capping stays stable.
 const SEED_CAP: usize = 8 * 1024;
 
 /// Build the stable conversation seed: leading system/developer message text up
 /// to and including the first user message. `None` when there are no messages
 /// or no text to hash (e.g. embeddings, image-only first turn with no system).
+///
+/// The first user message has a budget of its own: clients that share one
+/// long system prompt across every conversation are told apart only by it.
+/// A seed that fits in one cap hashes the same as it did under a shared one.
 fn conversation_seed(json: &serde_json::Value) -> Option<String> {
     let messages = json.get("messages")?.as_array()?;
     let mut seed = String::new();
     for msg in messages {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         match role {
-            "system" | "developer" => push_capped(&mut seed, &message_text(msg.get("content"))),
+            "system" | "developer" => {
+                push_capped(&mut seed, &message_text(msg.get("content")), SEED_CAP)
+            }
             "user" => {
-                push_capped(&mut seed, &message_text(msg.get("content")));
+                // The separator `push_capped` adds is not part of the budget.
+                let budget = match seed.len() {
+                    0 => SEED_CAP,
+                    n => n + 1 + SEED_CAP,
+                };
+                push_capped(&mut seed, &message_text(msg.get("content")), budget);
                 break; // first user turn closes the seed
             }
             _ => {}
@@ -6478,16 +6493,16 @@ fn conversation_seed(json: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Append up to the seed cap, with a separator so adjacent messages can't merge
-/// into a colliding blob.
-fn push_capped(seed: &mut String, text: &str) {
-    if seed.len() >= SEED_CAP || text.is_empty() {
+/// Append until the seed is `limit` bytes long, with a separator so adjacent
+/// messages can't merge into a colliding blob.
+fn push_capped(seed: &mut String, text: &str, limit: usize) {
+    if seed.len() >= limit || text.is_empty() {
         return;
     }
     if !seed.is_empty() {
         seed.push('\u{1f}'); // unit separator
     }
-    let room = SEED_CAP - seed.len();
+    let room = limit.saturating_sub(seed.len());
     if text.len() <= room {
         seed.push_str(text);
     } else {
@@ -6702,15 +6717,16 @@ mod tests {
     use super::{
         admit_request_for, anthropic_error, apply_multipart_text_view,
         backfill_max_tokens_for_count_tokens, backoff_for, build_targets, build_upstream_url,
-        canonical_post_path, clamp_max_tokens, compute_modality_cost, effective_request_type,
-        end_user_for, forward_headers, has_input_guardrails, has_path_traversal,
-        input_guardrails_unscannable, is_chat_path, is_models_collection, is_models_endpoint,
-        is_multipart_endpoint, is_retryable_status, looks_like_context_length_error,
-        messages_input_estimate, multipart_text_view, output_guardrails_unenforceable,
-        parse_multipart, prepare_upstream_body, redress_error, request_type_for_path,
-        requires_registered_model, resolve_conversation, response_cache_name, session_hash_order,
-        should_translate_as_stream, strip_beta_query, surface, tenant_active_now, weighted_order,
-        MultipartField, RequestMeta, TooLong, END_USER_HEADER, REGISTERED_MODEL_PATHS,
+        canonical_post_path, clamp_max_tokens, compute_modality_cost, conversation_seed,
+        effective_request_type, end_user_for, forward_headers, has_input_guardrails,
+        has_path_traversal, input_guardrails_unscannable, is_chat_path, is_models_collection,
+        is_models_endpoint, is_multipart_endpoint, is_retryable_status,
+        looks_like_context_length_error, messages_input_estimate, multipart_text_view,
+        output_guardrails_unenforceable, parse_multipart, prepare_upstream_body, redress_error,
+        request_type_for_path, requires_registered_model, resolve_conversation,
+        response_cache_name, session_hash_order, should_translate_as_stream, strip_beta_query,
+        surface, tenant_active_now, weighted_order, MultipartField, RequestMeta, TooLong,
+        END_USER_HEADER, REGISTERED_MODEL_PATHS, SEED_CAP,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
@@ -8908,6 +8924,64 @@ mod tests {
         assert_ne!(a.value, b.value, "different opener -> different id");
         assert_ne!(a.value, c.value, "different tenant -> different id");
         assert_eq!(a.value.len(), 16, "16 hex chars");
+    }
+
+    #[test]
+    fn resolve_reads_prompt_cache_key() {
+        let json = serde_json::json!({
+            "prompt_cache_key": "pck-7",
+            "messages":[{"role":"user","content":"hi"}]
+        });
+        let c = resolve_conversation(&HeaderMap::new(), &json, Uuid::nil(), true);
+        assert_eq!(c.value, "pck-7");
+        assert_eq!(c.source.as_str(), "client");
+    }
+
+    #[test]
+    fn derived_tells_apart_conversations_behind_a_long_system_prompt() {
+        let tid = Uuid::nil();
+        let system = "s".repeat(3 * SEED_CAP);
+        let opening = |task: &str| {
+            serde_json::json!({"messages":[
+                {"role":"system","content":system},
+                {"role":"user","content":task}
+            ]})
+        };
+        let a = resolve_conversation(&HeaderMap::new(), &opening("fix the parser"), tid, true);
+        let b = resolve_conversation(&HeaderMap::new(), &opening("write the docs"), tid, true);
+        assert_ne!(
+            a.value, b.value,
+            "the first user message must reach the hash"
+        );
+        let later = serde_json::json!({"messages":[
+            {"role":"system","content":system},
+            {"role":"user","content":"fix the parser"},
+            {"role":"assistant","content":"Reading it."},
+            {"role":"tool","content":"fn parse() {}"},
+            {"role":"user","content":"now run the tests"}
+        ]});
+        let a2 = resolve_conversation(&HeaderMap::new(), &later, tid, true);
+        assert_eq!(
+            a.value, a2.value,
+            "a conversation keeps its id across turns"
+        );
+    }
+
+    #[test]
+    fn seed_under_one_cap_is_unchanged() {
+        // What a single shared cap produced: every part in full, separated.
+        let json = serde_json::json!({"messages":[
+            {"role":"system","content":"You are helpful."},
+            {"role":"developer","content":"Answer briefly."},
+            {"role":"user","content":"What is Rust?"}
+        ]});
+        assert_eq!(
+            conversation_seed(&json).as_deref(),
+            Some("You are helpful.\u{1f}Answer briefly.\u{1f}What is Rust?")
+        );
+        let lone = "u".repeat(2 * SEED_CAP);
+        let json = serde_json::json!({"messages":[{"role":"user","content":lone}]});
+        assert_eq!(conversation_seed(&json).map(|s| s.len()), Some(SEED_CAP));
     }
 
     #[test]
