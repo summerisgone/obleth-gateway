@@ -8,6 +8,8 @@ workflow falls back to auto-generated notes.
 
 Agent sessions can keep their place on a busy model: with session affinity on, the fairshare scheduler serves a key's warm sessions first and can hold a slot for a session's next step, so its cached prompt is still there when the step arrives. It is off by default and can be turned on for the whole gateway or one model at a time. `auto` can keep a conversation on the model that answered it until an answer goes wrong, and Reports gains a Model speed section.
 
+Session affinity and the derived session id fix below follow the design @summerisgone proposed in #83. Thank you!
+
 > **Upgrade notes.** No breaking changes. Postgres migration `0038` only adds a column, and the gateway applies it when it starts. Session affinity and sticky `auto` routing are both off until they are configured. With session affinity off, v2.3.0 and v2.4.0 replicas can share slots during a rolling update; turn it on once every replica runs v2.4.0.
 >
 > - **Behaviour to expect after upgrading:**
