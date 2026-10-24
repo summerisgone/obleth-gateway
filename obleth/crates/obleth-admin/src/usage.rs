@@ -27,6 +27,30 @@ fn internal_filter(include_internal: Option<bool>) -> String {
     format!(" and request_type not in ({list})")
 }
 
+/// A row's first-token time marks a real first token. Streamed rows always
+/// qualify. Rows written before the gateway recorded `streamed` carry a
+/// first-byte time even for buffered replies, whose first byte arrives with
+/// the whole body, so the rest of the reply takes a few milliseconds. Their
+/// time counts only when at least a twentieth of the request came after it,
+/// as it does for a streamed reply. A buffered reply recorded since has no
+/// first-token time at all.
+macro_rules! real_ttft {
+    () => {
+        "(streamed or (total_ms - ttft_ms) * 20 >= total_ms - queue_wait_ms)"
+    };
+}
+const REAL_TTFT: &str = real_ttft!();
+
+/// Milliseconds a reply spent generating: the decode window (total less first
+/// token) when the first token is real, else the upstream time (total less
+/// queue). Measuring a buffered reply from its first byte would leave only the
+/// body's transfer time and a speed in the tens of thousands.
+const DECODE_MS: &str = concat!(
+    "if(ttft_ms > 0 and total_ms - ttft_ms >= 20 and ",
+    real_ttft!(),
+    ", total_ms - ttft_ms, total_ms - queue_wait_ms)"
+);
+
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct UsageQuery {
     #[schema(value_type = Option<String>)]
@@ -1137,18 +1161,18 @@ pub async fn query_usage_by_model(
 }
 
 fn usage_by_model_sql(q: &UsageQuery) -> String {
-    let mut sql = String::from(
+    let mut sql = format!(
         "select model, count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
          sum(input_tokens) + sum(output_tokens) as total_tok, \
          round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
-         quantileIf(0.5)(output_tokens / (greatest(if(total_ms - ttft_ms >= 20, total_ms - ttft_ms, total_ms - queue_wait_ms), 1) / 1000.), \
+         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS}, 1) / 1000.), \
          total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps, \
-         round(sumIf(output_tokens / (greatest(if(total_ms - ttft_ms >= 20, total_ms - ttft_ms, total_ms - queue_wait_ms), 1) / 1000.), \
+         round(sumIf(output_tokens / (greatest({DECODE_MS}, 1) / 1000.), \
          total_ms >= 20 and output_tokens >= 1), 1) as agg_tps, \
-         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft, \
+         round(if(countIf(ttft_ms > 0 and {REAL_TTFT}) > 0, avgIf(ttft_ms, ttft_ms > 0 and {REAL_TTFT}), 0), 1) as avg_ttft, \
          round(if(countIf(total_ms > 0) > 0, avgIf(total_ms, total_ms > 0), 0), 1) as avg_total, \
-         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft, \
+         round(if(countIf(ttft_ms > 0 and {REAL_TTFT}) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0 and {REAL_TTFT}), 0), 1) as p50_ttft, \
          round(if(countIf(total_ms > 0) > 0, quantileIf(0.5)(total_ms, total_ms > 0), 0), 1) as p50_total, \
          round(avg(input_tokens), 1) as avg_prompt, \
          round(avg(output_tokens), 1) as avg_gen, \
@@ -1242,13 +1266,13 @@ pub async fn query_usage_series_by_model(
         "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
          count() as requests, \
          round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
-         quantileIf(0.5)(output_tokens / (greatest(if(total_ms - ttft_ms >= 20, total_ms - ttft_ms, total_ms - queue_wait_ms), 1) / 1000.), \
+         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS}, 1) / 1000.), \
          total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps, \
-         round(if(countIf(ttft_ms >= 20 and input_tokens >= 1) > 0, \
+         round(if(countIf(ttft_ms >= 20 and input_tokens >= 1 and {REAL_TTFT}) > 0, \
          quantileIf(0.5)(input_tokens / (greatest(ttft_ms, 1) / 1000.), \
-         ttft_ms >= 20 and input_tokens >= 1), 0), 1) as prompt_tps, \
-         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft, \
-         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft, \
+         ttft_ms >= 20 and input_tokens >= 1 and {REAL_TTFT}), 0), 1) as prompt_tps, \
+         round(if(countIf(ttft_ms > 0 and {REAL_TTFT}) > 0, avgIf(ttft_ms, ttft_ms > 0 and {REAL_TTFT}), 0), 1) as avg_ttft, \
+         round(if(countIf(ttft_ms > 0 and {REAL_TTFT}) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0 and {REAL_TTFT}), 0), 1) as p50_ttft, \
          round(if(countIf(total_ms > 0) > 0, avgIf(total_ms, total_ms > 0), 0), 1) as avg_total, \
          round(if(countIf(total_ms > 0) > 0, quantileIf(0.5)(total_ms, total_ms > 0), 0), 1) as p50_total, \
          sum(energy_wh) as energy_wh \
@@ -1281,7 +1305,7 @@ pub async fn query_usage_breakdown_by_model(
         "select key_id, tenant_id, count() as requests, \
          sum(input_tokens) + sum(output_tokens) as total_tokens, \
          round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
-         quantileIf(0.5)(output_tokens / (greatest(if(total_ms - ttft_ms >= 20, total_ms - ttft_ms, total_ms - queue_wait_ms), 1) / 1000.), \
+         quantileIf(0.5)(output_tokens / (greatest({DECODE_MS}, 1) / 1000.), \
          total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps, \
          sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
          from usage where ts_ms >= ? and model = ?{filter} \
@@ -1297,7 +1321,8 @@ pub async fn query_usage_breakdown_by_model(
 
 /// One model's speed over a window, or over one hour or day of it. Rates are
 /// per request, so they show what a caller saw whatever the traffic volume.
-/// Only successful, uncached requests that produced tokens are rated.
+/// Only successful, uncached requests that wrote at least 16 tokens are rated:
+/// a one-word answer has no speed worth the name.
 #[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
 pub struct ModelSpeedPoint {
     /// Start of the hour or day, unix epoch millis; 0 for a whole-window row.
@@ -1337,10 +1362,10 @@ fn speed_bucket_sql(bucket: &str, span_ms: i64) -> (&'static str, bool) {
 /// Aliases stay clear of the column names the query reads; see [`usage_totals_sql`].
 fn usage_speed_sql(bucket_expr: &str, q: &UsageSpeedQuery) -> String {
     let rated =
-        "status_code < 400 and cache_status != 'hit' and total_ms >= 20 and output_tokens >= 1";
-    let rate = "output_tokens / (greatest(if(total_ms - ttft_ms >= 20, total_ms - ttft_ms, total_ms - queue_wait_ms), 1) / 1000.)";
+        "status_code < 400 and cache_status != 'hit' and total_ms >= 20 and output_tokens >= 16";
+    let rate = format!("output_tokens / (greatest({DECODE_MS}, 1) / 1000.)");
     let prefill =
-        "status_code < 400 and cache_status != 'hit' and ttft_ms >= 20 and input_tokens >= 1";
+        format!("status_code < 400 and cache_status != 'hit' and ttft_ms >= 20 and input_tokens >= 1 and {REAL_TTFT}");
     let mut sql = format!(
         "select {bucket_expr} as bucket_ms, model as model_name, \
          count() as reqs, \
@@ -1348,7 +1373,7 @@ fn usage_speed_sql(bucket_expr: &str, q: &UsageSpeedQuery) -> String {
          round(if(countIf({rated}) > 0, quantileIf(0.5)({rate}, {rated}), 0), 1) as gen_tps, \
          round(if(countIf({rated}) > 0, quantileIf(0.1)({rate}, {rated}), 0), 1) as slow_tps, \
          round(if(countIf({prefill}) > 0, quantileIf(0.5)(input_tokens / (greatest(ttft_ms, 1) / 1000.), {prefill}), 0), 1) as prompt_tps, \
-         round(if(countIf({rated} and ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, {rated} and ttft_ms > 0), 0), 1) as p50_ttft \
+         round(if(countIf({rated} and ttft_ms > 0 and {REAL_TTFT}) > 0, quantileIf(0.5)(ttft_ms, {rated} and ttft_ms > 0 and {REAL_TTFT}), 0), 1) as p50_ttft \
          from usage where ts_ms >= ? and ts_ms < ?"
     );
     if q.tenant_id.is_some() {
