@@ -989,7 +989,7 @@ export interface ModelSpeedPoint {
   bucket_ms: number;
   model: string;
   requests: number;
-  /** Successful, uncached requests that produced tokens: the ones a speed was measured on. */
+  /** Successful, uncached requests that wrote at least 16 tokens: the ones a speed was measured on. */
   rated: number;
   /** Median output tokens a second, after the first token. */
   gen_tokens_per_sec: number;

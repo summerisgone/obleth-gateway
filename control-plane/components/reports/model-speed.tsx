@@ -245,7 +245,7 @@ export function ModelSpeed({ range, previous, filters, against, retentionDays, m
               </button>
             )}
           </div>
-          <p className="px-[18px] pb-3.5 text-[11.5px] text-muted-foreground">Successful, uncached requests only. Audio, image and embedding models aren&apos;t listed: they don&apos;t produce tokens a second.</p>
+          <p className="px-[18px] pb-3.5 text-[11.5px] text-muted-foreground">Successful, uncached requests that wrote at least 16 tokens. Audio, image and embedding models aren&apos;t listed: they don&apos;t produce tokens a second.</p>
         </>
       )}
     </Panel>
