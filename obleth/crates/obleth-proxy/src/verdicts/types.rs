@@ -14,10 +14,13 @@ use serde::{Deserialize, Serialize};
 /// Upper bound on questions per request. Each question is one single-token
 /// upstream call; the cap bounds the fan-out a single request can demand.
 pub(crate) const MAX_QUESTIONS: usize = 32;
-/// Choice options are answered with single-letter labels (`A`..`Z`), which are
-/// single tokens in every mainstream vocabulary. Two-letter labels are not,
-/// so until constrained decoding lands the cap is the alphabet.
-pub(crate) const MAX_CHOICE_OPTIONS: usize = 26;
+/// Up to this many choice options are answered with single-letter labels
+/// (`A`..`Z`), which are single tokens in every mainstream vocabulary.
+pub(crate) const MAX_LETTER_OPTIONS: usize = 26;
+/// Past [`MAX_LETTER_OPTIONS`], options are labeled with two-letter codes
+/// (`AA`..`JU`); see [`super::prompt::labels_for`]. 255 matches the option cap
+/// of the SystemOne wire format.
+pub(crate) const MAX_CHOICE_OPTIONS: usize = 255;
 pub(crate) const MIN_CHOICE_OPTIONS: usize = 2;
 /// Score levels are labeled `A`..`J`. Ten descriptive levels is already past
 /// the point where adjacent levels stop being distinguishable.
@@ -27,7 +30,7 @@ pub(crate) const MAX_SCORE_LEVELS: usize = 10;
 /// bounds the raw body; this bounds what is replicated into every question's
 /// prompt.
 pub(crate) const MAX_STATE_BYTES: usize = 2 * 1024 * 1024;
-pub(crate) const MAX_QUESTION_ID_LEN: usize = 64;
+pub(crate) const MAX_QUESTION_ID_LEN: usize = 256;
 pub(crate) const MAX_OPTION_NAME_LEN: usize = 200;
 /// Upper bound on images per request.
 pub(crate) const MAX_IMAGES: usize = 8;
@@ -59,6 +62,22 @@ pub(crate) struct VerdictsRequest {
     #[serde(default)]
     pub model: String,
     pub questions: BTreeMap<String, Question>,
+    /// What a question gets when none of the model's likely first tokens is
+    /// an answer label.
+    #[serde(default)]
+    pub on_no_answer: OnNoAnswer,
+}
+
+/// Handling of a question the model did not answer with any label.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OnNoAnswer {
+    /// The request fails with 502, naming the question.
+    #[default]
+    Error,
+    /// The question comes back with an even distribution, confidence 0 and
+    /// `"answered": false`; the rest of the request is unaffected.
+    LowConfidence,
 }
 
 /// One typed question. All variants share free-form `instructions` (string |
@@ -119,6 +138,10 @@ pub(crate) struct Verdict {
     /// Score only: the probability-weighted level, `Σ pᵢ · levelᵢ`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_value: Option<f64>,
+    /// `false` only when the model gave no answer label and the request
+    /// asked for `on_no_answer: "low_confidence"`; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answered: Option<bool>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -141,6 +164,13 @@ pub(crate) struct Usage {
 pub(crate) fn to_json_bytes(response: &VerdictsResponse) -> Result<Vec<u8>, serde_json::Error> {
     let mut ser = serde_json::Serializer::with_formatter(Vec::new(), PlainDecimalFormatter);
     response.serialize(&mut ser)?;
+    Ok(ser.into_inner())
+}
+
+/// [`to_json_bytes`] for any JSON value (the SystemOne response).
+pub(crate) fn value_to_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+    let mut ser = serde_json::Serializer::with_formatter(Vec::new(), PlainDecimalFormatter);
+    value.serialize(&mut ser)?;
     Ok(ser.into_inner())
 }
 
@@ -222,8 +252,7 @@ pub(crate) fn validate(req: &VerdictsRequest) -> Result<(), String> {
                 }
                 if criteria.len() > MAX_CHOICE_OPTIONS {
                     return Err(format!(
-                        "question '{id}': too many options: {} (maximum {MAX_CHOICE_OPTIONS} \
-                         until constrained decoding is supported)",
+                        "question '{id}': too many options: {} (maximum {MAX_CHOICE_OPTIONS})",
                         criteria.len()
                     ));
                 }
@@ -544,6 +573,7 @@ mod tests {
             probabilities: serde_json::json!([0.1, 0.7, 0.2]),
             confidence: 0.61,
             expected_value: Some(2.1),
+            answered: None,
         };
         let v = serde_json::to_value(&answer).unwrap();
         assert!(v["probabilities"].is_array());
@@ -585,6 +615,7 @@ mod tests {
                 }),
                 confidence: 0.9999305114863566,
                 expected_value: None,
+                answered: None,
             },
         );
         verdicts.insert(
@@ -600,6 +631,7 @@ mod tests {
                 ]),
                 confidence: 0.733957935578729,
                 expected_value: Some(2.9956345671093089),
+                answered: None,
             },
         );
         let response = VerdictsResponse {

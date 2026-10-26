@@ -237,6 +237,7 @@ async fn ask(
             QuestionCall {
                 id: id.clone(),
                 boolean: matches!(labels.semantics, LabelSemantics::Boolean),
+                two_letter: vprompt::is_two_letter(&labels.labels),
                 user: vprompt::render_user(q, &labels),
                 labels: labels.labels,
                 shared: shared.clone(),
