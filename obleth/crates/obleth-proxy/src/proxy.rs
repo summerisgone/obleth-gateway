@@ -100,7 +100,6 @@ fn canonical_post_path(path: &str) -> Option<String> {
         "/messages" => crate::messages::MESSAGES_PATH,
         "/messages/count_tokens" => crate::messages::COUNT_TOKENS_PATH,
         "/verdicts" => crate::verdicts::VERDICTS_PATH,
-        "/systemone" => crate::verdicts::systemone::SYSTEMONE_PATH,
         other => other,
     };
     (!mapped.is_empty() && mapped != path).then(|| mapped.to_string())
@@ -131,11 +130,6 @@ pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Re
     // arrive here and must reach the same handler, never the upstream.
     if req.method() == Method::POST && req.uri().path() == crate::verdicts::VERDICTS_PATH {
         return crate::verdicts::handler(state, req).await;
-    }
-    if req.method() == Method::POST
-        && req.uri().path() == crate::verdicts::systemone::SYSTEMONE_PATH
-    {
-        return crate::verdicts::systemone::handler(state, req).await;
     }
     // `/v1/responses` is served by translating to chat completions and back,
     // around the unchanged pipeline — see `crate::responses`.

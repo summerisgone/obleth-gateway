@@ -17,7 +17,6 @@
 
 pub(crate) mod answers;
 pub(crate) mod prompt;
-pub(crate) mod systemone;
 pub(crate) mod types;
 
 use std::collections::BTreeMap;
@@ -2252,22 +2251,14 @@ mod model_choice_tests {
         }
 
         async fn verdicts(&self, secret: &str, body: Value) -> (StatusCode, Value) {
-            self.post(super::VERDICTS_PATH, secret, body).await
-        }
-
-        async fn post(&self, path: &str, secret: &str, body: Value) -> (StatusCode, Value) {
             let req = Request::builder()
                 .method(Method::POST)
-                .uri(path)
+                .uri(super::VERDICTS_PATH)
                 .header(header::AUTHORIZATION, format!("Bearer {secret}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap();
-            let resp = if path == super::systemone::SYSTEMONE_PATH {
-                super::systemone::handler(State(self.state.clone()), req).await
-            } else {
-                super::handler(State(self.state.clone()), req).await
-            };
+            let resp = super::handler(State(self.state.clone()), req).await;
             let status = resp.status();
             let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -2534,40 +2525,5 @@ mod model_choice_tests {
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["verdicts"]["q"].get("answered").is_none(), "{body}");
-    }
-
-    #[tokio::test]
-    async fn systemone_answers_in_its_own_shape() {
-        let Some(gw) = gateway(AutoRouterSettings::default()).await else {
-            return;
-        };
-        let (seen, base) = spawn_upstream().await;
-        gw.register("judge", &base).await;
-        let secret = gw.key().await;
-        let questions: serde_json::Map<String, Value> = (0..40)
-            .map(|i| {
-                (
-                    format!("q{i:02}"),
-                    json!({"type": "noul", "instructions": "Is it?"}),
-                )
-            })
-            .collect();
-
-        let (status, body) = gw
-            .post(
-                super::systemone::SYSTEMONE_PATH,
-                &secret,
-                json!({"model": "judge", "state": "x", "questions": questions}),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["model"], "judge");
-        let answers = body["answers"].as_object().unwrap();
-        assert_eq!(answers.len(), 40);
-        assert_eq!(answers["q00"]["type"], "noul");
-        assert!(answers["q00"]["noul"].as_f64().unwrap() > 0.9);
-        assert_eq!(body["usage"]["input_tokens"], 800);
-        // 40 questions went out as two verdicts requests (32 + 8).
-        assert_eq!(seen.lock().unwrap().len(), 40);
     }
 }

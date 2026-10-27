@@ -645,11 +645,6 @@ async fn main() -> anyhow::Result<()> {
             verdicts::VERDICTS_PATH,
             axum::routing::post(verdicts::handler),
         )
-        // The SystemOne wire format, served by verdicts.
-        .route(
-            verdicts::systemone::SYSTEMONE_PATH,
-            axum::routing::post(verdicts::systemone::handler),
-        )
         // Native web search (Perplexity shape), in both spellings LiteLLM
         // serves. `GET /v1/search/tools` shares the `:tool` pattern.
         .route(search::SEARCH_PATH, axum::routing::post(search::search))

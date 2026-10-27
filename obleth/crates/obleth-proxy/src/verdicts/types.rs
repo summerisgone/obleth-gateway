@@ -18,8 +18,7 @@ pub(crate) const MAX_QUESTIONS: usize = 32;
 /// (`A`..`Z`), which are single tokens in every mainstream vocabulary.
 pub(crate) const MAX_LETTER_OPTIONS: usize = 26;
 /// Past [`MAX_LETTER_OPTIONS`], options are labeled with two-letter codes
-/// (`AA`..`JU`); see [`super::prompt::labels_for`]. 255 matches the option cap
-/// of the SystemOne wire format.
+/// (`AA`..`JU`, 255 codes); see [`super::prompt::labels_for`].
 pub(crate) const MAX_CHOICE_OPTIONS: usize = 255;
 pub(crate) const MIN_CHOICE_OPTIONS: usize = 2;
 /// Score levels are labeled `A`..`J`. Ten descriptive levels is already past
@@ -164,13 +163,6 @@ pub(crate) struct Usage {
 pub(crate) fn to_json_bytes(response: &VerdictsResponse) -> Result<Vec<u8>, serde_json::Error> {
     let mut ser = serde_json::Serializer::with_formatter(Vec::new(), PlainDecimalFormatter);
     response.serialize(&mut ser)?;
-    Ok(ser.into_inner())
-}
-
-/// [`to_json_bytes`] for any JSON value (the SystemOne response).
-pub(crate) fn value_to_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
-    let mut ser = serde_json::Serializer::with_formatter(Vec::new(), PlainDecimalFormatter);
-    value.serialize(&mut ser)?;
     Ok(ser.into_inner())
 }
 
