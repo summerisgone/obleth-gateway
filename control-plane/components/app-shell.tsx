@@ -10,6 +10,7 @@ import {
   Boxes,
   BarChart3,
   ChevronDown,
+  FolderKanban,
   Gauge,
   FlaskConical,
   KeyRound,
@@ -53,6 +54,7 @@ const navGroups = [
   ] },
   { label: "Access", items: [
     { href: "/tenants", label: "Tenants", icon: Users },
+    { href: "/projects", label: "Projects", icon: FolderKanban },
     { href: "/keys", label: "API Keys", icon: KeyRound },
     { href: "/users", label: "Users", icon: UserCog },
   ] },
