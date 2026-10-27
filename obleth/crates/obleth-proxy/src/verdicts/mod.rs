@@ -53,6 +53,11 @@ const MIN_IN_SET_MASS: f64 = 0.05;
 /// pipeline.
 const TRANSIENT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
+/// A two-letter code's first letter needs at least this much bare-letter mass
+/// on the first call before its second letter is read with a continuation
+/// call. Below it the letter's codes keep only what single-token codes gave.
+const CONTINUE_MIN_MASS: f64 = 0.01;
+
 /// Models observed to need the empty-think prefill (see
 /// [`prompt::build_body_prefilled`]): their plain call's first token is
 /// reasoning prose, never an answer label. Learned at request time from a
@@ -122,6 +127,8 @@ pub(crate) struct QuestionCall {
     pub id: String,
     pub labels: Vec<String>,
     pub boolean: bool,
+    /// The labels are two-letter codes (a choice past 26 options).
+    pub two_letter: bool,
     pub shared: Arc<SharedPrompt>,
     pub user: String,
 }
@@ -135,6 +142,18 @@ enum Variant {
     Prefill,
     /// [`prompt::build_body_spliced`], sent to `/v1/completions`.
     Splice,
+    /// [`prompt::build_body_continued`] after this first letter, without
+    /// (`false`) or with (`true`) the empty think block.
+    Continue(char, bool),
+    /// [`prompt::build_body_spliced_continued`] after this first letter.
+    SpliceContinue(char),
+}
+
+impl Variant {
+    /// Sent to `/v1/completions` and answered in its logprobs shape.
+    fn is_splice(self) -> bool {
+        matches!(self, Variant::Splice | Variant::SpliceContinue(_))
+    }
 }
 
 impl QuestionCall {
@@ -151,6 +170,20 @@ impl QuestionCall {
                 prompt::build_body_prefilled(&p.upstream_model, &p.system, &self.user, &p.images)
             }
             Variant::Splice => prompt::build_body_spliced(&p.upstream_model, &p.system, &self.user),
+            Variant::Continue(first, think) => prompt::build_body_continued(
+                &p.upstream_model,
+                &p.system,
+                &self.user,
+                &p.images,
+                think,
+                first,
+            ),
+            Variant::SpliceContinue(first) => prompt::build_body_spliced_continued(
+                &p.upstream_model,
+                &p.system,
+                &self.user,
+                first,
+            ),
         }
     }
 
@@ -213,8 +246,20 @@ pub(crate) async fn fan_out(
     let futures = calls.into_iter().map(|call| async move {
         let start_ms = crate::tracer::now_ms();
         let started = Instant::now();
-        let in_set_of =
-            |s: &QuestionSuccess| answers::label_masses(&s.entries, &call.labels, call.boolean).1;
+        // A two-letter code split by the vocabulary starts with a bare first
+        // letter: that is answer mass too, read out by the continuation below.
+        let in_set_of = |s: &QuestionSuccess| {
+            let direct = answers::label_masses(&s.entries, &call.labels, call.boolean).1;
+            if call.two_letter {
+                direct
+                    + answers::first_letter_masses(&s.entries, &call.labels)
+                        .iter()
+                        .map(|(_, m)| m)
+                        .sum::<f64>()
+            } else {
+                direct
+            }
+        };
         let splice_first = splice_known && call.can_splice();
         let prefill_first = !splice_first && prefill_known;
         let (first_url, first_variant) = if splice_first {
@@ -299,6 +344,50 @@ pub(crate) async fn fan_out(
                 };
             }
         }
+        // Two-letter codes on a vocabulary that splits them: the call above
+        // ended on a first letter, so read each likely first letter's second
+        // letter with one more call, in the same envelope the answer came
+        // from. Codes the vocabulary holds whole need none of this.
+        if call.two_letter {
+            if let Ok(success) = &mut result {
+                let pending: Vec<(char, f64)> =
+                    answers::first_letter_masses(&success.entries, &call.labels)
+                        .into_iter()
+                        .filter(|(_, m)| *m >= CONTINUE_MIN_MASS)
+                        .collect();
+                let (cont_url, think, splice) = (
+                    if success.used_splice { splice_url } else { url },
+                    success.used_prefill,
+                    success.used_splice,
+                );
+                let continued =
+                    futures_util::future::join_all(pending.iter().map(|&(first, _)| {
+                        let variant = if splice {
+                            Variant::SpliceContinue(first)
+                        } else {
+                            Variant::Continue(first, think)
+                        };
+                        one_call(http, cont_url, api_key, headers, &call, variant, timeout)
+                    }))
+                    .await;
+                for ((first, mass), cont) in pending.into_iter().zip(continued) {
+                    // A failed continuation leaves that letter's codes with
+                    // only their single-token mass, which lowers confidence.
+                    if let Ok(cont) = cont {
+                        success.entries.extend(answers::continuation_entries(
+                            first,
+                            mass,
+                            &cont.entries,
+                            &call.labels,
+                        ));
+                        success.input_tokens =
+                            success.input_tokens.saturating_add(cont.input_tokens);
+                        success.output_tokens =
+                            success.output_tokens.saturating_add(cont.output_tokens);
+                    }
+                }
+            }
+        }
         QuestionOutcome {
             id: call.id,
             result,
@@ -379,7 +468,7 @@ async fn one_attempt(
             .json()
             .await
             .map_err(|e| format!("upstream returned invalid JSON: {e}"))?;
-        let entries = if variant == Variant::Splice {
+        let entries = if variant.is_splice() {
             answers::parse_completions_top_logprobs(&completion)?
         } else {
             answers::parse_top_logprobs(&completion)?
@@ -1163,6 +1252,7 @@ async fn handler_inner(
                 id: id.clone(),
                 labels: labels.labels.clone(),
                 boolean: matches!(labels.semantics, prompt::LabelSemantics::Boolean),
+                two_letter: prompt::is_two_letter(&labels.labels),
                 shared: shared.clone(),
                 user,
             }
@@ -1206,6 +1296,24 @@ async fn handler_inner(
                             "value": answer.value,
                             "confidence": answer.confidence,
                             "in_set_mass": in_set,
+                            "input_tokens": success.input_tokens,
+                            "output_tokens": success.output_tokens,
+                            "think_prefill": success.used_prefill,
+                            "harmony_splice": success.used_splice,
+                        });
+                        verdicts_map.insert(outcome.id.clone(), answer);
+                        ("ok", attrs)
+                    }
+                    // No label at all, and the caller asked for an answer
+                    // anyway: an even distribution at confidence 0.
+                    Err(reason) if request.on_no_answer == types::OnNoAnswer::LowConfidence => {
+                        let scored = answers::unanswered(labels.labels.len());
+                        let mut answer = answers::build_answer(question, labels, &scored);
+                        answer.answered = Some(false);
+                        let attrs = serde_json::json!({
+                            "type": answer.kind,
+                            "answered": false,
+                            "reason": reason,
                             "input_tokens": success.input_tokens,
                             "output_tokens": success.output_tokens,
                             "think_prefill": success.used_prefill,
@@ -1381,6 +1489,7 @@ mod tests {
             // The canned upstream answers ` A`/` B`, so these labels match.
             labels: vec!["A".to_string(), "B".to_string()],
             boolean: false,
+            two_letter: false,
             shared: Arc::new(SharedPrompt {
                 upstream_model: "upstream-model".to_string(),
                 system: "shared system".to_string(),
@@ -1850,6 +1959,128 @@ mod tests {
         let per_image = proxy::IMAGE_PART_TOKEN_ESTIMATE as u32;
         assert_eq!(est.input_tokens, 2 * (100 + 2 * per_image + 10 + 8));
     }
+
+    /// An upstream for two-letter codes. `split` answers like a vocabulary
+    /// that splits codes: the first token is the bare letter `B`, and after a
+    /// continued `B` the next token is `M`. Otherwise it answers the whole
+    /// code `BM` as one token.
+    async fn serve_codes(
+        split: bool,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let bodies: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let (h, b) = (hits.clone(), bodies.clone());
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let (hits, bodies) = (h.clone(), b.clone());
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let continued = body.pointer("/messages/2/content").and_then(|v| v.as_str());
+                    let top = match (split, continued) {
+                        (true, Some("B")) => serde_json::json!([
+                            {"token": "M", "logprob": (0.9f64).ln()},
+                            {"token": "N", "logprob": (0.1f64).ln()}
+                        ]),
+                        (true, _) => serde_json::json!([
+                            {"token": " B", "logprob": (0.8f64).ln()},
+                            {"token": "The", "logprob": (0.2f64).ln()}
+                        ]),
+                        (false, _) => serde_json::json!([
+                            {"token": "BM", "logprob": (0.95f64).ln()},
+                            {"token": " BM", "logprob": (0.05f64).ln()}
+                        ]),
+                    };
+                    bodies.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({
+                        "choices": [{"logprobs": {"content": [{"token": "x", "logprob": 0.0, "top_logprobs": top}]}}],
+                        "usage": {"prompt_tokens": 50, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/v1/chat/completions"), hits, bodies)
+    }
+
+    fn code_call() -> QuestionCall {
+        let labels: Vec<String> = (0..60)
+            .map(|i| {
+                let l = |k: usize| (b'A' + k as u8) as char;
+                format!("{}{}", l(i / 26), l(i % 26))
+            })
+            .collect();
+        QuestionCall {
+            id: "q".to_string(),
+            labels,
+            boolean: false,
+            two_letter: true,
+            shared: Arc::new(SharedPrompt {
+                upstream_model: "upstream-model".to_string(),
+                system: "shared system".to_string(),
+                images: Vec::new(),
+            }),
+            user: "question".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn whole_code_tokens_need_no_second_call() {
+        let (url, hits, _) = serve_codes(false).await;
+        let call = code_call();
+        let labels = call.labels.clone();
+        let outcomes = fan_out(
+            &reqwest::Client::new(),
+            &url,
+            None,
+            &reqwest::header::HeaderMap::new(),
+            "codes-whole",
+            vec![call],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let success = outcomes[0].result.as_ref().unwrap();
+        let (masses, in_set) = answers::label_masses(&success.entries, &labels, false);
+        assert!((in_set - 1.0).abs() < 1e-9);
+        assert!((masses[26 + 12] - 1.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn a_split_code_is_read_with_a_continuation_call() {
+        let (url, hits, bodies) = serve_codes(true).await;
+        let call = code_call();
+        let labels = call.labels.clone();
+        let outcomes = fan_out(
+            &reqwest::Client::new(),
+            &url,
+            None,
+            &reqwest::header::HeaderMap::new(),
+            "codes-split",
+            vec![call],
+            Duration::from_secs(5),
+        )
+        .await;
+        // The first call, then one continuation for `B` (`The` starts no code).
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let continued = bodies.lock().unwrap()[1].clone();
+        assert_eq!(continued["messages"][2]["content"], "B");
+        assert_eq!(continued["continue_final_message"], true);
+        let success = outcomes[0].result.as_ref().unwrap();
+        assert_eq!(success.input_tokens, 100);
+        assert!(
+            !success.used_prefill,
+            "bare-letter mass is an answer, not thinking"
+        );
+        let (masses, in_set) = answers::label_masses(&success.entries, &labels, false);
+        assert!((masses[26 + 12] - 0.72).abs() < 1e-9, "BM = 0.8 * 0.9");
+        assert!((masses[26 + 13] - 0.08).abs() < 1e-9, "BN = 0.8 * 0.1");
+        assert!((in_set - 0.8).abs() < 1e-9);
+    }
 }
 
 #[cfg(test)]
@@ -2223,5 +2454,76 @@ mod model_choice_tests {
             body["error"]["message"],
             "no model is available to satisfy the auto request"
         );
+    }
+
+    /// Never answers with a label: its only likely first token is `The`.
+    async fn spawn_unlabeled_upstream() -> String {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(json!({
+                    "choices": [{"logprobs": {"content": [{
+                        "token": "The", "logprob": -0.01,
+                        "top_logprobs": [{"token": "The", "logprob": -0.01}]
+                    }]}}],
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 1}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn no_answer_is_an_error_unless_the_request_asks_for_low_confidence() {
+        let Some(gw) = gateway(AutoRouterSettings::default()).await else {
+            return;
+        };
+        let base = spawn_unlabeled_upstream().await;
+        gw.register("mute", &base).await;
+        let secret = gw.key().await;
+        let questions = json!({"team": {"type": "choice", "instructions": "?", "criteria": {"a": null, "b": null}}});
+
+        let (status, body) = gw
+            .verdicts(
+                &secret,
+                json!({"model": "mute", "state": "x", "questions": questions}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+
+        let (status, body) = gw
+            .verdicts(
+                &secret,
+                json!({"model": "mute", "state": "x", "questions": questions, "on_no_answer": "low_confidence"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = &body["verdicts"]["team"];
+        assert_eq!(v["answered"], false);
+        assert_eq!(v["confidence"], 0.0);
+        assert_eq!(v["probabilities"], json!({"a": 0.5, "b": 0.5}));
+    }
+
+    #[tokio::test]
+    async fn an_answered_verdict_carries_no_answered_field() {
+        let Some(gw) = gateway(AutoRouterSettings::default()).await else {
+            return;
+        };
+        let (_, base) = spawn_upstream().await;
+        gw.register("judge", &base).await;
+        let secret = gw.key().await;
+        let (status, body) = gw
+            .verdicts(
+                &secret,
+                json!({"model": "judge", "state": "x", "questions": question(), "on_no_answer": "low_confidence"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["verdicts"]["q"].get("answered").is_none(), "{body}");
     }
 }

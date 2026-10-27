@@ -13,8 +13,14 @@
 //! token's `top_logprobs` is the entire answer distribution. Digits are
 //! deliberately not used for score levels: `"10"` is two tokens on
 //! SentencePiece vocabularies and `1` is an ambiguous prefix of it.
+//!
+//! A choice with more options than letters gets two-letter codes (`AA`, `AB`,
+//! …) instead. Large vocabularies hold every such pair as one token, so the
+//! first token is still the whole answer; where a vocabulary splits a code,
+//! the first token is its first letter and a continuation call reads the
+//! second (see [`build_body_continued`]).
 
-use super::types::{BooleanCriteria, Question};
+use super::types::{BooleanCriteria, Question, MAX_LETTER_OPTIONS};
 
 /// Letters used for choice options and score levels, in assignment order.
 const LETTERS: [char; 26] = [
@@ -64,6 +70,8 @@ pub(crate) fn render_system(state: &serde_json::Value) -> String {
 
 /// Assign answer labels to a question. Choice options take letters in the
 /// map's (sorted) iteration order; the order is part of the documented API.
+/// Past 26 options every option takes a two-letter code in the same order:
+/// `AA`..`AZ`, `BA`..`BZ`, and so on.
 pub(crate) fn labels_for(q: &Question) -> LabelSet {
     match q {
         Question::Boolean { .. } => LabelSet {
@@ -72,11 +80,18 @@ pub(crate) fn labels_for(q: &Question) -> LabelSet {
         },
         Question::Choice { criteria, .. } => {
             let options: Vec<String> = criteria.keys().cloned().collect();
+            let two_letter = options.len() > MAX_LETTER_OPTIONS;
             LabelSet {
                 labels: options
                     .iter()
                     .enumerate()
-                    .map(|(i, _)| LETTERS[i].to_string())
+                    .map(|(i, _)| {
+                        if two_letter {
+                            format!("{}{}", LETTERS[i / 26], LETTERS[i % 26])
+                        } else {
+                            LETTERS[i].to_string()
+                        }
+                    })
                     .collect(),
                 semantics: LabelSemantics::Choice(options),
             }
@@ -126,7 +141,11 @@ pub(crate) fn render_user(q: &Question, labels: &LabelSet) -> String {
                     d => out.push_str(&format!("{label}) {option} — {}\n", render_value(d))),
                 }
             }
-            out.push_str("\nAnswer with the letter of the best option.");
+            if is_two_letter(&labels.labels) {
+                out.push_str("\nAnswer with the two-letter code of the best option.");
+            } else {
+                out.push_str("\nAnswer with the letter of the best option.");
+            }
             out
         }
         Question::Score {
@@ -145,6 +164,13 @@ pub(crate) fn render_user(q: &Question, labels: &LabelSet) -> String {
             out
         }
     }
+}
+
+/// Whether a label set is two-letter codes (a choice past 26 options).
+pub(crate) fn is_two_letter(labels: &[String]) -> bool {
+    labels
+        .first()
+        .is_some_and(|l| l.len() == 2 && l.bytes().all(|b| b.is_ascii_uppercase()))
 }
 
 /// The user message's content: the question text alone, or the images
@@ -217,6 +243,57 @@ pub(crate) fn build_body_prefilled(
         "top_logprobs": 20,
         "stream": false,
     })
+}
+
+/// The call that reads a two-letter code's second letter: the assistant turn
+/// is pre-opened with the code's first letter (after the empty think block
+/// when the model needs it) and continued, so the first generated token is
+/// the second letter. Sent only when the first call's mass landed on a bare
+/// first letter, i.e. on a vocabulary that splits the code.
+pub(crate) fn build_body_continued(
+    upstream_model: &str,
+    system: &str,
+    user: &str,
+    images: &[String],
+    think: bool,
+    first: char,
+) -> serde_json::Value {
+    let opened = if think {
+        format!("<think></think>{first}")
+    } else {
+        first.to_string()
+    };
+    serde_json::json!({
+        "model": upstream_model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content(user, images)},
+            {"role": "assistant", "content": opened},
+        ],
+        "add_generation_prompt": false,
+        "continue_final_message": true,
+        "max_tokens": 1,
+        "temperature": 0,
+        "logprobs": true,
+        "top_logprobs": 20,
+        "stream": false,
+    })
+}
+
+/// [`build_body_continued`] for the harmony splice: the open final channel
+/// already holds the code's first letter.
+pub(crate) fn build_body_spliced_continued(
+    upstream_model: &str,
+    system: &str,
+    user: &str,
+    first: char,
+) -> serde_json::Value {
+    let mut body = build_body_spliced(upstream_model, system, user);
+    if let Some(prompt) = body.get_mut("prompt") {
+        let opened = format!("{}{first}", prompt.as_str().unwrap_or_default());
+        *prompt = serde_json::json!(opened);
+    }
+    body
 }
 
 /// The same call as a raw `/v1/completions` body with a hand-rendered
@@ -416,5 +493,77 @@ mod tests {
         };
         let user = render_user(&q, &labels_for(&q));
         assert!(user.contains("\"name\": \"John Smith\""));
+    }
+
+    fn options(n: usize) -> Question {
+        let names: Vec<(String, serde_json::Value)> = (0..n)
+            .map(|i| (format!("opt{i:03}"), serde_json::Value::Null))
+            .collect();
+        Question::Choice {
+            instructions: serde_json::json!("pick one"),
+            criteria: names.into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn up_to_26_options_keep_single_letters_and_the_letter_instruction() {
+        let q = options(26);
+        let labels = labels_for(&q);
+        assert_eq!(labels.labels.first().unwrap(), "A");
+        assert_eq!(labels.labels.last().unwrap(), "Z");
+        assert!(!is_two_letter(&labels.labels));
+        let user = render_user(&q, &labels);
+        assert!(user.contains("Z) opt025\n"));
+        assert!(user.ends_with("\nAnswer with the letter of the best option."));
+    }
+
+    #[test]
+    fn past_26_options_every_option_takes_a_two_letter_code() {
+        let q = options(151);
+        let labels = labels_for(&q);
+        assert!(is_two_letter(&labels.labels));
+        assert_eq!(labels.labels[0], "AA");
+        assert_eq!(labels.labels[25], "AZ");
+        assert_eq!(labels.labels[26], "BA");
+        assert_eq!(labels.labels[150], "FU");
+        let user = render_user(&q, &labels);
+        assert!(user.contains("AA) opt000\n"));
+        assert!(user.contains("FU) opt150\n"));
+        assert!(user.ends_with("\nAnswer with the two-letter code of the best option."));
+        let max = labels_for(&options(255));
+        assert_eq!(max.labels.last().unwrap(), "JU");
+    }
+
+    #[test]
+    fn boolean_and_score_labels_are_never_two_letter_codes() {
+        let boolean = Question::Boolean {
+            instructions: serde_json::json!("?"),
+            criteria: None,
+        };
+        assert!(!is_two_letter(&labels_for(&boolean).labels));
+        let score = Question::Score {
+            instructions: serde_json::json!("?"),
+            criteria: vec![serde_json::json!("low"), serde_json::json!("high")],
+        };
+        assert!(!is_two_letter(&labels_for(&score).labels));
+    }
+
+    #[test]
+    fn the_continued_body_opens_the_answer_with_the_first_letter() {
+        let body = build_body_continued("m", "sys", "user", &[], false, 'B');
+        assert_eq!(
+            body["messages"][2],
+            serde_json::json!({"role": "assistant", "content": "B"})
+        );
+        assert_eq!(body["continue_final_message"], true);
+        assert_eq!(body["add_generation_prompt"], false);
+        assert_eq!(body["max_tokens"], 1);
+        let think = build_body_continued("m", "sys", "user", &[], true, 'C');
+        assert_eq!(think["messages"][2]["content"], "<think></think>C");
+        let spliced = build_body_spliced_continued("m", "sys", "user", 'D');
+        assert!(spliced["prompt"]
+            .as_str()
+            .unwrap()
+            .ends_with("<|start|>assistant<|channel|>final<|message|>D"));
     }
 }

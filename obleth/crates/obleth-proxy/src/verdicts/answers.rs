@@ -134,6 +134,71 @@ pub(crate) fn label_masses(
     (masses, in_set)
 }
 
+/// For two-letter codes: the mass on each bare first letter, which is where a
+/// vocabulary that splits `BM` into `B` + `M` puts the answer. A letter that
+/// starts no code is not counted. Letters come back in code order.
+pub(crate) fn first_letter_masses(entries: &[TopLogprob], labels: &[String]) -> Vec<(char, f64)> {
+    let mut firsts: Vec<(char, f64)> = Vec::new();
+    for label in labels {
+        if let Some(c) = label.chars().next() {
+            if firsts.last().map(|(l, _)| *l) != Some(c) {
+                firsts.push((c, 0.0));
+            }
+        }
+    }
+    for entry in entries {
+        let token = normalize(&entry.token, false);
+        let mut chars = token.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if let Some(slot) = firsts.iter_mut().find(|(l, _)| *l == c) {
+                slot.1 += entry.logprob.exp();
+            }
+        }
+    }
+    firsts
+}
+
+/// Turn a continuation call's top tokens (read after the first letter `first`)
+/// into entries for whole codes: `P(first) · P(second | first)` for each
+/// second letter that completes a code. Appended to the first call's entries,
+/// they count toward their codes in [`label_masses`] like a single-token code.
+pub(crate) fn continuation_entries(
+    first: char,
+    first_mass: f64,
+    entries: &[TopLogprob],
+    labels: &[String],
+) -> Vec<TopLogprob> {
+    entries
+        .iter()
+        .filter_map(|e| {
+            let token = normalize(&e.token, false);
+            let mut chars = token.chars();
+            let (Some(second), None) = (chars.next(), chars.next()) else {
+                return None;
+            };
+            let code = format!("{first}{second}");
+            labels.contains(&code).then(|| TopLogprob {
+                token: code,
+                logprob: first_mass.ln() + e.logprob,
+            })
+        })
+        .collect()
+}
+
+/// The answer for a question the model gave no label at all, when the request
+/// asked for `on_no_answer: "low_confidence"`: every label equally likely and
+/// confidence 0.
+pub(crate) fn unanswered(labels: usize) -> Scored {
+    let k = labels.max(1);
+    let p = 1.0 / k as f64;
+    Scored {
+        probs: vec![p; k],
+        argmax: 0,
+        confidence: 0.0,
+        expected: (k as f64 + 1.0) / 2.0,
+    }
+}
+
 /// The renormalized distribution over labels plus derived quantities.
 #[derive(Debug)]
 pub(crate) struct Scored {
@@ -198,6 +263,7 @@ pub(crate) fn build_answer(q: &Question, labels: &LabelSet, scored: &Scored) -> 
             }),
             confidence: scored.confidence,
             expected_value: None,
+            answered: None,
         },
         (LabelSemantics::Choice(options), _) => Verdict {
             kind: "choice",
@@ -211,6 +277,7 @@ pub(crate) fn build_answer(q: &Question, labels: &LabelSet, scored: &Scored) -> 
             ),
             confidence: scored.confidence,
             expected_value: None,
+            answered: None,
         },
         (LabelSemantics::Score, _) => Verdict {
             kind: "score",
@@ -218,6 +285,7 @@ pub(crate) fn build_answer(q: &Question, labels: &LabelSet, scored: &Scored) -> 
             probabilities: serde_json::json!(scored.probs),
             confidence: scored.confidence,
             expected_value: Some(scored.expected),
+            answered: None,
         },
     }
 }
@@ -495,5 +563,81 @@ mod tests {
         assert_eq!(scored.argmax, 1);
         assert!(scored.probs[1] > 0.7);
         assert!(scored.confidence > 0.0 && scored.confidence < 1.0);
+    }
+
+    fn entries(list: &[(&str, f64)]) -> Vec<TopLogprob> {
+        list.iter()
+            .map(|(t, p)| TopLogprob {
+                token: t.to_string(),
+                logprob: p.ln(),
+            })
+            .collect()
+    }
+
+    fn codes(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let l = |k: usize| (b'A' + k as u8) as char;
+                format!("{}{}", l(i / 26), l(i % 26))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn whole_code_tokens_count_like_single_letters() {
+        let labels = codes(60);
+        let (masses, in_set) = label_masses(
+            &entries(&[(" BM", 0.9), ("BN", 0.05), ("The", 0.05)]),
+            &labels,
+            false,
+        );
+        assert!((in_set - 0.95).abs() < 1e-9);
+        assert!((masses[26 + 12] - 0.9).abs() < 1e-9);
+        assert!((masses[26 + 13] - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bare_first_letters_are_counted_only_where_a_code_starts() {
+        // 60 codes start with A, B or C; D starts none.
+        let found = first_letter_masses(
+            &entries(&[
+                (" B", 0.6),
+                ("A", 0.2),
+                ("D", 0.1),
+                ("BM", 0.05),
+                ("x", 0.05),
+            ]),
+            &codes(60),
+        );
+        assert_eq!(found.iter().map(|(c, _)| *c).collect::<String>(), "ABC");
+        assert!((found[0].1 - 0.2).abs() < 1e-9);
+        assert!((found[1].1 - 0.6).abs() < 1e-9);
+        assert_eq!(found[2].1, 0.0);
+    }
+
+    #[test]
+    fn a_continuation_multiplies_into_whole_codes() {
+        let labels = codes(60);
+        // After "C" only CA..CH exist (60 codes end at CH).
+        let added = continuation_entries(
+            'C',
+            0.5,
+            &entries(&[("H", 0.8), ("Z", 0.1), ("hi", 0.1)]),
+            &labels,
+        );
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].token, "CH");
+        assert!((added[0].logprob.exp() - 0.4).abs() < 1e-9);
+        let (masses, in_set) = label_masses(&added, &labels, false);
+        assert!((masses[2 * 26 + 7] - 0.4).abs() < 1e-9);
+        assert!((in_set - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_unanswered_question_is_even_at_zero_confidence() {
+        let scored = unanswered(4);
+        assert_eq!(scored.probs, vec![0.25; 4]);
+        assert_eq!(scored.confidence, 0.0);
+        assert!((scored.expected - 2.5).abs() < 1e-9);
     }
 }
