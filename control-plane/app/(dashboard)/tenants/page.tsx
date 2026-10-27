@@ -1,6 +1,7 @@
 import { TenantsList } from "@/components/access/tenants-list";
 import { requireAdmin } from "@/lib/auth/roles";
 import { listUsers, type AdminUser } from "@/lib/auth/users";
+import { accounts, type ProjectSummary } from "@/lib/obleth-accounts";
 import { obleth, type ApiKey, type BudgetUsage, type ModelRoute, type Tenant, type UsageAgg, type UsageDailyRow } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
@@ -12,10 +13,11 @@ export default async function TenantsPage() {
   await requireAdmin();
   const now = new Date();
   const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString().slice(0, 10);
-  const [tenants, keys, users, usage24h, budgets, month, models] = await Promise.all([
+  const [tenants, keys, users, members, usage24h, budgets, month, models] = await Promise.all([
     safe(obleth.listTenants(), [] as Tenant[]),
     safe(obleth.listKeys(), [] as ApiKey[]),
     safe(listUsers(), [] as AdminUser[]),
+    safe(accounts.memberCounts(), [] as ProjectSummary[]),
     safe(obleth.usage(now.getTime() - DAY_MS), [] as UsageAgg[]),
     safe(obleth.budgetUsage(), [] as BudgetUsage[]),
     safe(obleth.usageDaily({ startDay: monthStart, endDay: now.toISOString().slice(0, 10), groupBy: "tenant" }), [] as UsageDailyRow[]),
@@ -29,6 +31,7 @@ export default async function TenantsPage() {
       tenants={tenants}
       keys={keys}
       users={users}
+      memberCounts={Object.fromEntries(members.map((m) => [m.tenant_id, m.members]))}
       usage24h={usage24h}
       budgets={budgets}
       monthSpend={monthSpend}
