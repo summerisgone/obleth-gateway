@@ -8,6 +8,7 @@ import { admin, genericOAuth } from "better-auth/plugins";
 import { getDb } from "@/lib/db";
 import { oidcProviders } from "@/lib/auth/providers";
 import { requireActiveAccountForAdminApi } from "@/lib/auth/admin-access";
+import { ensurePersonalTenant } from "@/lib/auth/personal";
 
 export const SELF_ADMIN_REMOVAL_ERROR = "You cannot remove admin access from your own account";
 export const LAST_ADMIN_REMOVAL_ERROR = "Cannot remove the last active admin";
@@ -152,6 +153,15 @@ export function createAuth(
     // email sign-up endpoint would let anyone mint a (pending) account.
     emailAndPassword: { enabled: true, disableSignUp: true },
     hooks: { before: adminApiBeforeHook },
+    databaseHooks: {
+      session: {
+        create: {
+          after: async (session) => {
+            await ensurePersonalTenant(session.userId);
+          },
+        },
+      },
+    },
     user: {
       additionalFields: {
         role: { type: "string", defaultValue: "user", input: false },
