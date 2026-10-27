@@ -41,6 +41,9 @@ pub struct JwtIssuerConfig {
     pub identity_claims: Vec<String>,
     /// Name of the tenant identity keys are created under.
     pub tenant: String,
+    /// Settings applied only when JIT creates the tenant.
+    #[serde(default)]
+    pub tenant_defaults: Option<crate::TenantDefaults>,
     /// When false, an unknown identity is a 401 rather than being provisioned.
     #[serde(default = "default_true")]
     pub jit_provision: bool,
@@ -104,6 +107,24 @@ pub fn parse_jwt_issuers(raw: &str) -> Result<Vec<JwtIssuerConfig>, JwtConfigErr
                 i.issuer
             )));
         }
+        if i.tenant.matches("{sub}").count() > 1 {
+            return Err(JwtConfigError::Field(format!(
+                "tenant may contain {{sub}} at most once for issuer {:?}",
+                i.issuer
+            )));
+        }
+        if let Some(p) = i
+            .tenant_defaults
+            .as_ref()
+            .and_then(|d| d.budget_period.as_ref())
+        {
+            if !matches!(p.as_str(), "monthly" | "term" | "lifetime") {
+                return Err(JwtConfigError::Field(format!(
+                    "tenant_defaults.budget_period {p:?} must be monthly, term or lifetime for issuer {:?}",
+                    i.issuer
+                )));
+            }
+        }
         if i.subject_claim.trim().is_empty() {
             return Err(JwtConfigError::Field(format!(
                 "subject_claim must not be blank for issuer {:?}",
@@ -130,6 +151,23 @@ pub fn parse_jwt_issuers(raw: &str) -> Result<Vec<JwtIssuerConfig>, JwtConfigErr
 
 fn is_http_url(s: &str) -> bool {
     s.starts_with("https://") || s.starts_with("http://")
+}
+
+/// Tenant name for a JIT identity: `{sub}` in `template` becomes the subject when
+/// it is 1..=64 ASCII alphanumerics or `-`, else `h` + 32 hex chars of its SHA-256.
+pub fn render_identity_tenant(template: &str, subject: &str) -> String {
+    let plain = (1..=64).contains(&subject.len())
+        && subject
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let safe = if plain {
+        subject.to_string()
+    } else {
+        let mut h = Sha256::new();
+        h.update(subject.as_bytes());
+        format!("h{}", &hex::encode(h.finalize())[..32])
+    };
+    template.replace("{sub}", &safe)
 }
 
 /// Read `OBLETH_JWT_ISSUERS`. A trust anchor that fails to parse must not
@@ -314,5 +352,31 @@ mod tests {
         assert_ne!(a, identity_key_hash("https://idp.example.com", "bob"));
         // The NUL separator prevents (iss="a", sub="bc") colliding with (iss="ab", sub="c").
         assert_ne!(identity_key_hash("a", "bc"), identity_key_hash("ab", "c"));
+    }
+
+    #[test]
+    fn renders_identity_tenant() {
+        assert_eq!(render_identity_tenant("u-{sub}", "3f2a-9c"), "u-3f2a-9c");
+        assert_eq!(render_identity_tenant("open-webui", "x"), "open-webui");
+        let h = render_identity_tenant("u-{sub}", "a@b");
+        assert!(h.starts_with("u-h") && h.len() == 2 + 1 + 32);
+        assert_eq!(h, render_identity_tenant("u-{sub}", "a@b"));
+        assert_ne!(h, render_identity_tenant("u-{sub}", "a_b"));
+        assert!(render_identity_tenant("u-{sub}", &"x".repeat(65)).starts_with("u-h"));
+    }
+
+    #[test]
+    fn tenant_defaults_parse_and_validate() {
+        let ok = r#"[{"issuer":"https://idp.example.com","audience":"a","tenant":"u-{sub}","tenant_defaults":{"fairshare_group":"personal","budget_tokens":1000,"budget_period":"monthly","allowed_models":["m"]}}]"#;
+        let i = &parse_jwt_issuers(ok).unwrap()[0];
+        assert_eq!(
+            i.tenant_defaults.as_ref().unwrap().budget_tokens,
+            Some(1000)
+        );
+        assert!(parse_jwt_issuers(
+            r#"[{"issuer":"https://idp.example.com","audience":"a","tenant":"u-{sub}-{sub}"}]"#
+        )
+        .is_err());
+        assert!(parse_jwt_issuers(r#"[{"issuer":"https://idp.example.com","audience":"a","tenant":"u","tenant_defaults":{"budget_period":"weekly"}}]"#).is_err());
     }
 }
