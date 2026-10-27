@@ -516,6 +516,8 @@ controlPlane:
   #                        default body credentials.
   # See deploy/k8s/README.md for the full explanation of each.
   oidcProviders: ""   # e.g. '[{"providerId":"dex","displayName":"Dev SSO (Dex)","discoveryUrl":"...","clientId":"...","clientSecret":"...","scopes":["openid","email","profile"]}]'
+  # true: OIDC sign-ins become active users at once (no admin approval step).
+  oidcAutoApprove: false
   resources:
     requests: { cpu: "100m", memory: "256Mi" }
     limits: { cpu: "1", memory: "512Mi" }

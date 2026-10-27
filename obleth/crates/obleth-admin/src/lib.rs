@@ -12,7 +12,9 @@ mod backup;
 pub mod capacity_discovery;
 pub mod energy_probe;
 mod error;
+mod identities;
 pub mod knowledge;
+mod members;
 pub mod model_health;
 mod models_io;
 mod openapi;
@@ -136,6 +138,8 @@ pub struct AdminState {
     /// The gateway's capacity discovery: its settings, which model writes are
     /// checked against.
     pub capacity_discovery: capacity_discovery::CapacityDiscovery,
+    /// JWT issuers the gateway accepts, from the same config as the data plane.
+    pub jwt_issuers: Vec<obleth_config::JwtIssuerConfig>,
 }
 
 /// A boxed call into the data plane's classifier: `(prompt, available_tags)`
@@ -466,6 +470,8 @@ pub fn router(state: AdminState) -> Router {
             post(backup::restore_backup)
                 .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
+        .merge(members::router())
+        .merge(identities::router())
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_admin,
@@ -9481,7 +9487,7 @@ mod tests {
     /// Live-service plumbing for the handful of admin tests that need a real
     /// router. Everything here self-skips when the integration datastores are
     /// not configured, so a plain `cargo test` stays hermetic.
-    mod harness {
+    pub(crate) mod harness {
         use super::*;
         use tower::ServiceExt;
 
@@ -9498,7 +9504,7 @@ mod tests {
         /// CI). Held via `TestApp` so every DB-backed test carries it for its
         /// full duration and a new test cannot forget to take it.
         static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        fn serial() -> &'static tokio::sync::Mutex<()> {
+        pub(crate) fn serial() -> &'static tokio::sync::Mutex<()> {
             SERIAL.get_or_init(tokio::sync::Mutex::default)
         }
 
@@ -9661,6 +9667,7 @@ mod tests {
                 output_stats: Default::default(),
                 classify: None,
                 capacity_discovery,
+                jwt_issuers: vec![],
                 health: ModelHealthRuntime {
                     scheduled_enabled: false,
                     default_interval_secs: 60,
@@ -11793,6 +11800,32 @@ mod tests {
             assert!(
                 schemas.get(name).is_some(),
                 "{name} is not registered in components(...)"
+            );
+        }
+    }
+
+    /// The member, owned-key, kind, project and identity routes live in child
+    /// modules; each handler must be listed in `paths(...)`.
+    #[test]
+    fn openapi_doc_exposes_member_and_identity_handlers() {
+        use utoipa::OpenApi;
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize the openapi doc");
+        for (path, method) in [
+            ("/api/v1/tenants/{id}/members", "get"),
+            ("/api/v1/tenants/{id}/members", "put"),
+            ("/api/v1/tenants/{id}/members", "delete"),
+            ("/api/v1/tenants/{id}/owned-keys", "get"),
+            ("/api/v1/tenants/{id}/owned-keys", "post"),
+            ("/api/v1/tenants/{id}/kind", "put"),
+            ("/api/v1/projects", "get"),
+            ("/api/v1/member-counts", "get"),
+            ("/api/v1/identities", "post"),
+            ("/api/v1/identities", "get"),
+            ("/api/v1/identities/memberships", "get"),
+        ] {
+            assert!(
+                doc["paths"][path][method].is_object(),
+                "{method} {path} is missing from paths(...)"
             );
         }
     }

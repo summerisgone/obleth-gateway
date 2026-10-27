@@ -630,6 +630,7 @@ async fn main() -> anyhow::Result<()> {
             }
         })),
         capacity_discovery: capacity_discovery.clone(),
+        jwt_issuers: cfg.jwt_issuers.clone(),
     };
     obleth_admin::model_health::spawn_worker(admin_state.clone());
     obleth_admin::usage_retention::spawn_worker(admin_state.clone());
