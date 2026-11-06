@@ -137,6 +137,18 @@ use obleth_config::{
         crate::create_model_endpoint,
         crate::update_model_endpoint,
         crate::delete_model_endpoint,
+        // members, projects & identities
+        crate::members::list_members,
+        crate::members::put_member,
+        crate::members::delete_member,
+        crate::members::list_owned_keys,
+        crate::members::create_owned_key,
+        crate::members::put_kind,
+        crate::members::list_projects,
+        crate::members::member_counts,
+        crate::identities::provision_identity,
+        crate::identities::identities_by_email,
+        crate::identities::memberships,
         // managed models & replicas
         crate::list_managed_models,
         crate::get_managed_model,
@@ -413,6 +425,11 @@ use obleth_config::{
         crate::usage::SpanEntry,
         crate::recipes::RecipeView,
         crate::recipes::UpsertRecipeBody,
+        crate::members::PutMember,
+        crate::members::CreateOwnedKey,
+        crate::members::PutKind,
+        crate::identities::ProvisionIdentityBody,
+        crate::identities::ProvisionedIdentityOut,
     )),
     tags(
         (name = "meta", description = "Gateway build/version identity and resolver-cache reconcile"),
@@ -427,7 +444,9 @@ use obleth_config::{
         (name = "capacity", description = "Global gateway in-flight capacity"),
         (name = "settings", description = "Runtime alerting, auto-router, and retention configuration"),
         (name = "backup", description = "Configuration backup and restore"),
-        (name = "slurm", description = "Live Slurm cluster resource discovery")
+        (name = "slurm", description = "Live Slurm cluster resource discovery"),
+        (name = "members", description = "Tenant members, owned keys, tenant kind, and the project list"),
+        (name = "identities", description = "Identity provisioning, lookup by email, and memberships")
     )
 )]
 pub struct ApiDoc;

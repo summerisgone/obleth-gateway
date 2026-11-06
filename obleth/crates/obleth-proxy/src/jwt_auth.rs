@@ -18,8 +18,10 @@ use axum::http::{Response, StatusCode};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use obleth_admin::AlertDispatcher;
-use obleth_config::{sanitize_device_id, IdentityProvision, JwtIssuerConfig, ResolvedKey};
-use obleth_store::Store;
+use obleth_config::{
+    render_identity_tenant, sanitize_device_id, IdentityProvision, JwtIssuerConfig, ResolvedKey,
+};
+use obleth_store::{ProvisionOptions, Store};
 use tokio::sync::Mutex;
 
 use crate::metrics::Metrics;
@@ -588,14 +590,22 @@ impl JwtAuth {
                     return Err(AuthFailure::BackendUnavailable);
                 }
             }
+            let (tenant_name, personal) = identity_tenant(cfg, &identity.subject);
             let provisioned = self
                 .store
-                .provision_identity_key(IdentityProvision {
-                    issuer: &identity.issuer,
-                    subject: &identity.subject,
-                    tenant_name: &cfg.tenant,
-                    claims: identity.identity_claims.clone(),
-                })
+                .provision_identity_key_with(
+                    IdentityProvision {
+                        issuer: &identity.issuer,
+                        subject: &identity.subject,
+                        tenant_name: &tenant_name,
+                        claims: identity.identity_claims.clone(),
+                    },
+                    ProvisionOptions {
+                        defaults: cfg.tenant_defaults.as_ref(),
+                        personal,
+                        rehome: false,
+                    },
+                )
                 .await
                 .map_err(|e| {
                     tracing::warn!(error = %e, "identity provisioning failed");
@@ -610,7 +620,7 @@ impl JwtAuth {
                     );
                     AuthFailure::ProvisioningUnavailable
                 })?;
-            if provisioned.tenant_created {
+            if provisioned.tenant_created && !personal {
                 // In a deployment whose account system already manages the
                 // tenant, creation almost always means a config typo silently
                 // forked CLI traffic onto fresh default policy. Loud on purpose.
@@ -718,6 +728,15 @@ mod inflight_tests {
     }
 }
 
+/// Tenant name for a verified subject and whether it is a per-user (personal)
+/// tenant, i.e. the configured template contains `{sub}`.
+pub(crate) fn identity_tenant(cfg: &JwtIssuerConfig, subject: &str) -> (String, bool) {
+    (
+        render_identity_tenant(&cfg.tenant, subject),
+        cfg.tenant.contains("{sub}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,8 +819,21 @@ mod tests {
             device_claim: Some("device_id".into()),
             identity_claims: vec!["uid".into()],
             tenant: "cli-users".into(),
+            tenant_defaults: None,
             jit_provision: true,
         }
+    }
+
+    #[test]
+    fn identity_tenant_renders_template() {
+        let mut cfg = issuer_cfg("http://x");
+        cfg.tenant = "u-{sub}".into();
+        assert_eq!(identity_tenant(&cfg, "s1"), ("u-s1".to_string(), true));
+        cfg.tenant = "open-webui".into();
+        assert_eq!(
+            identity_tenant(&cfg, "s1"),
+            ("open-webui".to_string(), false)
+        );
     }
 
     fn now() -> i64 {

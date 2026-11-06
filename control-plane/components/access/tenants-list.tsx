@@ -60,6 +60,7 @@ export function TenantsList({
   tenants,
   keys,
   users,
+  memberCounts,
   usage24h,
   budgets,
   monthSpend,
@@ -68,6 +69,7 @@ export function TenantsList({
   tenants: Tenant[];
   keys: ApiKey[];
   users: AdminUser[];
+  memberCounts: Record<string, number>;
   usage24h: UsageAgg[];
   budgets: BudgetUsage[];
   /** Spend this calendar month, by tenant id. */
@@ -83,7 +85,7 @@ export function TenantsList({
   const [sort, setSort] = useState<TenantSort>("requests");
   const [adding, setAdding] = useState(false);
 
-  const rows = useMemo(() => buildTenantRows(tenants, keys, users, usage24h, budgets, fairshare.data), [tenants, keys, users, usage24h, budgets, fairshare.data]);
+  const rows = useMemo(() => buildTenantRows(tenants, keys, users, memberCounts, usage24h, budgets, fairshare.data), [tenants, keys, users, memberCounts, usage24h, budgets, fairshare.data]);
   const shown = useMemo(() => sortTenants(filterTenants(rows, { query, status, group, has }), sort), [rows, query, status, group, has, sort]);
   const groups = [...new Set(tenants.map((t) => t.fairshare_group))].sort();
   const count = (s: string) => tenants.filter((t) => t.status === s).length;
