@@ -98,4 +98,8 @@ pub struct AppState {
     /// Keeps one request from taking down every server of a model; see
     /// [`crate::crash_guard`].
     pub crash_guard: crate::crash_guard::CrashGuard,
+    /// GenAI OTLP export; `None` unless `OBLETH_GENAI_OTLP_ENDPOINT` is set.
+    pub genai: Option<crate::genai_export::exporter::ExporterHandle>,
+    /// Request bodies over this are exported without content.
+    pub genai_max_request_bytes: usize,
 }

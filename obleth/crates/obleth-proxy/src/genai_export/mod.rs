@@ -1,5 +1,4 @@
-#![allow(dead_code)]
-
+#[allow(dead_code)] // attached to responses by T8
 pub mod collector;
 pub mod config;
 pub mod exporter;

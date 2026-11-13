@@ -1392,6 +1392,8 @@ mod pipeline_tests {
             jobs: JobStore::new(store.clone(), scope),
             load: None,
             crash_guard: crate::crash_guard::CrashGuard::disabled(),
+            genai: None,
+            genai_max_request_bytes: 0,
             batches: None,
         };
         Some(Gateway {

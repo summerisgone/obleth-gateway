@@ -452,6 +452,32 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("GET /v1/load is off (OBLETH_LOAD_ENDPOINT)");
     }
 
+    let genai_cfg =
+        genai_export::config::GenAiConfig::from_env_map(&std::env::vars().collect())
+            .map_err(|e| anyhow::anyhow!(e))?
+            .map(Arc::new);
+    let genai_max_request_bytes = genai_cfg.as_ref().map_or(0, |c| c.max_request_bytes);
+    let genai = match genai_cfg {
+        Some(cfg) => {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()?;
+            let scrubber = Arc::new(genai_export::scrub::Scrubber::new(
+                cfg.clone(),
+                client.clone(),
+            ));
+            let process = genai_export::pipeline::process_fn(cfg.clone(), scrubber);
+            tracing::info!("GenAI OTLP export is on");
+            Some(genai_export::exporter::Exporter::start(
+                cfg,
+                client,
+                process,
+                metrics.registry(),
+            ))
+        }
+        None => None,
+    };
+
     let app_state = AppState {
         redis: redis.clone(),
         fairshare: fairshare.clone(),
@@ -489,6 +515,8 @@ async fn main() -> anyhow::Result<()> {
         jobs: jobs::JobStore::new(store.clone(), cfg.job_scope),
         load,
         crash_guard: crate::crash_guard::CrashGuard::new(Some(capacity_discovery.clone())),
+        genai: genai.clone(),
+        genai_max_request_bytes,
         batches: batches::BatchConfig::from_env()
             .map(|cfg| batches::Batches::new(store.clone(), cfg)),
     };
@@ -744,6 +772,9 @@ async fn main() -> anyhow::Result<()> {
     // Only once drained: a draining replica still holds its in-flight slots.
     if let Some(heartbeat) = replica_heartbeat {
         heartbeat.stop().await;
+    }
+    if let Some(exporter) = &genai {
+        exporter.shutdown(Duration::from_secs(5)).await;
     }
     telemetry.shutdown().await;
     if let Some(provider) = otel_provider {

@@ -1232,6 +1232,16 @@ async fn run_pipeline(
         Ok(b) => b,
         Err(_) => return error_json(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
+    // The client's body, before any rewrite below; a refcount bump, not a copy.
+    let genai_capture = capture_genai(
+        state.genai.as_ref().map(|_| state.genai_max_request_bytes),
+        &resolved,
+        batch.is_some(),
+        &method,
+        &path,
+        &headers,
+        &body_bytes,
+    );
     let mut json: serde_json::Value =
         serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
     // `stream` decides how the answer is read and what it is billed from. A
@@ -1383,6 +1393,11 @@ async fn run_pipeline(
         failure: None,
         crash_fp: String::new(),
         client: client.clone(),
+        genai: genai_capture,
+        genai_collector: None,
+        genai_start_nanos: unix_nanos_now(),
+        genai_route: GenAiRoute::default(),
+        genai_tool_turns: 0,
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -1741,6 +1756,9 @@ async fn run_pipeline(
                 return resp;
             }
         }
+    }
+    if req_meta.genai.is_some() {
+        req_meta.genai_route = genai_route_of(route.as_deref(), &state.upstream_base);
     }
     // The name the client used, for its usage row and response headers. The
     // ledger's `model` stays the parent's.
@@ -3012,6 +3030,12 @@ async fn run_pipeline(
         break;
     }
 
+    if req_meta.genai.is_some() {
+        (
+            req_meta.genai_route.server_address,
+            req_meta.genai_route.server_port,
+        ) = server_of(&last_url);
+    }
     let url = last_url;
     let dispatch_ms = (crate::tracer::now_ms() - dispatch_start) as u32;
     let upstream = match upstream_resp {
@@ -6958,6 +6982,201 @@ pub(crate) struct RequestMeta {
     /// Where the request came from, for the ledger's client columns. Unknown
     /// (empty) for work the gateway runs itself.
     pub(crate) client: crate::client::ClientInfo,
+    /// The request body for GenAI export; `None` when the request is not
+    /// exported.
+    pub(crate) genai: Option<Arc<crate::genai_export::GenAiCapture>>,
+    /// Collects the reply for GenAI export; attached by the response branches.
+    pub(crate) genai_collector: Option<crate::genai_export::collector::Collector>,
+    /// When the request arrived, in unix nanoseconds.
+    pub(crate) genai_start_nanos: u64,
+    /// The provider, routed model and upstream address, once known.
+    pub(crate) genai_route: GenAiRoute,
+    /// Gateway tool-loop turns taken before the final reply.
+    pub(crate) genai_tool_turns: u32,
+}
+
+/// Where a request was routed, as GenAI export records it.
+#[derive(Clone, Default)]
+pub(crate) struct GenAiRoute {
+    pub(crate) provider: String,
+    pub(crate) routed_model: String,
+    pub(crate) server_address: Option<String>,
+    pub(crate) server_port: Option<u16>,
+}
+
+fn unix_nanos_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Host and port of an upstream URL; the port defaults from the scheme.
+fn server_of(url: &str) -> (Option<String>, Option<u16>) {
+    match reqwest::Url::parse(url) {
+        Ok(u) => (
+            u.host_str().map(str::to_string),
+            u.port_or_known_default(),
+        ),
+        Err(_) => (None, None),
+    }
+}
+
+fn genai_route_of(route: Option<&ResolvedModel>, default_base: &str) -> GenAiRoute {
+    let base = route
+        .map(|r| r.api_base.as_str())
+        .filter(|b| !b.is_empty())
+        .unwrap_or(default_base);
+    let (server_address, server_port) = server_of(base);
+    GenAiRoute {
+        provider: route.map(|r| r.provider.clone()).unwrap_or_default(),
+        routed_model: route.map(|r| r.upstream_model.clone()).unwrap_or_default(),
+        server_address,
+        server_port,
+    }
+}
+
+/// Snapshot of the request for GenAI export, or `None` when this request is
+/// not exported: no exporter, the key's flag is off, an internal key, a batch
+/// item, or not a completion call. `max_request_bytes` is `None` when the
+/// gateway has no exporter. A body over the limit is marked, not kept.
+fn capture_genai(
+    max_request_bytes: Option<usize>,
+    resolved: &ResolvedKey,
+    batch: bool,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Option<Arc<crate::genai_export::GenAiCapture>> {
+    use crate::genai_export::{ApiSurface, GenAiCapture};
+    let max = max_request_bytes?;
+    if !resolved.genai_export || resolved.internal || batch || *method != Method::POST {
+        return None;
+    }
+    let surface = match surface(headers) {
+        Some("responses") => ApiSurface::Responses,
+        Some(crate::messages::SURFACE) => ApiSurface::Messages,
+        _ => match request_type_for_path(path) {
+            "chat" => ApiSurface::Chat,
+            "completion" => ApiSurface::Completions,
+            _ => return None,
+        },
+    };
+    Some(Arc::new(if body.len() > max {
+        GenAiCapture {
+            body: None,
+            surface,
+            dropped: Some("request_too_large"),
+        }
+    } else {
+        GenAiCapture {
+            body: Some(body.clone()),
+            surface,
+            dropped: None,
+        }
+    }))
+}
+
+/// Whether the tenant's guardrails redact or block PII, which forces regex
+/// scrubbing of exported content whatever the scrub mode.
+fn pii_guardrail_active(resolved: &ResolvedKey) -> bool {
+    resolved.guardrails_policy.as_ref().is_some_and(|p| {
+        !matches!(p.action, obleth_config::GuardrailsAction::LogOnly)
+            && p.input_scanners
+                .iter()
+                .chain(&p.output_scanners)
+                .any(|s| s == "pii")
+    })
+}
+
+/// The export event for a finished request, or `None` when it is not exported.
+#[allow(clippy::too_many_arguments)]
+fn genai_event(
+    resolved: &ResolvedKey,
+    meta: &RequestMeta,
+    request_id: Uuid,
+    model: &str,
+    usage: (u32, u32, u32),
+    ttft_ms: u32,
+    total_ms: u32,
+    cache_status: &str,
+    error_class: &str,
+) -> Option<crate::genai_export::GenAiEvent> {
+    use crate::genai_export::{EventMeta, GenAiEvent, Usage};
+    let cap = meta.genai.as_ref()?;
+    let end = unix_nanos_now().max(meta.genai_start_nanos);
+    let ttft = (ttft_ms > 0).then(|| {
+        end.saturating_sub((total_ms.saturating_sub(ttft_ms) as u64) * 1_000_000)
+            .max(meta.genai_start_nanos)
+    });
+    let client_model = if !meta.model_family.is_empty() {
+        &meta.model_family
+    } else if !meta.model_variant.is_empty() {
+        &meta.model_variant
+    } else {
+        model
+    };
+    let routed_model = if meta.genai_route.routed_model.is_empty() {
+        model
+    } else {
+        &meta.genai_route.routed_model
+    };
+    let (ops_trace_id, ops_span_id) = ops_ids();
+    let (input, output, cached) = usage;
+    Some(GenAiEvent {
+        start_unix_nanos: meta.genai_start_nanos,
+        end_unix_nanos: end,
+        ttft_unix_nanos: ttft,
+        enqueued_at: None,
+        surface: cap.surface,
+        request_body: cap.body.clone(),
+        dropped: cap.dropped,
+        output: meta.genai_collector.as_ref().map(|c| c.snapshot()),
+        meta: EventMeta {
+            request_id: request_id.to_string(),
+            tenant_id: resolved.tenant_id.to_string(),
+            key_id: resolved.key_id.to_string(),
+            client_model: client_model.to_string(),
+            routed_model: routed_model.to_string(),
+            model_variant: meta.model_variant.clone(),
+            provider: meta.genai_route.provider.clone(),
+            server_address: meta.genai_route.server_address.clone(),
+            server_port: meta.genai_route.server_port,
+            session_id: meta.session_id.clone(),
+            session_source: meta.session_id_source.to_string(),
+            reasoning_effort: Some(meta.reasoning_effort.clone()).filter(|e| !e.is_empty()),
+            cache_status: cache_status.to_string(),
+            tool_loop_turns: meta.genai_tool_turns,
+            ops_trace_id,
+            ops_span_id,
+            usage: Usage {
+                input: Some(input as u64),
+                output: Some(output as u64),
+                cache_read: (cached > 0).then_some(cached as u64),
+                reasoning: None,
+            },
+            error_type: Some(error_class.to_string()).filter(|e| !e.is_empty()),
+            pii_guardrail: pii_guardrail_active(resolved),
+        },
+    })
+}
+
+/// Trace and span ids of the current span's OTel context, if it has one.
+fn ops_ids() -> (Option<String>, Option<String>) {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    let cx = tracing::Span::current().context();
+    let span = cx.span();
+    let sc = span.span_context();
+    if sc.is_valid() {
+        (
+            Some(sc.trace_id().to_string()),
+            Some(sc.span_id().to_string()),
+        )
+    } else {
+        (None, None)
+    }
 }
 
 /// The name a response cache entry is keyed by.
@@ -7368,6 +7587,21 @@ pub(crate) fn finalize(
     }
     let (error_class, error_reason) =
         obleth_config::ledger_failure(status_code, admission.as_str(), meta.failure.as_ref());
+    if let Some(exporter) = state.genai.as_ref() {
+        if let Some(ev) = genai_event(
+            resolved,
+            meta,
+            request_id,
+            model,
+            (input_tokens, output_tokens, cached_input_tokens),
+            ttft_ms,
+            total_ms,
+            cache_status,
+            error_class,
+        ) {
+            exporter.try_send(ev);
+        }
+    }
     state.telemetry.record(UsageRecord {
         request_id,
         tenant_id: resolved.tenant_id,
@@ -10202,6 +10436,144 @@ mod tests {
         assert_eq!(super::recorded_ttft(false, 34_800), 0);
     }
 
+    fn genai_key(on: bool) -> ResolvedKey {
+        let mut k = key_with_schedule("UTC", None, None, None);
+        k.genai_export = on;
+        k
+    }
+
+    fn genai_meta() -> RequestMeta {
+        RequestMeta {
+            session_id: "sess-1".into(),
+            session_id_source: "client",
+            request_type: "chat",
+            device_id: String::new(),
+            end_user: String::new(),
+            model_variant: String::new(),
+            reasoning_effort: "high".into(),
+            reasoning_effort_requested: String::new(),
+            model_family: String::new(),
+            streamed: true,
+            failure: None,
+            crash_fp: String::new(),
+            client: crate::client::ClientInfo::default(),
+            genai: None,
+            genai_collector: None,
+            genai_start_nanos: 1_000,
+            genai_route: super::GenAiRoute {
+                provider: "openai".into(),
+                routed_model: "up-m".into(),
+                server_address: Some("api.example.com".into()),
+                server_port: Some(443),
+            },
+            genai_tool_turns: 0,
+        }
+    }
+
+    fn capture(
+        max: Option<usize>,
+        key: &ResolvedKey,
+        batch: bool,
+        body: &'static [u8],
+    ) -> Option<std::sync::Arc<crate::genai_export::GenAiCapture>> {
+        super::capture_genai(
+            max,
+            key,
+            batch,
+            &Method::POST,
+            "/v1/chat/completions",
+            &HeaderMap::new(),
+            &Bytes::from_static(body),
+        )
+    }
+
+    #[test]
+    fn flag_off_no_event() {
+        assert!(capture(Some(1 << 20), &genai_key(false), false, b"{}").is_none());
+        // No exporter configured.
+        assert!(capture(None, &genai_key(true), false, b"{}").is_none());
+        assert!(capture(Some(1 << 20), &genai_key(true), false, b"{}").is_some());
+    }
+
+    #[test]
+    fn internal_key_no_event() {
+        let mut k = genai_key(true);
+        k.internal = true;
+        assert!(capture(Some(1 << 20), &k, false, b"{}").is_none());
+    }
+
+    #[test]
+    fn batch_no_event() {
+        assert!(capture(Some(1 << 20), &genai_key(true), true, b"{}").is_none());
+    }
+
+    #[test]
+    fn oversize_body_dropped_marker() {
+        let c = capture(Some(4), &genai_key(true), false, b"{\"a\":1}").unwrap();
+        assert!(c.body.is_none());
+        assert_eq!(c.dropped, Some("request_too_large"));
+    }
+
+    #[test]
+    fn surface_follows_shim_header_and_path() {
+        use crate::genai_export::ApiSurface;
+        let key = genai_key(true);
+        let body = Bytes::from_static(b"{}");
+        let mut h = HeaderMap::new();
+        h.insert(crate::responses::SURFACE_HEADER, "responses".parse().unwrap());
+        let c = super::capture_genai(Some(99), &key, false, &Method::POST, "/v1/chat/completions", &h, &body)
+            .unwrap();
+        assert_eq!(c.surface, ApiSurface::Responses);
+        let c = super::capture_genai(Some(99), &key, false, &Method::POST, "/v1/completions", &HeaderMap::new(), &body)
+            .unwrap();
+        assert_eq!(c.surface, ApiSurface::Completions);
+        assert!(super::capture_genai(Some(99), &key, false, &Method::POST, "/v1/embeddings", &HeaderMap::new(), &body).is_none());
+    }
+
+    #[tokio::test]
+    async fn event_has_usage_and_session() {
+        use crate::genai_export::{config::GenAiConfig, exporter::Exporter, GenAiEvent};
+        let key = genai_key(true);
+        let mut meta = genai_meta();
+        meta.genai = capture(Some(1 << 20), &key, false, b"{\"model\":\"m\"}");
+        let ev = super::genai_event(&key, &meta, Uuid::nil(), "m", (11, 7, 3), 40, 100, "miss", "")
+            .expect("event");
+        assert_eq!(ev.meta.usage.input, Some(11));
+        assert_eq!(ev.meta.usage.output, Some(7));
+        assert_eq!(ev.meta.usage.cache_read, Some(3));
+        assert_eq!(ev.meta.session_id, "sess-1");
+        assert_eq!(ev.meta.session_source, "client");
+        assert_eq!(ev.meta.provider, "openai");
+        assert_eq!(ev.meta.routed_model, "up-m");
+        assert_eq!(ev.meta.client_model, "m");
+        assert_eq!(ev.meta.server_port, Some(443));
+        assert_eq!(ev.meta.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(ev.meta.error_type, None);
+        assert!(ev.ttft_unix_nanos.is_some());
+        assert!(ev.request_body.is_some());
+        // No capture, no event.
+        assert!(super::genai_event(&key, &genai_meta(), Uuid::nil(), "m", (0, 0, 0), 0, 0, "off", "").is_none());
+
+        // The event reaches the exporter's process step.
+        let env = std::collections::HashMap::from([(
+            "OBLETH_GENAI_OTLP_ENDPOINT".to_string(),
+            "http://127.0.0.1:1".to_string(),
+        )]);
+        let cfg = std::sync::Arc::new(GenAiConfig::from_env_map(&env).unwrap().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GenAiEvent>();
+        let process: crate::genai_export::exporter::ProcessFn = std::sync::Arc::new(move |ev| {
+            let _ = tx.send(ev);
+            Box::pin(async { Default::default() })
+        });
+        let handle = Exporter::start(cfg, reqwest::Client::new(), process, &prometheus::Registry::new());
+        assert!(handle.try_send(ev));
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.meta.usage.input, Some(11));
+    }
+
     #[test]
     fn request_meta_carries_device_id_into_usage_record() {
         let meta = RequestMeta {
@@ -10218,6 +10590,11 @@ mod tests {
             failure: None,
             crash_fp: String::new(),
             client: crate::client::ClientInfo::default(),
+            genai: None,
+            genai_collector: None,
+            genai_start_nanos: 0,
+            genai_route: super::GenAiRoute::default(),
+            genai_tool_turns: 0,
         };
         assert_eq!(meta.device_id, "dev-1");
     }
@@ -10732,6 +11109,11 @@ mod lifecycle_tests {
             failure: None,
             crash_fp: String::new(),
             client: crate::client::ClientInfo::default(),
+            genai: None,
+            genai_collector: None,
+            genai_start_nanos: 0,
+            genai_route: super::GenAiRoute::default(),
+            genai_tool_turns: 0,
         };
         super::record_called_name(&mut meta, Some("acme"), Some("acme"));
         assert_eq!(meta.model_family, "acme");

@@ -381,6 +381,10 @@ impl Metrics {
         self.auto_routes.with_label_values(&[model, reason]).inc();
     }
 
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
     pub fn encode(&self) -> String {
         let encoder = TextEncoder::new();
         encoder

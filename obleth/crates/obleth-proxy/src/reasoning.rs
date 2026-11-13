@@ -514,6 +514,8 @@ mod pipeline {
             jobs: crate::jobs::JobStore::new(store, Default::default()),
             load: None,
             crash_guard: crate::crash_guard::CrashGuard::disabled(),
+            genai: None,
+            genai_max_request_bytes: 0,
             batches: None,
         };
         Some(Gateway { state, wal_dir })
