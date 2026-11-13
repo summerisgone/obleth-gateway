@@ -1220,6 +1220,7 @@ mod tests {
         let store = RedisStore::connect(&url).await.expect("connect");
         let hash = format!("test-{}", Uuid::new_v4());
         let key = ResolvedKey {
+            genai_export: false,
             key_id: Uuid::new_v4(),
             tenant_id: Uuid::new_v4(),
             tenant_name: "t".into(),

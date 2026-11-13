@@ -208,6 +208,14 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/keys/:id/tenant", put(move_key))
         .route("/api/v1/keys/:id/tracing", put(set_key_tracing_handler))
         .route(
+            "/api/v1/keys/:id/genai-export",
+            put(set_key_genai_export_handler),
+        )
+        .route(
+            "/api/v1/tenants/:id/genai-export",
+            put(set_tenant_genai_export_handler),
+        )
+        .route(
             "/api/v1/keys/:id/end-user-fairshare",
             put(set_key_end_user_fairshare_handler),
         )
@@ -732,6 +740,22 @@ pub struct SetKeyTracing {
     pub tracing_enabled: bool,
 }
 
+/// Body of `PUT /api/v1/keys/{id}/genai-export`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetKeyGenaiExport {
+    /// `false` opts the key out; `null` inherits the tenant. `true` cannot
+    /// enable a tenant that has export off.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<bool>)]
+    pub genai_export: Option<Option<bool>>,
+}
+
+/// Body of `PUT /api/v1/tenants/{id}/genai-export`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetTenantGenaiExport {
+    pub genai_export: bool,
+}
+
 /// Body of `PUT /api/v1/keys/{id}/end-user-fairshare`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetKeyEndUserFairshare {
@@ -1084,6 +1108,10 @@ pub struct CreateModel {
     /// `unknown` — undeclared, not "full precision".
     #[serde(default)]
     pub quantization: Option<String>,
+    /// Upstream provider name for GenAI export; omitted leaves it unchanged
+    /// (empty on create), `""` resets it to `openai`.
+    #[serde(default)]
+    pub provider: Option<String>,
     pub input_cost_per_token: Option<f64>,
     pub output_cost_per_token: Option<f64>,
     #[serde(default)]
@@ -1224,6 +1252,10 @@ pub struct UpdateModel {
     /// leaves the current value unchanged.
     #[serde(default)]
     pub quantization: Option<String>,
+    /// Upstream provider name for GenAI export; omitted leaves it unchanged
+    /// (empty on create), `""` resets it to `openai`.
+    #[serde(default)]
+    pub provider: Option<String>,
     pub input_cost_per_token: Option<f64>,
     pub output_cost_per_token: Option<f64>,
     #[serde(default)]
@@ -2306,6 +2338,8 @@ pub struct ModelRouteView {
     /// routing; it is reported so clients can tell a `fp8` deployment from a
     /// `bf16` one without reading it out of the model's name.
     pub quantization: String,
+    /// Upstream provider name for GenAI export (empty = `openai`).
+    pub provider: String,
     pub input_cost_per_token: f64,
     pub output_cost_per_token: f64,
     /// Per-generated-image cost in USD (`image` models).
@@ -2598,6 +2632,7 @@ impl From<ModelRoute> for ModelRouteView {
             upstream_headers,
             model_type,
             quantization,
+            provider,
             input_cost_per_token,
             output_cost_per_token,
             cost_per_image,
@@ -2657,6 +2692,7 @@ impl From<ModelRoute> for ModelRouteView {
             upstream_header_names: obleth_config::upstream_header_names(&upstream_headers),
             model_type,
             quantization,
+            provider,
             input_cost_per_token,
             output_cost_per_token,
             cost_per_image,
@@ -5428,6 +5464,59 @@ async fn set_tenant_tracing_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn set_tenant_genai_export_handler(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetTenantGenaiExport>,
+) -> Result<StatusCode> {
+    state
+        .store
+        .set_tenant_genai_export(id, body.genai_export)
+        .await?;
+    sync_tenant_keys(&state, id).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            if body.genai_export {
+                "enable_tenant_genai_export"
+            } else {
+                "disable_tenant_genai_export"
+            },
+            "tenant",
+            &id.to_string(),
+            serde_json::json!({ "genai_export": body.genai_export }),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_key_genai_export_handler(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetKeyGenaiExport>,
+) -> Result<StatusCode> {
+    // Absent and explicit null both inherit the tenant.
+    let on = body.genai_export.flatten();
+    state.store.set_key_genai_export(id, on).await?;
+    if let Some(resolved) = state.store.resolved_key_by_id(id).await? {
+        sync_tenant_keys(&state, resolved.tenant_id).await?;
+    }
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_key_genai_export",
+            "api_key",
+            &id.to_string(),
+            serde_json::json!({ "genai_export": on }),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[utoipa::path(
     put, path = "/api/v1/tenants/{id}/synthetic", tag = "tenants",
     params(("id" = Uuid, Path, description = "Tenant id")),
@@ -8047,6 +8136,11 @@ async fn create_model(
             .set_model_session_affinity(model.id, &session_affinity)
             .await?
     };
+    // Set the same way, before the first publish.
+    let model = match body.provider.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => state.store.set_model_provider(model.id, p).await?,
+        _ => model,
+    };
     // Staged the same way, before the first publish.
     let model = if initial_status == obleth_config::ModelStatus::Staged {
         let lifecycle = obleth_config::ModelLifecycle {
@@ -8260,6 +8354,10 @@ async fn update_model(
                 .set_model_session_affinity(id, &affinity)
                 .await?
         }
+        _ => model,
+    };
+    let model = match body.provider.as_deref() {
+        Some(p) if p.trim() != model.provider => state.store.set_model_provider(id, p).await?,
         _ => model,
     };
     if model_health::probe_config_changed(&existing, &model) {
@@ -10334,6 +10432,7 @@ fn resolved_model_of(
     knowledge_collections: Vec<Uuid>,
 ) -> ResolvedModel {
     ResolvedModel {
+        provider: model.provider.clone(),
         model_name: model.model_name.clone(),
         aliases: model.aliases.clone(),
         lifecycle: model.lifecycle.clone(),
@@ -14215,6 +14314,7 @@ mod tests {
     fn fixture_model_route(name: &str) -> ModelRoute {
         let now = chrono::Utc::now();
         ModelRoute {
+            provider: String::new(),
             id: Uuid::new_v4(),
             model_name: name.to_string(),
             aliases: Vec::new(),

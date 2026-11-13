@@ -1530,6 +1530,7 @@ mod tests {
 
     pub(super) fn test_route() -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
+            provider: String::new(),
             description: String::new(),
             model_name: "test".to_string(),
             aliases: Vec::new(),
@@ -1592,6 +1593,7 @@ mod tests {
         policy: Option<obleth_config::CompressionPolicy>,
     ) -> obleth_config::ResolvedKey {
         let mut k = obleth_config::ResolvedKey {
+            genai_export: false,
             key_id: uuid::Uuid::nil(),
             tenant_id: uuid::Uuid::nil(),
             tenant_name: "t".into(),
@@ -1889,6 +1891,7 @@ mod tests {
             // Build via the redis crate's test-shaped literal is not accessible here;
             // construct the minimal key inline.
             obleth_config::ResolvedKey {
+                genai_export: false,
                 key_id: uuid::Uuid::nil(),
                 tenant_id: uuid::Uuid::nil(),
                 tenant_name: "t".into(),

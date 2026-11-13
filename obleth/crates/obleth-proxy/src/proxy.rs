@@ -7628,6 +7628,7 @@ mod tests {
         weekly_windows: Option<Vec<WeeklyWindow>>,
     ) -> ResolvedKey {
         ResolvedKey {
+            genai_export: false,
             key_id: Uuid::nil(),
             tenant_id: Uuid::nil(),
             tenant_name: "t".into(),
@@ -9051,6 +9052,7 @@ mod tests {
 
     fn model_with(endpoints: Vec<ResolvedEndpoint>) -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
+            provider: String::new(),
             description: String::new(),
             model_name: "m".into(),
             aliases: Vec::new(),
@@ -10222,6 +10224,7 @@ mod tests {
 
     fn minimal_model(name: &str) -> ResolvedModel {
         ResolvedModel {
+            provider: String::new(),
             description: String::new(),
             model_name: name.to_string(),
             aliases: Vec::new(),

@@ -8,6 +8,7 @@ mod batches;
 mod completion;
 mod crash_guard;
 mod energy;
+mod genai_export;
 mod jobs;
 mod jwt_auth;
 mod knowledge;
@@ -1737,6 +1738,7 @@ mod registry_refresh_tests {
 
     fn model(name: &str, request_timeout_secs: Option<i64>) -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
+            provider: String::new(),
             description: String::new(),
             model_name: name.to_string(),
             aliases: Vec::new(),
@@ -2046,6 +2048,7 @@ mod shutdown_tests {
 
     fn test_resolved_key() -> obleth_config::ResolvedKey {
         obleth_config::ResolvedKey {
+            genai_export: false,
             key_id: uuid::Uuid::new_v4(),
             tenant_id: uuid::Uuid::new_v4(),
             tenant_name: "t".into(),

@@ -278,6 +278,7 @@ mod tests {
 
     fn model(name: &str) -> ResolvedModel {
         ResolvedModel {
+            provider: String::new(),
             description: String::new(),
             model_name: name.to_string(),
             aliases: Vec::new(),

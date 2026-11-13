@@ -371,6 +371,10 @@ pub struct ResolvedKey {
     /// payloads for replay and debugging.
     #[serde(default)]
     pub tracing_enabled: bool,
+    /// Whether completions are exported over OTLP as GenAI spans: the tenant
+    /// flag AND NOT an explicit key-level `false` (resolved in the store).
+    #[serde(default)]
+    pub genai_export: bool,
     /// Per-tenant content policy, if configured. `None` means no guardrails.
     #[serde(default)]
     pub guardrails_policy: Option<GuardrailsPolicy>,
@@ -478,6 +482,10 @@ pub struct ModelRoute {
     /// `bf16` one without reading it out of the model's name.
     #[serde(default = "default_quantization")]
     pub quantization: String,
+    /// Upstream provider name for GenAI export (`gen_ai.provider.name`);
+    /// empty means `openai`. `#[serde(default)]` keeps older payloads readable.
+    #[serde(default)]
+    pub provider: String,
     pub input_cost_per_token: f64,
     pub output_cost_per_token: f64,
     /// Per-generated-image cost in USD (`image` models).
@@ -745,6 +753,10 @@ pub struct ResolvedModel {
     /// payloads deserializable as `unknown`.
     #[serde(default = "default_quantization")]
     pub quantization: String,
+    /// Upstream provider name for GenAI export (`gen_ai.provider.name`);
+    /// empty means `openai`. `#[serde(default)]` keeps older payloads readable.
+    #[serde(default)]
+    pub provider: String,
     pub admission_weight: i64,
     pub max_in_flight: Option<usize>,
     /// How the pool size is decided (see [`ModelRoute::capacity_mode`]). The
@@ -5424,6 +5436,7 @@ mod tests {
 
     fn resolved_fixture() -> ResolvedModel {
         ResolvedModel {
+            provider: String::new(),
             description: String::new(),
             model_name: "glm-5-3".into(),
             aliases: vec!["glm-5-3-fp8".into(), "glm-5-3-mxfp4".into()],
@@ -5488,5 +5501,13 @@ mod tests {
             serde_json::from_str(r#"{"classifier_enabled":false}"#).unwrap();
         assert_eq!(v.messages_default_model, None);
         assert_eq!(v.verdicts_default_model, None);
+    }
+
+    #[test]
+    fn provider_defaults_empty() {
+        let mut v = serde_json::to_value(resolved_fixture()).unwrap();
+        v.as_object_mut().unwrap().remove("provider");
+        let m: ResolvedModel = serde_json::from_value(v).unwrap();
+        assert_eq!(m.provider, "");
     }
 }
