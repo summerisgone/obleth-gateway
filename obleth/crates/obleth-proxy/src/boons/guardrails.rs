@@ -332,7 +332,7 @@ fn pii_patterns() -> &'static Vec<PiiPattern> {
     })
 }
 
-pub(super) fn scan_pii(text: &str) -> (bool, String) {
+pub(crate) fn scan_pii(text: &str) -> (bool, String) {
     let mut out = text.to_string();
     let mut flagged = false;
     for p in pii_patterns() {
