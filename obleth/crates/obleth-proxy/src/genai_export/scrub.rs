@@ -161,11 +161,19 @@ fn visit_part(v: &mut Value, f: &mut dyn FnMut(&mut String)) {
             }
         }
         "tool_call_response" => {
+            if let Some(Value::String(s)) = obj.get_mut("id") {
+                f(s);
+            }
             if let Some(r) = obj.get_mut("response") {
                 visit_json(r, f);
             }
         }
         "tool_call" => {
+            for k in ["id", "name"] {
+                if let Some(Value::String(s)) = obj.get_mut(k) {
+                    f(s);
+                }
+            }
             if let Some(a) = obj.get_mut("arguments") {
                 visit_json(a, f);
             }
@@ -433,6 +441,19 @@ mod tests {
         assert_eq!(m["parts"][0]["arguments"]["n"], 1);
         assert_eq!(m["parts"][1]["response"], "call [REDACTED:SSN]");
         assert_eq!(m["parts"][2]["content"], "[REDACTED:EMAIL]");
+    }
+
+    #[tokio::test]
+    async fn tool_ids_and_names_scrubbed() {
+        let s = scrubber(cfg(ScrubMode::Regex, None));
+        let mut c = Content {
+            input: vec![json!({"role":"tool","parts":[{"type":"tool_call_response","id":"a@b.io","response":"x"}]})],
+            output: vec![json!({"role":"assistant","parts":[{"type":"tool_call","id":"c@d.io","name":"e@f.io","arguments":{}}]})],
+            ..Default::default()
+        };
+        s.scrub(&mut c, false).await.unwrap();
+        let t = serde_json::to_string(&(&c.input, &c.output)).unwrap();
+        assert!(!t.contains('@'), "{t}");
     }
 
     #[tokio::test]

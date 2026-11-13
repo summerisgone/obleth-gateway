@@ -10,12 +10,21 @@ fn text_part(s: &str) -> Value {
     json!({"type": "text", "content": s})
 }
 
+fn tok(s: &str, extra: &str) -> bool {
+    !s.is_empty() && s.len() <= 255 && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
+}
+
+// Only token-shaped pieces survive: free text in a url or mime never reaches the span.
 fn host_only(url: &str) -> String {
     match url.split_once("://") {
         Some((scheme, rest)) => {
             let auth = rest.split(['/', '?', '#']).next().unwrap_or("");
             let host = auth.rsplit('@').next().unwrap_or("");
-            format!("{scheme}://{host}")
+            if tok(scheme, "+.-") && tok(host, ".-:[]_") {
+                format!("{scheme}://{host}")
+            } else {
+                "unknown".to_string()
+            }
         }
         None => "unknown".to_string(),
     }
@@ -24,6 +33,8 @@ fn host_only(url: &str) -> String {
 fn image_part(url: &str) -> Value {
     if let Some(rest) = url.strip_prefix("data:") {
         let mime = rest.split([';', ',']).next().unwrap_or("");
+        let ok = mime.split_once('/').is_some_and(|(a, b)| tok(a, "+.-") && tok(b, "+.-"));
+        let mime = if ok { mime } else { "unknown" };
         json!({"type": "blob", "modality": "image", "mime_type": mime})
     } else {
         json!({"type": "uri", "modality": "image", "uri": host_only(url)})
@@ -504,6 +515,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.input[0]["parts"][0]["uri"], "https://x.io");
+    }
+
+    #[test]
+    fn url_and_mime_free_text_not_leaked() {
+        let (_, c) = parse_request(
+            ApiSurface::Chat,
+            br#"{"messages":[{"role":"user","content":[
+              {"type":"image_url","image_url":{"url":"data:bob@x.io;base64,AA"}},
+              {"type":"image_url","image_url":{"url":"John Smith 555-1234://h"}},
+              {"type":"image_url","image_url":{"url":"https://John Smith/a"}}]}]}"#,
+        )
+        .unwrap();
+        let t = text_of(&c);
+        assert!(!t.contains("bob") && !t.contains("John") && !t.contains("555"));
+        assert_eq!(c.input[0]["parts"][0]["mime_type"], "unknown");
+        assert_eq!(c.input[0]["parts"][1]["uri"], "unknown");
+        assert_eq!(c.input[0]["parts"][2]["uri"], "unknown");
     }
 
     #[test]

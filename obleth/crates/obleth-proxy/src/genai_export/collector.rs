@@ -51,6 +51,11 @@ impl Collector {
                 g.apply(&v, true);
             }
         }
+        let cap = g.max.saturating_add(1 << 20);
+        if g.line_buf.len() > cap {
+            g.line_buf.clear();
+            g.out.truncated = true;
+        }
     }
 
     pub fn set_json(&self, body: &[u8]) {
@@ -88,6 +93,10 @@ impl Inner {
                 .get("index")
                 .and_then(Value::as_u64)
                 .unwrap_or(pos as u64) as u32;
+            if index > 1024 {
+                self.out.truncated = true;
+                continue;
+            }
             let slot = match self.out.choices.iter().position(|x| x.index == index) {
                 Some(i) => i,
                 None => {
@@ -142,11 +151,11 @@ impl Inner {
         }
         let f = tc.get("function");
         if let Some(id) = tc.get("id").and_then(Value::as_str) {
-            calls[ti].id = id.to_string();
+            calls[ti].id = clip(id);
         }
         if let Some(n) = f.and_then(|f| f.get("name")).and_then(Value::as_str) {
             if !n.is_empty() {
-                calls[ti].name = n.to_string();
+                calls[ti].name = clip(n);
             }
         }
         if let Some(a) = f.and_then(|f| f.get("arguments")).and_then(Value::as_str) {
@@ -177,6 +186,14 @@ impl Inner {
     }
 }
 
+fn clip(s: &str) -> String {
+    let mut n = s.len().min(256);
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    s[..n].to_string()
+}
+
 enum Field {
     Text,
     Reasoning,
@@ -186,6 +203,22 @@ enum Field {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostile_stream_is_bounded() {
+        let c = Collector::new(100);
+        c.feed_sse(&vec![b'a'; (1 << 20) + 200]);
+        assert!(c.lock().line_buf.is_empty());
+        assert!(c.snapshot().truncated);
+        let c = Collector::new(100);
+        c.set_json(br#"{"choices":[{"index":4000000000,"message":{"content":"x"}}]}"#);
+        assert!(c.snapshot().choices.is_empty());
+        let long = "n".repeat(1000);
+        let body = format!(r#"{{"choices":[{{"message":{{"tool_calls":[{{"id":"{long}","function":{{"name":"{long}"}}}}]}}}}]}}"#);
+        c.set_json(body.as_bytes());
+        let t = &c.snapshot().choices[0].tool_calls[0];
+        assert!(t.id.len() <= 256 && t.name.len() <= 256);
+    }
 
     const STREAM: &[u8] = b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"he\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"llo\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
 
