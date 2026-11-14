@@ -118,6 +118,7 @@ const SCHEMA_V43: &str =
     include_str!("../../../../schema/postgres/0043_api_key_allowed_networks.sql");
 const SCHEMA_V44: &str = include_str!("../../../../schema/postgres/0044_key_prefix_keeps_obl.sql");
 const SCHEMA_V45: &str = include_str!("../../../../schema/postgres/0045_genai_export.sql");
+const SCHEMA_V46: &str = include_str!("../../../../schema/postgres/0046_pii_trace_profile.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -299,6 +300,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V43).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V44).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V45).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V46).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -360,7 +362,7 @@ impl Store {
         Self::guard_reserved_tenant(id)?;
         let row = sqlx::query(
             "update tenants set fairshare_group = $2, updated_at = now() where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, pii_trace_profile, created_at, updated_at",
         )
         .bind(id)
         .bind(fairshare_group)
@@ -384,7 +386,7 @@ impl Store {
         let row = sqlx::query(
             "insert into tenants (id, name, fairshare_group, weight, tokens_per_minute, max_in_flight)
              values ($1, $2, $3, $4, $5, $6)
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, pii_trace_profile, created_at, updated_at",
         )
         .bind(Uuid::new_v4())
         .bind(name)
@@ -399,7 +401,7 @@ impl Store {
 
     pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
         let rows = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, genai_export, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, genai_export, pii_trace_profile, created_at, updated_at
              from tenants order by created_at",
         )
         .fetch_all(&self.pool)
@@ -433,7 +435,7 @@ impl Store {
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Tenant> {
         let row = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, genai_export, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, genai_export, pii_trace_profile, created_at, updated_at
              from tenants where id = $1",
         )
         .bind(id)
@@ -445,7 +447,7 @@ impl Store {
 
     pub async fn tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
         let row = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, genai_export, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, genai_export, pii_trace_profile, created_at, updated_at
              from tenants where name = $1",
         )
         .bind(name)
@@ -458,7 +460,7 @@ impl Store {
         Self::guard_reserved_tenant(id)?;
         let row = sqlx::query(
             "update tenants set weight = $2, updated_at = now() where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, pii_trace_profile, created_at, updated_at",
         )
         .bind(id)
         .bind(weight.max(1))
@@ -478,7 +480,7 @@ impl Store {
         let row = sqlx::query(
             "update tenants set tokens_per_minute = $2, max_in_flight = $3, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, pii_trace_profile, created_at, updated_at",
         )
         .bind(id)
         .bind(tokens_per_minute.max(0))
@@ -504,7 +506,7 @@ impl Store {
             "update tenants set name = $2, description = $3, organization = $4,
                     contact_email = $5, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, pii_trace_profile, created_at, updated_at",
         )
         .bind(id)
         .bind(name)
@@ -522,7 +524,7 @@ impl Store {
         Self::guard_reserved_tenant(id)?;
         let row = sqlx::query(
             "update tenants set status = $2, updated_at = now() where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, pii_trace_profile, created_at, updated_at",
         )
         .bind(id)
         .bind(status)
@@ -551,7 +553,7 @@ impl Store {
             "update tenants set timezone = $2, active_from = $3, active_until = $4,
                     weekly_windows = $5, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, pii_trace_profile, created_at, updated_at",
         )
         .bind(id)
         .bind(timezone)
@@ -580,7 +582,7 @@ impl Store {
             "update tenants set budget_tokens = $2, budget_cost_usd = $3, budget_period = $4,
                     budget_started_at = $5, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, pii_trace_profile, created_at, updated_at",
         )
         .bind(id)
         .bind(budget_tokens)
@@ -607,7 +609,7 @@ impl Store {
         let row = sqlx::query(
             "update tenants set allowed_models = $2, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, pii_trace_profile, created_at, updated_at",
         )
         .bind(id)
         .bind(allowed)
@@ -628,7 +630,7 @@ impl Store {
         let row = sqlx::query(
             "update tenants set guardrails_policy = $2, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, pii_trace_profile, created_at, updated_at",
         )
         .bind(id)
         .bind(encoded)
@@ -649,7 +651,7 @@ impl Store {
         let row = sqlx::query(
             "update tenants set compression_policy = $2, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, pii_trace_profile, created_at, updated_at",
         )
         .bind(id)
         .bind(encoded)
@@ -1322,6 +1324,24 @@ impl Store {
         Ok(())
     }
 
+    /// Set a tenant's GenAI trace PII profile: `None` inherits the gateway default.
+    pub async fn set_tenant_pii_trace_profile(
+        &self,
+        tenant_id: Uuid,
+        profile: Option<&str>,
+    ) -> Result<()> {
+        Self::guard_reserved_tenant(tenant_id)?;
+        sqlx::query(
+            "update tenants set pii_trace_profile = $2, updated_at = now() where id = $1 returning id",
+        )
+        .bind(tenant_id)
+        .bind(profile)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        Ok(())
+    }
+
     /// Set a key's GenAI export override: `Some(false)` opts the key out,
     /// `None` inherits the tenant. `Some(true)` cannot enable a tenant that
     /// has export off (the resolved value ANDs with the tenant flag).
@@ -1406,6 +1426,7 @@ impl Store {
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     (t.genai_export AND k.genai_export IS DISTINCT FROM false) AS genai_export,
                     t.guardrails_policy,
+                    t.pii_trace_profile,
                     t.compression_policy,
                     t.synthetic
              from api_keys k
@@ -1438,6 +1459,7 @@ impl Store {
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     (t.genai_export AND k.genai_export IS DISTINCT FROM false) AS genai_export,
                     t.guardrails_policy,
+                    t.pii_trace_profile,
                     t.compression_policy,
                     t.synthetic
              from api_keys k
@@ -1469,6 +1491,7 @@ impl Store {
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     (t.genai_export AND k.genai_export IS DISTINCT FROM false) AS genai_export,
                     t.guardrails_policy,
+                    t.pii_trace_profile,
                     t.compression_policy,
                     t.synthetic
              from api_keys k
@@ -1504,6 +1527,7 @@ impl Store {
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     (t.genai_export AND k.genai_export IS DISTINCT FROM false) AS genai_export,
                     t.guardrails_policy,
+                    t.pii_trace_profile,
                     t.compression_policy,
                     t.synthetic
              from api_keys k
@@ -4413,6 +4437,7 @@ pub struct ModelHealthRecordOutcome {
 
 fn tenant_from_row(row: &PgRow) -> Result<Tenant> {
     Ok(Tenant {
+        pii_trace_profile: row.try_get("pii_trace_profile")?,
         id: row.try_get("id")?,
         name: row.try_get("name")?,
         fairshare_group: row.try_get("fairshare_group")?,
@@ -4542,6 +4567,7 @@ fn api_key_from_row(row: &PgRow) -> Result<ApiKey> {
 
 fn resolved_from_row(row: &PgRow) -> Result<ResolvedKey> {
     Ok(ResolvedKey {
+        pii_trace_profile: row.try_get("pii_trace_profile")?,
         key_id: row.try_get("key_id")?,
         tenant_id: row.try_get("tenant_id")?,
         tenant_name: row.try_get("tenant_name")?,
@@ -9948,6 +9974,76 @@ mod tests {
         assert!(store.get_tenant(tenant.id).await.expect("get").genai_export);
         let listed = store.list_tenants().await.expect("list");
         assert!(listed.iter().find(|t| t.id == tenant.id).expect("listed").genai_export);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn resolved_key_carries_pii_trace_profile() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+        let tenant = store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 0, None, None)
+            .await
+            .expect("create tenant");
+        fixtures.track_tenant(tenant.id);
+        let (_, secret) = store
+            .create_api_key(tenant.id, "k", "", None, None, None, None, 100, None, &[])
+            .await
+            .expect("create key");
+        let hash = hash_api_key(&secret);
+        let resolve = || async {
+            store
+                .resolved_key_by_hash(&hash)
+                .await
+                .expect("resolve")
+                .expect("present")
+                .pii_trace_profile
+        };
+        assert_eq!(resolve().await, None);
+        store
+            .set_tenant_pii_trace_profile(tenant.id, Some("ru"))
+            .await
+            .expect("set");
+        assert_eq!(resolve().await.as_deref(), Some("ru"));
+        let listed = store.list_tenants().await.expect("list");
+        let t = listed.iter().find(|t| t.id == tenant.id).expect("listed");
+        assert_eq!(t.pii_trace_profile.as_deref(), Some("ru"));
+        store
+            .set_tenant_pii_trace_profile(tenant.id, None)
+            .await
+            .expect("clear");
+        assert_eq!(resolve().await, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn undecodable_pii_trace_profile_is_an_error() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+        let tenant = store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 0, None, None)
+            .await
+            .expect("create tenant");
+        fixtures.track_tenant(tenant.id);
+        let row = sqlx::query(
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, genai_export, 1::int4 as pii_trace_profile, created_at, updated_at
+             from tenants where id = $1",
+        )
+        .bind(tenant.id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("row");
+        assert!(tenant_from_row(&row).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

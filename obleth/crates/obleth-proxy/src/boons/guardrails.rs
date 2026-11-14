@@ -1,17 +1,23 @@
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use obleth_config::{GuardrailsAction, GuardrailsBoonSettings, GuardrailsPolicy, ResolvedKey};
+use obleth_config::{
+    GuardrailsAction, GuardrailsBoonSettings, GuardrailsPolicy, PiiDetectorKind, PiiProfile,
+    PiiSettings, ResolvedKey,
+};
 use regex::Regex;
 use serde_json::Value;
 
+use crate::pii::{Lane, PiiDetector, PiiError};
 use crate::state::AppState;
 
 /// A guardrails decision to reject a request or response. `status` is `400` for
 /// a content-policy violation and `503` when a scanner was unavailable and the
 /// policy is fail-closed (`fail_open: false`).
+#[derive(Debug)]
 pub struct GuardrailsBlock {
     pub status: StatusCode,
     pub reason: &'static str,
@@ -296,54 +302,7 @@ pub(super) fn scan_prompt_injection(text: &str) -> bool {
 // Tier-1 scanner: PII
 // ---------------------------------------------------------------------------
 
-struct PiiPattern {
-    label: &'static str,
-    re: Regex,
-}
-
-static PII_PATTERNS: OnceLock<Vec<PiiPattern>> = OnceLock::new();
-
-fn pii_patterns() -> &'static Vec<PiiPattern> {
-    PII_PATTERNS.get_or_init(|| {
-        vec![
-            PiiPattern {
-                label: "SSN",
-                re: Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap(),
-            },
-            PiiPattern {
-                label: "EMAIL",
-                re: Regex::new(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b").unwrap(),
-            },
-            PiiPattern {
-                label: "PHONE",
-                re: Regex::new(
-                    r"(?:\+?1[-.\s]?)?\(?[2-9]\d{2}\)?[-.\s]?[2-9]\d{2}[-.\s]?\d{4}\b",
-                )
-                .unwrap(),
-            },
-            PiiPattern {
-                label: "CREDIT_CARD",
-                re: Regex::new(
-                    r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b",
-                )
-                .unwrap(),
-            },
-        ]
-    })
-}
-
-pub(crate) fn scan_pii(text: &str) -> (bool, String) {
-    let mut out = text.to_string();
-    let mut flagged = false;
-    for p in pii_patterns() {
-        if p.re.is_match(&out) {
-            let tag = format!("[REDACTED:{}]", p.label);
-            out = p.re.replace_all(&out, tag.as_str()).into_owned();
-            flagged = true;
-        }
-    }
-    (flagged, out)
-}
+pub use crate::pii::regex::scan_pii;
 
 // ---------------------------------------------------------------------------
 // Tier-1 scanner: ban keywords
@@ -566,6 +525,277 @@ fn redact_content_in_place(
 }
 
 // ---------------------------------------------------------------------------
+// PII scanner through the shared detector
+// ---------------------------------------------------------------------------
+
+/// How the `pii` scanner runs for one policy, resolved from the settings
+/// snapshot at request time.
+#[derive(Debug, Clone)]
+pub(crate) enum PiiPlan {
+    /// Built-in sync `regex` path (also the default with no `pii_profile`).
+    Regex,
+    /// The `off` profile: the scanner does nothing.
+    Off,
+    /// A `ner` profile: one batched call to the detector.
+    Ner(PiiProfile),
+    /// The policy names a profile that no longer resolves.
+    Missing,
+}
+
+pub(crate) fn pii_plan(pii: &PiiSettings, policy: &GuardrailsPolicy) -> PiiPlan {
+    match pii.resolve(policy.pii_profile.as_deref().unwrap_or("regex")) {
+        None => PiiPlan::Missing,
+        Some(p) => match p.detector {
+            PiiDetectorKind::Regex => PiiPlan::Regex,
+            PiiDetectorKind::Off => PiiPlan::Off,
+            PiiDetectorKind::Ner => PiiPlan::Ner(p),
+        },
+    }
+}
+
+impl PiiPlan {
+    fn uses_detector(&self) -> bool {
+        matches!(self, PiiPlan::Ner(_) | PiiPlan::Missing)
+    }
+}
+
+/// The policy the sync scanners see: without `pii` unless the sync regex path
+/// owns it.
+fn sync_policy(policy: &GuardrailsPolicy, plan: &PiiPlan) -> GuardrailsPolicy {
+    let mut p = policy.clone();
+    if !matches!(plan, PiiPlan::Regex) {
+        p.input_scanners.retain(|s| s != "pii");
+        p.output_scanners.retain(|s| s != "pii");
+    }
+    p
+}
+
+/// What a detector call needs: cheap clones so it can also run in a task.
+#[derive(Clone)]
+pub(crate) struct PiiCx {
+    det: Arc<PiiDetector>,
+    metrics: Arc<crate::metrics::Metrics>,
+    alerts: obleth_admin::AlertDispatcher,
+    tenant_id: uuid::Uuid,
+    tenant_name: String,
+}
+
+impl PiiCx {
+    fn new(state: &AppState, key: &ResolvedKey) -> Self {
+        Self {
+            det: state.pii.clone(),
+            metrics: state.metrics.clone(),
+            alerts: state.alerts.clone(),
+            tenant_id: key.tenant_id,
+            tenant_name: key.tenant_name.clone(),
+        }
+    }
+}
+
+fn pii_reason(e: &PiiError) -> &'static str {
+    match e {
+        PiiError::NotConfigured => "not_configured",
+        PiiError::Busy => "busy",
+        PiiError::Timeout => "timeout",
+        PiiError::Http(_) => "http",
+        PiiError::BadReply(_) => "bad_reply",
+    }
+}
+
+/// One detector call for `texts`. `Ok(Some(out))` = something changed,
+/// `Ok(None)` = nothing found, `Err(())` = the detector failed (already
+/// counted, and alerted when `alert`).
+async fn run_ner(
+    cx: &PiiCx,
+    plan: &PiiPlan,
+    lane: Lane,
+    alert: bool,
+    texts: Vec<String>,
+) -> Result<Option<Vec<String>>, ()> {
+    let (reason, detail) = match plan {
+        PiiPlan::Ner(profile) => match cx.det.redact(&texts, profile, lane).await {
+            Ok(out) if out == texts => return Ok(None),
+            Ok(out) => return Ok(Some(out)),
+            Err(e) => (pii_reason(&e), e.to_string()),
+        },
+        _ => ("missing_profile", "the policy's pii_profile does not resolve".to_string()),
+    };
+    cx.metrics.record_pii_failure("model", reason);
+    tracing::warn!(reason, tenant = %cx.tenant_name, "guardrails pii detector failed");
+    if alert {
+        cx.alerts.issue(
+            format!("guardrails_pii_detector_{}", cx.tenant_id),
+            "Guardrails PII detector unavailable",
+            format!("tenant `{}`: {detail}", cx.tenant_name),
+        );
+    }
+    Err(())
+}
+
+fn each_content_string(content: &mut Value, f: &mut dyn FnMut(&mut String)) {
+    match content {
+        Value::String(s) => f(s),
+        Value::Array(parts) => {
+            for part in parts {
+                match part {
+                    Value::String(s) => f(s),
+                    _ => {
+                        if let Some(Value::String(s)) = part.get_mut("text") {
+                            f(s);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every string the redacting input path rewrites, in its order: scanned
+/// messages, then the top-level text fields.
+fn each_input_string(json: &mut Value, f: &mut dyn FnMut(&mut String)) {
+    if let Some(messages) = json.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in messages.iter_mut() {
+            if !is_scanned_role(msg.get("role").and_then(|r| r.as_str())) {
+                continue;
+            }
+            if let Some(content) = msg.get_mut("content") {
+                each_content_string(content, f);
+            }
+        }
+    }
+    for field in TEXT_FIELDS {
+        match json.get_mut(*field) {
+            Some(Value::String(s)) => f(s),
+            Some(Value::Array(items)) => {
+                for item in items.iter_mut() {
+                    match item {
+                        Value::String(s) => f(s),
+                        Value::Object(o) => {
+                            if let Some(Value::String(s)) = o.get_mut("text") {
+                                f(s);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn each_output_string(completion: &mut Value, f: &mut dyn FnMut(&mut String)) {
+    each_output_text(completion, |v| each_content_string(v, &mut *f));
+}
+
+fn gather(visit: impl FnOnce(&mut dyn FnMut(&mut String))) -> Vec<String> {
+    let mut texts = Vec::new();
+    visit(&mut |s: &mut String| texts.push(s.clone()));
+    texts
+}
+
+fn write_back(visit: impl FnOnce(&mut dyn FnMut(&mut String)), out: Vec<String>) {
+    let mut out = out.into_iter();
+    visit(&mut |s: &mut String| {
+        if let Some(next) = out.next() {
+            *s = next;
+        }
+    });
+}
+
+/// The `pii` scanner for `block` / `redact` on the request body. `Ok(true)` =
+/// the body was rewritten. A detector failure follows `fail_open`.
+async fn ner_input_stage(
+    cx: &PiiCx,
+    plan: &PiiPlan,
+    policy: &GuardrailsPolicy,
+    json: &mut Value,
+) -> Result<bool, GuardrailsBlock> {
+    let redact = matches!(policy.action, GuardrailsAction::Redact);
+    let block = matches!(policy.action, GuardrailsAction::Block);
+    if !(plan.uses_detector() && (redact || block))
+        || !policy.input_scanners.iter().any(|s| s == "pii")
+    {
+        return Ok(false);
+    }
+    let texts = gather(|f| each_input_string(json, f));
+    if texts.iter().all(|t| t.trim().is_empty()) {
+        return Ok(false);
+    }
+    match Box::pin(run_ner(cx, plan, Lane::Model, true, texts)).await {
+        Ok(None) => Ok(false),
+        Ok(Some(_)) if block => Err(GuardrailsBlock::policy("request blocked by content policy")),
+        Ok(Some(out)) => {
+            write_back(|f| each_input_string(json, f), out);
+            Ok(true)
+        }
+        Err(()) if policy.fail_open => Ok(false),
+        Err(()) => Err(GuardrailsBlock::unavailable()),
+    }
+}
+
+/// The `pii` scanner for `block` / `redact` on a buffered completion.
+async fn ner_output_stage(
+    cx: &PiiCx,
+    plan: &PiiPlan,
+    policy: &GuardrailsPolicy,
+    completion: &mut Value,
+) -> Result<bool, GuardrailsBlock> {
+    let redact = matches!(policy.action, GuardrailsAction::Redact);
+    let block = matches!(policy.action, GuardrailsAction::Block);
+    if !(plan.uses_detector() && (redact || block))
+        || !policy.output_scanners.iter().any(|s| s == "pii")
+    {
+        return Ok(false);
+    }
+    let texts = gather(|f| each_output_string(completion, f));
+    if texts.iter().all(|t| t.trim().is_empty()) {
+        return Ok(false);
+    }
+    match Box::pin(run_ner(cx, plan, Lane::Model, true, texts)).await {
+        Ok(None) => Ok(false),
+        Ok(Some(_)) if block => Err(GuardrailsBlock::policy("response blocked by content policy")),
+        Ok(Some(out)) => {
+            write_back(|f| each_output_string(completion, f), out);
+            // Log-probabilities spell the removed text out token by token.
+            let choices = completion.get_mut("choices").and_then(Value::as_array_mut);
+            for choice in choices.into_iter().flatten() {
+                if let Some(logprobs) = choice.get_mut("logprobs") {
+                    *logprobs = Value::Null;
+                }
+            }
+            Ok(true)
+        }
+        Err(()) if policy.fail_open => Ok(false),
+        Err(()) => Err(GuardrailsBlock::unavailable()),
+    }
+}
+
+/// `log_only` with a detector profile: check in a task so the request is never
+/// delayed; alert on a hit, count a failure.
+fn spawn_pii_monitor(
+    cx: PiiCx,
+    plan: PiiPlan,
+    texts: Vec<String>,
+    phase: &'static str,
+    request_id: uuid::Uuid,
+) {
+    tokio::spawn(async move {
+        if let Ok(Some(_)) = run_ner(&cx, &plan, Lane::Background, false, texts).await {
+            cx.alerts.issue(
+                format!("guardrails_{phase}_{}", cx.tenant_id),
+                format!("Guardrails {phase} flagged (log_only)"),
+                format!(
+                    "tenant `{}` request `{request_id}`: {phase} scanner `pii` flagged content",
+                    cx.tenant_name
+                ),
+            );
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Tier-2 scanner: harm (guard model via chat_call)
 // ---------------------------------------------------------------------------
 
@@ -684,6 +914,7 @@ pub struct GuardrailsInputOutcome {
 pub(super) async fn apply_input(
     state: &AppState,
     settings: &GuardrailsBoonSettings,
+    pii: &PiiPlan,
     policy: &GuardrailsPolicy,
     key: &ResolvedKey,
     session_id: &str,
@@ -692,6 +923,8 @@ pub(super) async fn apply_input(
     tracer: Option<&mut crate::tracer::SpanRecorder>,
 ) -> GuardrailsInputOutcome {
     let start = crate::tracer::now_ms();
+    let cx = PiiCx::new(state, key);
+    let eff = sync_policy(policy, pii);
     let enforcing = !matches!(policy.action, GuardrailsAction::LogOnly);
     if enforcing && !policy.input_scanners.is_empty() && has_token_id_prompt(json) {
         record_block(
@@ -721,7 +954,11 @@ pub(super) async fn apply_input(
 
     // ---- log_only: observe and alert, never block or rewrite ----
     if matches!(policy.action, GuardrailsAction::LogOnly) {
-        if let Some(scanner) = detect_tier1_input(&text, policy) {
+        if pii.uses_detector() && policy.input_scanners.iter().any(|s| s == "pii") {
+            let texts = gather(|f| each_input_string(json, f));
+            spawn_pii_monitor(cx.clone(), pii.clone(), texts, "input", request_id);
+        }
+        if let Some(scanner) = detect_tier1_input(&text, &eff) {
             state.alerts.issue(
                 format!("guardrails_input_{}", key.tenant_id),
                 "Guardrails input flagged (log_only)",
@@ -761,7 +998,7 @@ pub(super) async fn apply_input(
     }
 
     // ---- tier-1 blocking scanners ----
-    if let Some(reason) = run_tier1_input_scanners(&text, policy) {
+    if let Some(reason) = run_tier1_input_scanners(&text, &eff) {
         record_block(
             tracer,
             "boon:guardrails_input",
@@ -774,6 +1011,24 @@ pub(super) async fn apply_input(
             sanitized: false,
         };
     }
+
+    // ---- pii scanner through the detector (ner profiles) ----
+    let ner_changed = match Box::pin(ner_input_stage(&cx, pii, policy, json)).await {
+        Ok(changed) => changed,
+        Err(block) => {
+            record_block(
+                tracer,
+                "boon:guardrails_input",
+                &policy.input_scanners,
+                start,
+                Some("pii"),
+            );
+            return GuardrailsInputOutcome {
+                blocked: Some(block),
+                sanitized: false,
+            };
+        }
+    };
 
     // ---- tier-2 harm scanner (always blocks; honors fail_open on error) ----
     if policy.input_scanners.iter().any(|s| s == "harm") {
@@ -820,7 +1075,7 @@ pub(super) async fn apply_input(
     }
 
     // ---- tier-1 redact scanners (only when action is Redact) ----
-    let mut sanitized = false;
+    let mut sanitized = ner_changed;
     if matches!(policy.action, GuardrailsAction::Redact) {
         if let Some(messages) = json.get_mut("messages").and_then(|m| m.as_array_mut()) {
             for msg in messages.iter_mut() {
@@ -830,15 +1085,15 @@ pub(super) async fn apply_input(
                 if let Some(content) = msg.get_mut("content") {
                     if redact_content_in_place(
                         content,
-                        &policy.input_scanners,
-                        &policy.ban_keywords,
+                        &eff.input_scanners,
+                        &eff.ban_keywords,
                     ) {
                         sanitized = true;
                     }
                 }
             }
         }
-        if redact_fields_in_place(json, &policy.input_scanners, &policy.ban_keywords) {
+        if redact_fields_in_place(json, &eff.input_scanners, &eff.ban_keywords) {
             sanitized = true;
         }
     }
@@ -877,6 +1132,7 @@ pub enum ApplyOutputResult {
 pub(crate) async fn apply_output(
     state: &AppState,
     settings: &GuardrailsBoonSettings,
+    pii: &PiiPlan,
     policy: &GuardrailsPolicy,
     key: &ResolvedKey,
     session_id: &str,
@@ -885,10 +1141,12 @@ pub(crate) async fn apply_output(
     tracer: Option<&mut crate::tracer::SpanRecorder>,
 ) -> ApplyOutputResult {
     let start = crate::tracer::now_ms();
+    let cx = PiiCx::new(state, key);
+    let eff = sync_policy(policy, pii);
     let text = extract_completion_text(completion);
 
     // ---- tier-1 blocking ----
-    if let Some(reason) = run_tier1_output_block(&text, policy) {
+    if let Some(reason) = run_tier1_output_block(&text, &eff) {
         record_block(
             tracer,
             "boon:guardrails_output",
@@ -898,6 +1156,21 @@ pub(crate) async fn apply_output(
         );
         return ApplyOutputResult::Block(GuardrailsBlock::policy(reason));
     }
+
+    // ---- pii scanner through the detector (ner profiles) ----
+    let ner_changed = match Box::pin(ner_output_stage(&cx, pii, policy, completion)).await {
+        Ok(changed) => changed,
+        Err(block) => {
+            record_block(
+                tracer,
+                "boon:guardrails_output",
+                &policy.output_scanners,
+                start,
+                Some("pii"),
+            );
+            return ApplyOutputResult::Block(block);
+        }
+    };
 
     // ---- tier-2 harm (always blocks; honors fail_open on error) ----
     if policy.output_scanners.iter().any(|s| s == "harm") {
@@ -942,10 +1215,9 @@ pub(crate) async fn apply_output(
     // ---- tier-1 redact ----
     // Redact the visible content *and* every reasoning channel; a leaked
     // reasoning trace would otherwise restate exactly what we just redacted.
-    let mut redacted = false;
+    let mut redacted = ner_changed;
     if matches!(policy.action, GuardrailsAction::Redact) {
-        redacted =
-            redact_output_in_place(completion, &policy.output_scanners, &policy.ban_keywords);
+        redacted |= redact_output_in_place(completion, &eff.output_scanners, &eff.ban_keywords);
     }
 
     if let Some(t) = tracer {
@@ -963,9 +1235,11 @@ pub(crate) async fn apply_output(
 /// Asynchronously scan a drained `log_only` response and raise an alert if any
 /// scanner flags it. Never blocks or rewrites — monitoring only. `completion` is
 /// the raw upstream response body.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn monitor_output(
     state: &AppState,
     settings: &GuardrailsBoonSettings,
+    pii: &PiiPlan,
     policy: &GuardrailsPolicy,
     key: &ResolvedKey,
     session_id: &str,
@@ -973,7 +1247,18 @@ pub(crate) fn monitor_output(
     completion: &Value,
 ) {
     let text = extract_completion_text(completion);
-    if let Some(scanner) = detect_tier1_output(&text, policy) {
+    if pii.uses_detector() && policy.output_scanners.iter().any(|s| s == "pii") {
+        let mut copy = completion.clone();
+        let texts = gather(|f| each_output_string(&mut copy, f));
+        spawn_pii_monitor(
+            PiiCx::new(state, key),
+            pii.clone(),
+            texts,
+            "output",
+            request_id,
+        );
+    }
+    if let Some(scanner) = detect_tier1_output(&text, &sync_policy(policy, pii)) {
         state.alerts.issue(
             format!("guardrails_output_{}", key.tenant_id),
             "Guardrails output flagged (log_only)",
@@ -1303,6 +1588,7 @@ mod tests {
     #[test]
     fn input_outcome_blocked_when_injection_found() {
         let policy = obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action: obleth_config::GuardrailsAction::Block,
             input_scanners: vec!["prompt_injection".into()],
             output_scanners: vec![],
@@ -1318,6 +1604,7 @@ mod tests {
     #[test]
     fn input_outcome_clean_when_no_match() {
         let policy = obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action: obleth_config::GuardrailsAction::Block,
             input_scanners: vec!["prompt_injection".into()],
             output_scanners: vec![],
@@ -1333,6 +1620,7 @@ mod tests {
     #[test]
     fn redact_action_produces_sanitized_text() {
         let policy = obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action: obleth_config::GuardrailsAction::Redact,
             input_scanners: vec!["pii".into()],
             output_scanners: vec![],
@@ -1349,6 +1637,7 @@ mod tests {
     #[test]
     fn redact_preserves_multimodal_image_parts() {
         let policy = obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action: obleth_config::GuardrailsAction::Redact,
             input_scanners: vec!["pii".into()],
             output_scanners: vec![],
@@ -1379,6 +1668,7 @@ mod tests {
     #[test]
     fn output_outcome_redacts_pii_in_completion() {
         let policy = obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action: obleth_config::GuardrailsAction::Redact,
             input_scanners: vec![],
             output_scanners: vec!["pii".into()],
@@ -1396,6 +1686,7 @@ mod tests {
     #[test]
     fn output_outcome_blocks_banned_keyword() {
         let policy = obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action: obleth_config::GuardrailsAction::Block,
             input_scanners: vec![],
             output_scanners: vec!["ban_keywords".into()],
@@ -1428,6 +1719,7 @@ mod tests {
     fn output_block_sees_banned_keyword_in_reasoning_only() {
         // The banned word appears only in the reasoning channel, not in content.
         let policy = obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action: obleth_config::GuardrailsAction::Block,
             input_scanners: vec![],
             output_scanners: vec!["ban_keywords".into()],
@@ -1471,6 +1763,7 @@ mod tests {
     #[test]
     fn output_redact_covers_reasoning_channels() {
         let policy = obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action: obleth_config::GuardrailsAction::Redact,
             input_scanners: vec![],
             output_scanners: vec!["ban_keywords".into()],
@@ -1529,6 +1822,7 @@ mod tests {
     #[test]
     fn every_place_an_answer_carries_text_is_scanned_and_redacted() {
         let policy = GuardrailsPolicy {
+            pii_profile: None,
             action: GuardrailsAction::Redact,
             input_scanners: vec![],
             output_scanners: vec!["ban_keywords".into()],
@@ -1664,5 +1958,278 @@ mod tests {
         let p = harm_probability(&guard_completion(&[("yes", -0.7), ("no", -0.7)])).unwrap();
         assert!((p - 0.5).abs() < 1e-6);
         assert!(p <= HARM_THRESHOLD, "a coin flip must not block");
+    }
+
+    // --- pii scanner through the detector ---
+
+    use arc_swap::ArcSwap;
+    use axum::{extract::State, routing::post, Json, Router};
+    use obleth_config::{BoonSettings, PiiDetectorKind, PiiProfile};
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    type Seen = Arc<Mutex<Vec<Value>>>;
+
+    /// Fake NER: replaces "Ivan" with "[PERSON]", records each body.
+    async fn fake_ner(delay_ms: u64) -> (String, Seen) {
+        let seen: Seen = Default::default();
+        async fn h(
+            State((seen, delay)): State<(Seen, u64)>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            seen.lock().unwrap().push(body.clone());
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            let texts: Vec<String> = body["texts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_str().unwrap().replace("Ivan", "[PERSON]"))
+                .collect();
+            Json(json!({ "texts": texts }))
+        }
+        let app = Router::new()
+            .route("/", post(h))
+            .with_state((seen.clone(), delay_ms));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (format!("http://{addr}/"), seen)
+    }
+
+    fn cx(url: Option<String>) -> PiiCx {
+        let env = crate::pii::PiiEnv {
+            ner_url: url,
+            concurrency: 2,
+            scrub_timeout_ms: None,
+            warnings: vec![],
+        };
+        let http = reqwest::Client::new();
+        PiiCx {
+            det: Arc::new(PiiDetector::new(
+                &env,
+                http.clone(),
+                Arc::new(ArcSwap::from_pointee(BoonSettings::default())),
+            )),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            alerts: obleth_admin::AlertDispatcher::new(http, Default::default()),
+            tenant_id: uuid::Uuid::nil(),
+            tenant_name: "t".into(),
+        }
+    }
+
+    fn pii_policy(action: GuardrailsAction, fail_open: bool) -> GuardrailsPolicy {
+        GuardrailsPolicy {
+            pii_profile: Some("ner".into()),
+            action,
+            input_scanners: vec!["pii".into(), "ban_keywords".into()],
+            output_scanners: vec!["pii".into(), "ban_keywords".into()],
+            guard_model: None,
+            ban_keywords: vec!["secret".into()],
+            fail_open,
+        }
+    }
+
+    fn ner_plan() -> PiiPlan {
+        PiiPlan::Ner(PiiProfile::builtin(PiiDetectorKind::Ner))
+    }
+
+    fn request() -> Value {
+        json!({
+            "messages": [
+                {"role": "system", "content": "I am Ivan"},
+                {"role": "assistant", "content": "Ivan said hi"},
+                {"role": "user", "content": [{"type": "text", "text": "Ivan is a secret"}]}
+            ],
+            "prompt": "call Ivan"
+        })
+    }
+
+    fn failures(cx: &PiiCx, reason: &str) -> bool {
+        cx.metrics.encode().lines().any(|l| {
+            l.starts_with("obleth_pii_detector_failures_total")
+                && l.contains("lane=\"model\"")
+                && l.contains(&format!("reason=\"{reason}\""))
+                && l.ends_with(" 1")
+        })
+    }
+
+    #[test]
+    fn regex_profile_unchanged() {
+        let policy = GuardrailsPolicy {
+            pii_profile: None,
+            ..pii_policy(GuardrailsAction::Redact, true)
+        };
+        let plan = pii_plan(&PiiSettings::default(), &policy);
+        assert!(matches!(plan, PiiPlan::Regex));
+        assert!(!plan.uses_detector());
+        assert_eq!(sync_policy(&policy, &plan), policy);
+    }
+
+    #[tokio::test]
+    async fn ner_redact_batches_one_call() {
+        let (url, seen) = fake_ner(0).await;
+        let cx = cx(Some(url));
+        let policy = pii_policy(GuardrailsAction::Redact, true);
+        let mut json = request();
+        let changed = ner_input_stage(&cx, &ner_plan(), &policy, &mut json)
+            .await
+            .unwrap();
+        assert!(changed);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0]["texts"],
+            json!(["I am Ivan", "Ivan is a secret", "call Ivan"])
+        );
+        drop(seen);
+        assert_eq!(json["messages"][0]["content"], "I am [PERSON]");
+        assert_eq!(json["messages"][1]["content"], "Ivan said hi");
+        assert_eq!(json["messages"][2]["content"][0]["text"], "[PERSON] is a secret");
+        assert_eq!(json["prompt"], "call [PERSON]");
+    }
+
+    #[tokio::test]
+    async fn ner_block_when_text_changes() {
+        let (url, _) = fake_ner(0).await;
+        let cx = cx(Some(url));
+        let policy = pii_policy(GuardrailsAction::Block, true);
+        let mut json = request();
+        let before = json.clone();
+        let err = ner_input_stage(&cx, &ner_plan(), &policy, &mut json)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(json, before);
+        let mut clean = json!({"messages": [{"role": "user", "content": "hello"}]});
+        assert!(!ner_input_stage(&cx, &ner_plan(), &policy, &mut clean)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn ner_fail_open_passes_unchanged() {
+        let cx = cx(None);
+        let policy = pii_policy(GuardrailsAction::Redact, true);
+        let mut json = request();
+        let before = json.clone();
+        let changed = ner_input_stage(&cx, &ner_plan(), &policy, &mut json)
+            .await
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(json, before);
+        assert!(failures(&cx, "not_configured"));
+    }
+
+    #[tokio::test]
+    async fn ner_fail_closed_503() {
+        let cx = cx(None);
+        let policy = pii_policy(GuardrailsAction::Redact, false);
+        let mut json = request();
+        let err = ner_input_stage(&cx, &ner_plan(), &policy, &mut json)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        let mut completion = json!({"choices": [{"message": {"content": "Ivan"}}]});
+        let err = ner_output_stage(&cx, &ner_plan(), &policy, &mut completion)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn missing_profile_fail_open() {
+        let policy = GuardrailsPolicy {
+            pii_profile: Some("gone".into()),
+            ..pii_policy(GuardrailsAction::Redact, true)
+        };
+        let plan = pii_plan(&PiiSettings::default(), &policy);
+        assert!(matches!(plan, PiiPlan::Missing));
+        let cx = cx(None);
+        let mut json = request();
+        let before = json.clone();
+        assert!(!ner_input_stage(&cx, &plan, &policy, &mut json).await.unwrap());
+        assert_eq!(json, before);
+        assert!(failures(&cx, "missing_profile"));
+        let closed = GuardrailsPolicy {
+            fail_open: false,
+            ..policy
+        };
+        let err = ner_input_stage(&cx, &plan, &closed, &mut json)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn log_only_ner_background() {
+        let (url, seen) = fake_ner(300).await;
+        let cx = cx(Some(url));
+        let started = std::time::Instant::now();
+        spawn_pii_monitor(
+            cx.clone(),
+            ner_plan(),
+            vec!["Ivan".into()],
+            "input",
+            uuid::Uuid::nil(),
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        for _ in 0..50 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        let down = self::cx(None);
+        spawn_pii_monitor(down.clone(), ner_plan(), vec!["x".into()], "output", uuid::Uuid::nil());
+        for _ in 0..50 {
+            if failures(&down, "not_configured") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(failures(&down, "not_configured"));
+    }
+
+    #[tokio::test]
+    async fn off_profile_skips_pii() {
+        let (url, seen) = fake_ner(0).await;
+        let cx = cx(Some(url));
+        let mut policy = pii_policy(GuardrailsAction::Block, true);
+        policy.pii_profile = Some("off".into());
+        let plan = pii_plan(&PiiSettings::default(), &policy);
+        assert!(matches!(plan, PiiPlan::Off));
+        let eff = sync_policy(&policy, &plan);
+        assert_eq!(eff.input_scanners, vec!["ban_keywords".to_string()]);
+        assert!(run_tier1_input_scanners("mail a@b.co", &eff).is_none());
+        let mut json = request();
+        assert!(!ner_input_stage(&cx, &plan, &policy, &mut json).await.unwrap());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ban_keywords_applied_after_ner() {
+        let (url, _) = fake_ner(0).await;
+        let cx = cx(Some(url));
+        let policy = pii_policy(GuardrailsAction::Redact, true);
+        let plan = ner_plan();
+        let mut completion = json!({"choices": [{
+            "message": {"content": "Ivan keeps a secret"},
+            "logprobs": {"content": []}
+        }]});
+        assert!(ner_output_stage(&cx, &plan, &policy, &mut completion)
+            .await
+            .unwrap());
+        assert_eq!(completion["choices"][0]["logprobs"], Value::Null);
+        let eff = sync_policy(&policy, &plan);
+        redact_output_in_place(&mut completion, &eff.output_scanners, &eff.ban_keywords);
+        let out = completion["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(out.starts_with("[PERSON] keeps a "));
+        assert!(!out.contains("secret"));
     }
 }

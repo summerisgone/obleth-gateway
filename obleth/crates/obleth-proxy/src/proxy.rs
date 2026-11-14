@@ -3670,16 +3670,17 @@ async fn run_pipeline(
                 turn0_usage = outcome.turn0_usage;
                 // guardrails output scan (block/redact action)
                 if let Some(guard_plan) = &plan.guardrails {
-                    match crate::boons::guardrails::apply_output(
+                    match Box::pin(crate::boons::guardrails::apply_output(
                         &state,
                         &guard_plan.settings,
+                        &guard_plan.pii,
                         &guard_plan.policy,
                         &resolved,
                         &req_meta.session_id,
                         request_id,
                         body_json,
                         tracer.as_mut(),
-                    )
+                    ))
                     .await
                     {
                         crate::boons::guardrails::ApplyOutputResult::Block(block) => {
@@ -4792,6 +4793,7 @@ impl StreamAccounting {
                 Ok(completion) => crate::boons::guardrails::monitor_output(
                     &self.state,
                     &self.state.boons.settings().guardrails,
+                    &crate::boons::guardrails::pii_plan(&self.state.boons.settings().pii, policy),
                     policy,
                     &self.resolved,
                     &self.meta.session_id,
@@ -7173,21 +7175,11 @@ fn capture_genai(
     }))
 }
 
-/// Whether the tenant's guardrails redact or block PII, which forces regex
-/// scrubbing of exported content whatever the scrub mode.
-fn pii_guardrail_active(resolved: &ResolvedKey) -> bool {
-    resolved.guardrails_policy.as_ref().is_some_and(|p| {
-        !matches!(p.action, obleth_config::GuardrailsAction::LogOnly)
-            && p.input_scanners
-                .iter()
-                .chain(&p.output_scanners)
-                .any(|s| s == "pii")
-    })
-}
-
 /// The export event for a finished request, or `None` when it is not exported.
 #[allow(clippy::too_many_arguments)]
 fn genai_event(
+    pii: &obleth_config::PiiSettings,
+    scrub_default: &str,
     resolved: &ResolvedKey,
     meta: &RequestMeta,
     request_id: Uuid,
@@ -7252,7 +7244,12 @@ fn genai_event(
                 reasoning: None,
             },
             error_type: Some(error_class.to_string()).filter(|e| !e.is_empty()),
-            pii_guardrail: pii_guardrail_active(resolved),
+            scrub: obleth_config::effective_trace_profile(
+                pii,
+                resolved.pii_trace_profile.as_deref(),
+                scrub_default,
+                resolved.guardrails_policy.as_ref(),
+            ),
         },
     })
 }
@@ -7684,6 +7681,8 @@ pub(crate) fn finalize(
         obleth_config::ledger_failure(status_code, admission.as_str(), meta.failure.as_ref());
     if let Some(exporter) = state.genai.as_ref() {
         if let Some(ev) = genai_event(
+            &state.boons.settings().pii,
+            exporter.scrub_default(),
             resolved,
             meta,
             request_id,
@@ -7957,6 +7956,7 @@ mod tests {
         weekly_windows: Option<Vec<WeeklyWindow>>,
     ) -> ResolvedKey {
         ResolvedKey {
+            pii_trace_profile: None,
             genai_export: false,
             key_id: Uuid::nil(),
             tenant_id: Uuid::nil(),
@@ -7998,6 +7998,7 @@ mod tests {
     #[test]
     fn legacy_completions_are_refused_only_under_an_enforcing_output_policy() {
         let policy = |action, output: &[&str]| obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action,
             input_scanners: vec![],
             output_scanners: output.iter().map(|s| s.to_string()).collect(),
@@ -8208,6 +8209,7 @@ mod tests {
     #[test]
     fn unscannable_paths_are_refused_only_under_an_enforcing_input_policy() {
         let policy = |action| obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action,
             input_scanners: vec!["pii".into()],
             output_scanners: vec![],
@@ -8240,6 +8242,7 @@ mod tests {
         let mut key = key_with_schedule("UTC", None, None, None);
         assert!(!has_input_guardrails(&key));
         key.guardrails_policy = Some(obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action: obleth_config::GuardrailsAction::LogOnly,
             input_scanners: vec!["pii".into()],
             output_scanners: vec![],
@@ -10674,7 +10677,7 @@ mod tests {
         let mut meta = genai_meta();
         meta.genai = capture(Some(1 << 20), &genai_key(true), false, b"{}");
         meta.genai_collector = Some(guard_view);
-        let ev = super::genai_event(&genai_key(true), &meta, Uuid::nil(), "m", (1, 1, 0), 0, 5, "off", "client_cancel")
+        let ev = super::genai_event(&obleth_config::PiiSettings::default(), "regex", &genai_key(true), &meta, Uuid::nil(), "m", (1, 1, 0), 0, 5, "off", "client_cancel")
             .unwrap();
         assert_eq!(ev.output.unwrap().choices[0].text, "hel");
     }
@@ -10721,7 +10724,7 @@ mod tests {
     fn upstream_error_has_error_type() {
         let mut meta = genai_meta();
         meta.genai = capture(Some(1 << 20), &genai_key(true), false, b"{}");
-        let ev = super::genai_event(&genai_key(true), &meta, Uuid::nil(), "m", (0, 0, 0), 0, 5, "off", "upstream_error")
+        let ev = super::genai_event(&obleth_config::PiiSettings::default(), "regex", &genai_key(true), &meta, Uuid::nil(), "m", (0, 0, 0), 0, 5, "off", "upstream_error")
             .unwrap();
         assert_eq!(ev.meta.error_type.as_deref(), Some("upstream_error"));
     }
@@ -10732,7 +10735,7 @@ mod tests {
         let key = genai_key(true);
         let mut meta = genai_meta();
         meta.genai = capture(Some(1 << 20), &key, false, b"{\"model\":\"m\"}");
-        let ev = super::genai_event(&key, &meta, Uuid::nil(), "m", (11, 7, 3), 40, 100, "miss", "")
+        let ev = super::genai_event(&obleth_config::PiiSettings::default(), "regex", &key, &meta, Uuid::nil(), "m", (11, 7, 3), 40, 100, "miss", "")
             .expect("event");
         assert_eq!(ev.meta.usage.input, Some(11));
         assert_eq!(ev.meta.usage.output, Some(7));
@@ -10745,10 +10748,16 @@ mod tests {
         assert_eq!(ev.meta.server_port, Some(443));
         assert_eq!(ev.meta.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(ev.meta.error_type, None);
+        assert_eq!(ev.meta.scrub.name, "regex");
+        let mut tenant_key = genai_key(true);
+        tenant_key.pii_trace_profile = Some("off".into());
+        let ev2 = super::genai_event(&obleth_config::PiiSettings::default(), "regex", &tenant_key, &meta, Uuid::nil(), "m", (0, 0, 0), 0, 5, "off", "")
+            .unwrap();
+        assert_eq!(ev2.meta.scrub.name, "off");
         assert!(ev.ttft_unix_nanos.is_some());
         assert!(ev.request_body.is_some());
         // No capture, no event.
-        assert!(super::genai_event(&key, &genai_meta(), Uuid::nil(), "m", (0, 0, 0), 0, 0, "off", "").is_none());
+        assert!(super::genai_event(&obleth_config::PiiSettings::default(), "regex", &key, &genai_meta(), Uuid::nil(), "m", (0, 0, 0), 0, 0, "off", "").is_none());
 
         // The event reaches the exporter's process step.
         let env = std::collections::HashMap::from([(
@@ -11216,6 +11225,7 @@ mod tests {
         assert_eq!(request_type_for_path("/v1/videos"), "video");
         let mut key = crate::boons::test_support::test_key();
         key.guardrails_policy = Some(obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action: obleth_config::GuardrailsAction::Block,
             input_scanners: vec!["pii".into()],
             output_scanners: vec!["pii".into()],

@@ -37,6 +37,7 @@ export interface GuardrailsPolicy {
   guard_model: string | null;
   ban_keywords: string[];
   fail_open: boolean;
+  pii_profile?: string | null;
 }
 
 export interface CompressionPolicy {
@@ -73,6 +74,8 @@ export interface Tenant {
   synthetic: boolean;
   /** Completions are exported as GenAI spans; a key can only opt out. */
   genai_export: boolean;
+  /** PII profile for this tenant's traces; null inherits the gateway default. */
+  pii_trace_profile?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -85,6 +88,11 @@ export interface GenaiExportStatus {
   scrub: "off" | "regex" | "ner" | "llm" | null;
   /** Why export is off although it was set up: an invalid `OBLETH_GENAI_*` value. Older gateways omit it. */
   error?: string | null;
+  /** Profile names a tenant can pick, built-ins included. Older gateways omit it. */
+  profiles?: string[];
+  ner_configured?: boolean;
+  /** Set when the env uses a deprecated mode. */
+  deprecated?: "llm" | null;
 }
 
 export interface ApiKey {
@@ -1882,6 +1890,25 @@ export interface SimulateRouteRequest {
   classify?: boolean;
 }
 
+export interface PiiProfile {
+  detector: "off" | "regex" | "ner";
+  entities: string[];
+  language: string | null;
+  score_threshold: number | null;
+}
+
+export interface PiiSettings {
+  ner: { timeout_ms: number | null; model_timeout_ms: number };
+  profiles: Record<string, PiiProfile>;
+  traces: string | null;
+}
+
+export interface PiiCheckResult {
+  ok: boolean;
+  latency_ms: number | null;
+  error: string | null;
+}
+
 export interface BoonSettingsView {
   vision_enabled: boolean;
   vision_fallback_model: string | null;
@@ -1940,6 +1967,8 @@ export interface BoonSettingsView {
   web_search_max_results: number;
   web_search_max_searches_per_request: number;
   web_search_timeout_ms: number;
+  /** Absent on gateways older than the unified PII config. `ner_url` is read-only, from the environment. */
+  pii?: PiiSettings & { ner_url: string | null };
 }
 
 // One per-category gate of the speculation boon. Missing thresholds fall back
@@ -1953,6 +1982,8 @@ export interface SpeculationCategoryGate {
 }
 
 export interface UpdateBoonSettings {
+  /** Replaces the whole PII section. */
+  pii?: PiiSettings;
   vision_enabled?: boolean;
   vision_fallback_model?: string | null;
   vision_describe_prompt?: string;
@@ -2692,11 +2723,11 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify({ tracing_enabled }),
     }),
-  setTenantGenaiExport: (id: string, genai_export: boolean, options?: AuditOptions) =>
+  setTenantGenaiExport: (id: string, genai_export: boolean, options?: AuditOptions, pii_trace_profile?: string | null) =>
     api<void>(`/tenants/${seg(id)}/genai-export`, {
       method: "PUT",
       headers: auditActorHeaders(options),
-      body: JSON.stringify({ genai_export }),
+      body: JSON.stringify(pii_trace_profile === undefined ? { genai_export } : { genai_export, pii_trace_profile }),
     }),
   genaiExportStatus: () => api<GenaiExportStatus>("/genai-export"),
   setTenantSynthetic: (
@@ -3329,6 +3360,7 @@ export const obleth = {
       method: "POST",
       body: JSON.stringify(query),
     }),
+  checkPiiService: () => api<PiiCheckResult>("/settings/boons/pii/check", { method: "POST" }),
   getSlurmSettings: reactCache(() => api<SlurmSettingsView>("/settings/slurm")),
   setSlurmSettings: (body: UpdateSlurmSettings, options?: AuditOptions) =>
     api<SlurmSettingsView>("/settings/slurm", {

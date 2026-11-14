@@ -35,6 +35,8 @@ afterEach(async () => {
 });
 
 async function render(t = tenant(), genai: GenaiExportStatus | null = null) {
+  await act(async () => root.unmount());
+  root = createRoot(host);
   const others = [t, tenant({ id: "t2", name: "brain-training", weight: 100 }), tenant({ id: "t3", name: "svc", weight: 100 })];
   await act(async () => root.render(<TenantSettings tenant={t} tenants={others} models={["m1", "m2"]} budget={null} genai={genai} onDirty={() => {}} onSaved={() => {}} />));
   await frame();
@@ -114,5 +116,58 @@ describe("a tenant's settings", () => {
     await act(async () => [...bar.querySelectorAll("button")].find((b) => b.textContent === "Save changes")!.click());
     expect(saveTenantSettingsAction).not.toHaveBeenCalled();
     expect(bar.textContent).toContain("pick a guard model");
+  });
+  const piiPolicy = (over: Record<string, unknown> = {}) =>
+    ({ action: "redact", input_scanners: ["pii"], output_scanners: [], guard_model: null, ban_keywords: [], fail_open: true, ...over }) as Tenant["guardrails_policy"];
+  const status = (over: Partial<GenaiExportStatus> = {}): GenaiExportStatus => ({ configured: true, scrub: "off", profiles: ["ner", "off", "regex", "ru"], ...over });
+
+  it("trace_profile_select_inherit", async () => {
+    await render(tenant(), status());
+    const sel = host.querySelector<HTMLSelectElement>('select[name="pii_trace_profile"]')!;
+    expect(sel.value).toBe("");
+    expect([...sel.options].map((o) => o.value)).toEqual(["", "ner", "off", "regex", "ru"]);
+    expect(host.querySelector("#set-genai-export")!.textContent).toContain("Effective trace profile: gateway default");
+  });
+
+  it("hides the trace profile select on older gateways", async () => {
+    await render(tenant(), { configured: true, scrub: "regex" });
+    expect(host.querySelector('select[name="pii_trace_profile"]')).toBeNull();
+  });
+
+  it("effective_line_says_strengthened", async () => {
+    await render(tenant({ pii_trace_profile: "off", guardrails_policy: piiPolicy() }), status());
+    expect(host.querySelector("#set-genai-export")!.textContent).toContain("off+regex, strengthened by guardrails");
+  });
+
+  it("does not strengthen for log_only or a custom profile", async () => {
+    await render(tenant({ pii_trace_profile: "off", guardrails_policy: piiPolicy({ action: "log_only" }) }), status());
+    expect(host.querySelector("#set-genai-export")!.textContent).not.toContain("strengthened");
+    await render(tenant({  pii_trace_profile: "ru", guardrails_policy: piiPolicy() }), status());
+    expect(host.querySelector("#set-genai-export")!.textContent).toContain("plus guardrails profile regex");
+  });
+
+  it("llm_deprecated_warning", async () => {
+    await render(tenant(), status({ scrub: "llm", deprecated: "llm" }));
+    const note = host.querySelector("#set-genai-export")!.textContent!;
+    expect(note).toContain("deprecated and will be removed in the next release");
+    expect(note).toContain("use NER");
+  });
+
+  it("guardrails_ner_fail_open_warning", async () => {
+    const warn = "If the NER service is down, requests pass unredacted";
+    await render(tenant({ guardrails_policy: piiPolicy({ pii_profile: "ner" }) }), status());
+    expect(host.querySelector("#set-guardrails-pii-profile")!.textContent).toContain(warn);
+    await render(tenant({  guardrails_policy: piiPolicy({ pii_profile: "ner", fail_open: false }) }), status());
+    expect(host.textContent).not.toContain(warn);
+    await render(tenant({  guardrails_policy: piiPolicy() }), status());
+    expect(host.textContent).not.toContain(warn);
+    expect(JSON.parse(host.querySelector<HTMLInputElement>('[name="guardrails_policy"]')!.value)).not.toHaveProperty("pii_profile");
+  });
+
+  it("pii_profile_select_only_with_pii_scanner", async () => {
+    await render(tenant({ guardrails_policy: piiPolicy({ input_scanners: ["prompt_injection"] }) }), status());
+    expect(host.querySelector("#set-guardrails-pii-profile")).toBeNull();
+    await render(tenant({  guardrails_policy: piiPolicy({ input_scanners: [], output_scanners: ["pii"] }) }), status());
+    expect(host.querySelector("#set-guardrails-pii-profile")).not.toBeNull();
   });
 });

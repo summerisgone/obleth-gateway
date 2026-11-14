@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
 use opentelemetry_proto::tonic::trace::v1::Span;
 
 use super::config::GenAiConfig;
@@ -46,7 +47,7 @@ pub async fn process(mut ev: GenAiEvent, cfg: Arc<GenAiConfig>, scrubber: Arc<Sc
                         (Some(u), Some(k)) => Some(hmac_hex(k, &u)),
                         _ => None,
                     };
-                    match scrubber.scrub(&mut c, ev.meta.pii_guardrail).await {
+                    match scrubber.scrub(&mut c, &ev.meta.scrub).await {
                         Err(_) => ev.dropped = Some("scrub_failed"),
                         Ok(mode) => {
                             scrubbed = mode;
@@ -62,7 +63,7 @@ pub async fn process(mut ev: GenAiEvent, cfg: Arc<GenAiConfig>, scrubber: Arc<Sc
         }
     }
 
-    build_span(
+    let mut span = build_span(
         &ev,
         params.as_ref(),
         content.as_ref(),
@@ -71,7 +72,15 @@ pub async fn process(mut ev: GenAiEvent, cfg: Arc<GenAiConfig>, scrubber: Arc<Sc
             ("obleth.content.input_truncated", in_truncated),
             ("obleth.content.output_truncated", out_truncated && content.is_some()),
         ],
-    )
+    );
+    span.attributes.push(KeyValue {
+        key: "obleth.content.scrub_profile".to_string(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(ev.meta.scrub.name.clone())),
+        }),
+        ..Default::default()
+    });
+    span
 }
 
 pub fn process_fn(cfg: Arc<GenAiConfig>, scrubber: Arc<Scrubber>) -> ProcessFn {
@@ -83,12 +92,13 @@ pub fn process_fn(cfg: Arc<GenAiConfig>, scrubber: Arc<Scrubber>) -> ProcessFn {
 
 #[cfg(test)]
 mod tests {
-    use super::super::config::ScrubMode;
+    use crate::pii::PiiDetector;
+    use obleth_config::{PiiDetectorKind, PiiProfile, TraceProfile};
     use super::super::{ApiSurface, CollectedOutput, OutputChoice};
     use super::*;
     use std::time::Duration;
 
-    fn cfg(mode: ScrubMode, key: Option<&[u8]>, sources: &[&str]) -> Arc<GenAiConfig> {
+    fn cfg(key: Option<&[u8]>, sources: &[&str]) -> Arc<GenAiConfig> {
         Arc::new(GenAiConfig {
             traces_url: "http://127.0.0.1:1/v1/traces".into(),
             headers: vec![],
@@ -97,7 +107,7 @@ mod tests {
             flush: Duration::from_secs(1),
             max_request_bytes: 1 << 20,
             max_content_bytes: 1 << 18,
-            scrub: mode,
+            scrub_default: "regex".into(),
             scrub_url: Some("http://127.0.0.1:1".into()),
             scrub_model: None,
             scrub_timeout: Duration::from_millis(300),
@@ -107,6 +117,19 @@ mod tests {
         })
     }
 
+    fn tp(name: &str, kind: PiiDetectorKind) -> TraceProfile {
+        TraceProfile {
+            name: name.into(),
+            profile: Some(PiiProfile {
+                detector: kind,
+                entities: vec![],
+                language: None,
+                score_threshold: None,
+            }),
+            strengthened: false,
+        }
+    }
+
     fn event(body: &str) -> GenAiEvent {
         let mut ev = GenAiEvent {
             surface: ApiSurface::Chat,
@@ -114,6 +137,7 @@ mod tests {
             ..Default::default()
         };
         ev.meta.client_model = "m".into();
+        ev.meta.scrub = tp("regex", PiiDetectorKind::Regex);
         ev.output = Some(CollectedOutput {
             choices: vec![OutputChoice { role: "assistant".into(), text: "ok".into(), ..Default::default() }],
             ..Default::default()
@@ -122,7 +146,7 @@ mod tests {
     }
 
     async fn run(ev: GenAiEvent, c: Arc<GenAiConfig>) -> Span {
-        let sc = Arc::new(Scrubber::new(c.clone(), reqwest::Client::new()));
+        let sc = Arc::new(Scrubber::new(c.clone(), reqwest::Client::new(), PiiDetector::for_tests()));
         process(ev, c, sc).await
     }
 
@@ -139,7 +163,7 @@ mod tests {
 
     #[tokio::test]
     async fn pii_in_input_redacted_in_span() {
-        let sp = run(event(BODY), cfg(ScrubMode::Regex, None, &["client"])).await;
+        let sp = run(event(BODY), cfg(None, &["client"])).await;
         let inp = attr(&sp, "gen_ai.input.messages").unwrap();
         assert!(inp.contains("[REDACTED:EMAIL]") && !inp.contains("a@b.io"));
         assert!(attr(&sp, "gen_ai.output.messages").unwrap().contains("ok"));
@@ -148,7 +172,9 @@ mod tests {
 
     #[tokio::test]
     async fn scrub_failure_drops_content() {
-        let sp = run(event(BODY), cfg(ScrubMode::Ner, None, &[])).await;
+        let mut ev = event(BODY);
+        ev.meta.scrub = tp("ner", PiiDetectorKind::Ner);
+        let sp = run(ev, cfg(None, &[])).await;
         assert!(attr(&sp, "gen_ai.input.messages").is_none());
         assert!(attr(&sp, "gen_ai.output.messages").is_none());
         assert_eq!(attr(&sp, "obleth.content.dropped").as_deref(), Some("scrub_failed"));
@@ -157,15 +183,15 @@ mod tests {
 
     #[tokio::test]
     async fn parse_failure_marked() {
-        let sp = run(event("not json"), cfg(ScrubMode::Regex, None, &[])).await;
+        let sp = run(event("not json"), cfg(None, &[])).await;
         assert_eq!(attr(&sp, "obleth.content.dropped").as_deref(), Some("parse_failed"));
     }
 
     #[tokio::test]
     async fn user_id_needs_key() {
-        let sp = run(event(BODY), cfg(ScrubMode::Regex, None, &[])).await;
+        let sp = run(event(BODY), cfg(None, &[])).await;
         assert!(attr(&sp, "user.id").is_none());
-        let sp = run(event(BODY), cfg(ScrubMode::Regex, Some(b"k"), &[])).await;
+        let sp = run(event(BODY), cfg(Some(b"k"), &[])).await;
         assert_eq!(attr(&sp, "user.id").unwrap(), hmac_hex(b"k", "u1"));
     }
 
@@ -174,10 +200,10 @@ mod tests {
         let mut ev = event(BODY);
         ev.meta.session_id = "sess-1".into();
         ev.meta.session_source = "derived".into();
-        let sp = run(ev.clone(), cfg(ScrubMode::Regex, None, &["client"])).await;
+        let sp = run(ev.clone(), cfg(None, &["client"])).await;
         assert!(attr(&sp, "gen_ai.conversation.id").is_none());
         assert!(attr(&sp, "obleth.session.source").is_none());
-        let sp = run(ev, cfg(ScrubMode::Regex, None, &["client", "derived"])).await;
+        let sp = run(ev, cfg(None, &["client", "derived"])).await;
         assert_eq!(attr(&sp, "gen_ai.conversation.id").as_deref(), Some("sess-1"));
         assert_eq!(attr(&sp, "obleth.session.source").as_deref(), Some("derived"));
     }
@@ -187,7 +213,7 @@ mod tests {
         let mut ev = event(BODY);
         ev.meta.session_id = "a@b.io".into();
         ev.meta.session_source = "client".into();
-        let sp = run(ev, cfg(ScrubMode::Regex, None, &["client"])).await;
+        let sp = run(ev, cfg(None, &["client"])).await;
         assert!(attr(&sp, "gen_ai.conversation.id").is_none());
     }
 
@@ -195,7 +221,7 @@ mod tests {
     async fn dropped_event_has_no_content() {
         let mut ev = event(BODY);
         ev.dropped = Some("queue_full");
-        let sp = run(ev, cfg(ScrubMode::Regex, None, &[])).await;
+        let sp = run(ev, cfg(None, &[])).await;
         assert!(attr(&sp, "gen_ai.input.messages").is_none());
         assert!(attr(&sp, "gen_ai.output.messages").is_none());
         assert_eq!(attr(&sp, "obleth.content.dropped").as_deref(), Some("queue_full"));
@@ -205,7 +231,26 @@ mod tests {
     async fn collector_truncated_flags_output() {
         let mut ev = event(BODY);
         ev.output.as_mut().unwrap().truncated = true;
-        let sp = run(ev, cfg(ScrubMode::Regex, None, &[])).await;
+        let sp = run(ev, cfg(None, &[])).await;
         assert_eq!(attr(&sp, "obleth.content.output_truncated").as_deref(), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn unknown_profile_scrub_failed() {
+        let mut ev = event(BODY);
+        ev.meta.scrub = TraceProfile { name: "gone".into(), profile: None, strengthened: false };
+        let sp = run(ev, cfg(None, &[])).await;
+        assert!(attr(&sp, "gen_ai.input.messages").is_none());
+        assert_eq!(attr(&sp, "obleth.content.dropped").as_deref(), Some("scrub_failed"));
+        assert_eq!(attr(&sp, "obleth.content.scrub_profile").as_deref(), Some("gone"));
+    }
+
+    #[tokio::test]
+    async fn scrub_profile_attribute() {
+        let mut ev = event(BODY);
+        ev.meta.scrub = tp("off+regex", PiiDetectorKind::Regex);
+        let sp = run(ev, cfg(None, &[])).await;
+        assert_eq!(attr(&sp, "obleth.content.scrub_profile").as_deref(), Some("off+regex"));
+        assert_eq!(attr(&sp, "obleth.content.scrubbed").as_deref(), Some("regex"));
     }
 }

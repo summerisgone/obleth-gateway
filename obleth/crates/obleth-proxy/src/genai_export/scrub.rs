@@ -5,13 +5,14 @@
 
 use std::sync::Arc;
 
+use obleth_config::{PiiDetectorKind, TraceProfile};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
 
-use super::config::{GenAiConfig, ScrubMode};
+use super::config::GenAiConfig;
 use super::Content;
 use crate::boons::guardrails::scan_pii;
+use crate::pii::{Lane, PiiDetector, PiiError};
 
 const LLM_SYSTEM_PROMPT: &str = "You redact personal data. You receive a JSON array of strings. \
 Replace every name, address, phone number, e-mail, identifier and secret with a [REDACTED:TYPE] tag. \
@@ -20,65 +21,44 @@ Reply with only a JSON array of strings of the same length, in the same order, w
 pub struct Scrubber {
     cfg: Arc<GenAiConfig>,
     http: reqwest::Client,
-    sem: Semaphore,
+    detector: Arc<PiiDetector>,
 }
 
 impl Scrubber {
-    pub fn new(cfg: Arc<GenAiConfig>, http: reqwest::Client) -> Scrubber {
-        let sem = Semaphore::new(cfg.scrub_concurrency.max(1));
-        Scrubber { cfg, http, sem }
+    pub fn new(cfg: Arc<GenAiConfig>, http: reqwest::Client, detector: Arc<PiiDetector>) -> Scrubber {
+        Scrubber { cfg, http, detector }
     }
 
-    /// Returns the scrub mode label applied. Any Err means the caller must drop the content.
-    pub async fn scrub(&self, c: &mut Content, force_regex: bool) -> Result<&'static str, String> {
-        let mode = self.cfg.scrub;
-        if mode == ScrubMode::Off && !force_regex {
-            return Ok("none");
-        }
-        let mut texts = collect(c);
-        for t in texts.iter_mut() {
-            *t = scan_pii(t).1;
-        }
-        let label = match mode {
-            ScrubMode::Off | ScrubMode::Regex => "regex",
-            ScrubMode::Ner => "ner",
-            ScrubMode::Llm => "llm",
-        };
-        if label == "ner" || label == "llm" {
-            let _permit = self.sem.try_acquire().map_err(|_| "busy".to_string())?;
-            let fut = async {
-                if label == "ner" {
-                    self.call_ner(&texts).await
-                } else {
-                    self.call_llm(&texts).await
+    /// Returns the scrub marker applied. Any Err means the caller must drop the content.
+    pub async fn scrub(&self, c: &mut Content, tp: &TraceProfile) -> Result<&'static str, String> {
+        let profile = tp.profile.as_ref().ok_or("unknown profile")?;
+        let mut texts = self
+            .detector
+            .redact(&collect(c), profile, Lane::Traces)
+            .await
+            .map_err(|e| {
+                match e {
+                    PiiError::NotConfigured => "ner not configured",
+                    PiiError::Busy => "busy",
+                    PiiError::Timeout => "scrub timeout",
+                    PiiError::Http(_) => "ner request failed",
+                    PiiError::BadReply(_) => "ner bad reply",
                 }
-            };
-            texts = tokio::time::timeout(self.cfg.scrub_timeout, fut)
+                .to_string()
+            })?;
+        let mut label = match profile.detector {
+            PiiDetectorKind::Off => "none",
+            PiiDetectorKind::Regex => "regex",
+            PiiDetectorKind::Ner => "ner",
+        };
+        if tp.name.split('+').next() == Some("llm") {
+            texts = tokio::time::timeout(self.cfg.scrub_timeout, self.call_llm(&texts))
                 .await
                 .map_err(|_| "scrub timeout".to_string())??;
+            label = "llm";
         }
         apply(c, texts);
         Ok(label)
-    }
-
-    async fn call_ner(&self, texts: &[String]) -> Result<Vec<String>, String> {
-        let url = self.cfg.scrub_url.as_deref().ok_or("scrub url missing")?;
-        let resp = self
-            .http
-            .post(url)
-            .json(&serde_json::json!({ "texts": texts }))
-            .send()
-            .await
-            .map_err(|_| "ner request failed".to_string())?;
-        if !resp.status().is_success() {
-            return Err("ner status".into());
-        }
-        let v: Value = resp.json().await.map_err(|_| "ner bad reply".to_string())?;
-        let out = string_array(v.get("texts")).ok_or("ner bad reply")?;
-        if out.len() != texts.len() {
-            return Err("ner length mismatch".into());
-        }
-        Ok(out)
     }
 
     async fn call_llm(&self, texts: &[String]) -> Result<Vec<String>, String> {
@@ -236,10 +216,16 @@ pub fn conversation_id(raw: &str, key: Option<&[u8]>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boons::BoonEngine;
+    use crate::pii::PiiEnv;
+    use obleth_config::{
+        effective_trace_profile, BoonSettings, GuardrailsAction, GuardrailsPolicy, PiiProfile,
+    };
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    fn cfg(mode: ScrubMode, url: Option<String>) -> GenAiConfig {
+    fn cfg(url: Option<String>) -> GenAiConfig {
         GenAiConfig {
             traces_url: String::new(),
             headers: vec![],
@@ -248,7 +234,7 @@ mod tests {
             flush: Duration::from_millis(2000),
             max_request_bytes: 4 << 20,
             max_content_bytes: 262144,
-            scrub: mode,
+            scrub_default: "regex".into(),
             scrub_url: url,
             scrub_model: Some("m".into()),
             scrub_timeout: Duration::from_millis(300),
@@ -258,9 +244,46 @@ mod tests {
         }
     }
 
-    // Fake: always the local struct literal; the real GenAiConfig is the same type.
+    fn detector_with(
+        url: Option<String>,
+        conc: usize,
+        settings: BoonSettings,
+    ) -> (Arc<PiiDetector>, Arc<arc_swap::ArcSwap<BoonSettings>>) {
+        let h = Arc::new(arc_swap::ArcSwap::from_pointee(settings));
+        let env = PiiEnv {
+            ner_url: url,
+            concurrency: conc,
+            scrub_timeout_ms: Some(300),
+            warnings: vec![],
+        };
+        (Arc::new(PiiDetector::new(&env, reqwest::Client::new(), h.clone())), h)
+    }
+
+    fn scrubber_url(c: GenAiConfig, ner: Option<String>) -> Scrubber {
+        let (d, _) = detector_with(ner, 8, BoonSettings::default());
+        Scrubber::new(Arc::new(c), reqwest::Client::new(), d)
+    }
+
     fn scrubber(c: GenAiConfig) -> Scrubber {
-        Scrubber::new(Arc::new(c), reqwest::Client::new())
+        let u = c.scrub_url.clone();
+        scrubber_url(c, u)
+    }
+
+    fn tp(name: &str, kind: PiiDetectorKind) -> TraceProfile {
+        TraceProfile {
+            name: name.into(),
+            profile: Some(PiiProfile {
+                detector: kind,
+                entities: vec![],
+                language: None,
+                score_threshold: None,
+            }),
+            strengthened: false,
+        }
+    }
+
+    fn regex_tp() -> TraceProfile {
+        tp("regex", PiiDetectorKind::Regex)
     }
 
     fn text_content(t: &str) -> Content {
@@ -281,6 +304,20 @@ mod tests {
         format!("http://{addr}")
     }
 
+    async fn counting_ner(hits: Arc<AtomicUsize>, delay_ms: u64) -> String {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(v): axum::Json<Value>| {
+                hits.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    axum::Json(v)
+                }
+            }),
+        );
+        format!("{}/", serve(app).await)
+    }
+
     #[test]
     fn hmac_known_vector() {
         assert_eq!(
@@ -293,20 +330,27 @@ mod tests {
 
     #[tokio::test]
     async fn regex_redacts_email() {
-        let s = scrubber(cfg(ScrubMode::Regex, None));
+        let s = scrubber(cfg(None));
         let mut c = text_content("mail a@b.io");
-        assert_eq!(s.scrub(&mut c, false).await, Ok("regex"));
+        assert_eq!(s.scrub(&mut c, &regex_tp()).await, Ok("regex"));
         assert_eq!(first_text(&c), "mail [REDACTED:EMAIL]");
     }
 
     #[tokio::test]
-    async fn off_and_force_regex() {
-        let s = scrubber(cfg(ScrubMode::Off, None));
+    async fn off_leaves_text() {
+        let s = scrubber(cfg(None));
         let mut c = text_content("mail a@b.io");
-        assert_eq!(s.scrub(&mut c, false).await, Ok("none"));
+        assert_eq!(s.scrub(&mut c, &tp("off", PiiDetectorKind::Off)).await, Ok("none"));
         assert_eq!(first_text(&c), "mail a@b.io");
-        assert_eq!(s.scrub(&mut c, true).await, Ok("regex"));
-        assert_eq!(first_text(&c), "mail [REDACTED:EMAIL]");
+    }
+
+    #[tokio::test]
+    async fn unknown_profile_scrub_failed() {
+        let s = scrubber(cfg(None));
+        let mut c = text_content("mail a@b.io");
+        let gone = TraceProfile { name: "gone".into(), profile: None, strengthened: false };
+        assert!(s.scrub(&mut c, &gone).await.is_err());
+        assert_eq!(first_text(&c), "mail a@b.io");
     }
 
     #[tokio::test]
@@ -324,31 +368,19 @@ mod tests {
             }),
         );
         let url = serve(app).await;
-        let s = scrubber(cfg(ScrubMode::Ner, Some(format!("{url}/"))));
+        let s = scrubber(cfg(Some(format!("{url}/"))));
         let mut c = text_content("hello a@b.io");
         c.system = vec![json!({"type":"text","content":"sys"})];
-        assert_eq!(s.scrub(&mut c, false).await, Ok("ner"));
+        assert_eq!(s.scrub(&mut c, &tp("ner", PiiDetectorKind::Ner)).await, Ok("ner"));
         assert_eq!(first_text(&c), "HELLO [REDACTED:EMAIL]");
         assert_eq!(c.system[0]["content"], "SYS");
     }
 
     #[tokio::test]
-    async fn force_regex_keeps_ner() {
-        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let h = hits.clone();
-        let app = axum::Router::new().route(
-            "/",
-            axum::routing::post(move |axum::Json(v): axum::Json<Value>| {
-                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async move { axum::Json(v) }
-            }),
-        );
-        let url = serve(app).await;
-        let s = scrubber(cfg(ScrubMode::Ner, Some(format!("{url}/"))));
-        let mut c = text_content("hi a@b.io");
-        assert_eq!(s.scrub(&mut c, true).await, Ok("ner"));
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(first_text(&c), "hi [REDACTED:EMAIL]");
+    async fn ner_without_url_fails() {
+        let s = scrubber(cfg(None));
+        let mut c = text_content("x");
+        assert!(s.scrub(&mut c, &tp("ner", PiiDetectorKind::Ner)).await.is_err());
     }
 
     #[tokio::test]
@@ -358,9 +390,9 @@ mod tests {
             axum::routing::post(|| async { axum::Json(json!({"texts": []})) }),
         );
         let url = serve(app).await;
-        let s = scrubber(cfg(ScrubMode::Ner, Some(format!("{url}/"))));
+        let s = scrubber(cfg(Some(format!("{url}/"))));
         let mut c = text_content("secret words");
-        let r = s.scrub(&mut c, false).await;
+        let r = s.scrub(&mut c, &tp("ner", PiiDetectorKind::Ner)).await;
         assert!(r.is_err());
         assert!(!r.unwrap_err().contains("secret"));
     }
@@ -375,19 +407,108 @@ mod tests {
             }),
         );
         let url = serve(app).await;
-        let s = scrubber(cfg(ScrubMode::Ner, Some(format!("{url}/"))));
+        let s = scrubber(cfg(Some(format!("{url}/"))));
         let mut c = text_content("x");
-        assert!(s.scrub(&mut c, false).await.is_err());
+        assert!(s.scrub(&mut c, &tp("ner", PiiDetectorKind::Ner)).await.is_err());
     }
 
     #[tokio::test]
     async fn busy_when_no_permit() {
-        let mut cf = cfg(ScrubMode::Ner, Some("http://127.0.0.1:1/".into()));
-        cf.scrub_concurrency = 1;
-        let s = scrubber(cf);
-        let _held = s.sem.try_acquire().unwrap();
+        let url = counting_ner(Arc::new(AtomicUsize::new(0)), 150).await;
+        let (d, _) = detector_with(Some(url), 1, BoonSettings::default());
+        let s = Arc::new(Scrubber::new(Arc::new(cfg(None)), reqwest::Client::new(), d));
+        let t = tp("ner", PiiDetectorKind::Ner);
+        let s2 = s.clone();
+        let t2 = t.clone();
+        let first = tokio::spawn(async move {
+            let mut c = text_content("x");
+            s2.scrub(&mut c, &t2).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let mut c = text_content("x");
-        assert_eq!(s.scrub(&mut c, false).await, Err("busy".to_string()));
+        assert_eq!(s.scrub(&mut c, &t).await, Err("busy".to_string()));
+        assert_eq!(first.await.unwrap(), Ok("ner"));
+    }
+
+    #[tokio::test]
+    async fn no_restart_traces_and_tenant_override() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = counting_ner(hits.clone(), 0).await;
+        let engine = BoonEngine::new(BoonSettings::default());
+        let det = Arc::new(PiiDetector::new(
+            &PiiEnv {
+                ner_url: Some(url),
+                concurrency: 4,
+                scrub_timeout_ms: None,
+                warnings: vec![],
+            },
+            reqwest::Client::new(),
+            engine.settings_handle(),
+        ));
+        let sc = Scrubber::new(Arc::new(cfg(None)), reqwest::Client::new(), det);
+        let resolve = |tenant: Option<&str>, policy: Option<&GuardrailsPolicy>| {
+            effective_trace_profile(&engine.settings().pii, tenant, "regex", policy)
+        };
+
+        let mut c = text_content("a@b.io");
+        assert_eq!(sc.scrub(&mut c, &resolve(None, None)).await, Ok("regex"));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let mut b = BoonSettings::default();
+        b.pii.traces = Some("ner".into());
+        engine.update(b);
+        let mut c = text_content("a@b.io");
+        assert_eq!(sc.scrub(&mut c, &resolve(None, None)).await, Ok("ner"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let mut c = text_content("a@b.io");
+        assert_eq!(sc.scrub(&mut c, &resolve(Some("off"), None)).await, Ok("none"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(first_text(&c), "a@b.io");
+
+        let policy = GuardrailsPolicy {
+            action: GuardrailsAction::Redact,
+            input_scanners: vec!["pii".into()],
+            output_scanners: vec![],
+            guard_model: None,
+            ban_keywords: vec![],
+            fail_open: true,
+            pii_profile: None,
+        };
+        let mut c = text_content("a@b.io");
+        let strengthened = resolve(Some("off"), Some(&policy));
+        assert_eq!(strengthened.name, "off+regex");
+        assert_eq!(sc.scrub(&mut c, &strengthened).await, Ok("regex"));
+        assert_eq!(first_text(&c), "[REDACTED:EMAIL]");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let mut c = text_content("a@b.io");
+        assert_eq!(sc.scrub(&mut c, &resolve(Some("ner"), None)).await, Ok("ner"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn llm_legacy_runs_after_detector() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(v): axum::Json<Value>| {
+                h.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let seen = v["messages"][1]["content"].as_str().unwrap().to_string();
+                    assert!(seen.contains("[REDACTED:EMAIL]") && !seen.contains("a@b.io"));
+                    let out = serde_json::to_string(&["hi [REDACTED:EMAIL]"]).unwrap();
+                    axum::Json(json!({"choices":[{"message":{"content": out}}]}))
+                }
+            }),
+        );
+        let url = serve(app).await;
+        let s = scrubber(cfg(Some(url)));
+        let mut c = text_content("hi a@b.io");
+        assert_eq!(s.scrub(&mut c, &tp("llm", PiiDetectorKind::Regex)).await, Ok("llm"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(first_text(&c), "hi [REDACTED:EMAIL]");
     }
 
     async fn llm_server(factor_num: usize) -> String {
@@ -410,22 +531,22 @@ mod tests {
     #[tokio::test]
     async fn llm_too_long_fails() {
         let url = llm_server(13).await;
-        let s = scrubber(cfg(ScrubMode::Llm, Some(url)));
+        let s = scrubber(cfg(Some(url)));
         let mut c = text_content("abcdefghij");
-        assert!(s.scrub(&mut c, false).await.is_err());
+        assert!(s.scrub(&mut c, &tp("llm", PiiDetectorKind::Regex)).await.is_err());
     }
 
     #[tokio::test]
     async fn llm_ok_same_length() {
         let url = llm_server(10).await;
-        let s = scrubber(cfg(ScrubMode::Llm, Some(url)));
+        let s = scrubber(cfg(Some(url)));
         let mut c = text_content("abcdefghij");
-        assert_eq!(s.scrub(&mut c, false).await, Ok("llm"));
+        assert_eq!(s.scrub(&mut c, &tp("llm", PiiDetectorKind::Regex)).await, Ok("llm"));
     }
 
     #[tokio::test]
     async fn arguments_leaves_scrubbed() {
-        let s = scrubber(cfg(ScrubMode::Regex, None));
+        let s = scrubber(cfg(None));
         let mut c = Content {
             output: vec![json!({"role":"assistant","name":"bob@x.io","parts":[
                 {"type":"tool_call","id":"1","name":"f","arguments":{"to":"a@b.io","n":1}},
@@ -434,7 +555,7 @@ mod tests {
             ]})],
             ..Default::default()
         };
-        s.scrub(&mut c, false).await.unwrap();
+        s.scrub(&mut c, &regex_tp()).await.unwrap();
         let m = &c.output[0];
         assert_eq!(m["name"], "[REDACTED:EMAIL]");
         assert_eq!(m["parts"][0]["arguments"]["to"], "[REDACTED:EMAIL]");
@@ -445,22 +566,22 @@ mod tests {
 
     #[tokio::test]
     async fn tool_ids_and_names_scrubbed() {
-        let s = scrubber(cfg(ScrubMode::Regex, None));
+        let s = scrubber(cfg(None));
         let mut c = Content {
             input: vec![json!({"role":"tool","parts":[{"type":"tool_call_response","id":"a@b.io","response":"x"}]})],
             output: vec![json!({"role":"assistant","parts":[{"type":"tool_call","id":"c@d.io","name":"e@f.io","arguments":{}}]})],
             ..Default::default()
         };
-        s.scrub(&mut c, false).await.unwrap();
+        s.scrub(&mut c, &regex_tp()).await.unwrap();
         let t = serde_json::to_string(&(&c.input, &c.output)).unwrap();
         assert!(!t.contains('@'), "{t}");
     }
 
     #[tokio::test]
     async fn unicode_and_quotes_survive() {
-        let s = scrubber(cfg(ScrubMode::Regex, None));
+        let s = scrubber(cfg(None));
         let mut c = text_content("\"привет\" \u{1F600} \\ \n a@b.io");
-        s.scrub(&mut c, false).await.unwrap();
+        s.scrub(&mut c, &regex_tp()).await.unwrap();
         assert_eq!(first_text(&c), "\"привет\" \u{1F600} \\ \n [REDACTED:EMAIL]");
     }
 

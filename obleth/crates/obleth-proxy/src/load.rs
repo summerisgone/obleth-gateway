@@ -741,6 +741,7 @@ mod tests {
             crash_guard: crate::crash_guard::CrashGuard::disabled(),
             genai: None,
             genai_max_request_bytes: 0,
+            pii: crate::pii::PiiDetector::for_tests(),
             batches: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -129,6 +129,11 @@ impl Exporter {
 }
 
 impl ExporterHandle {
+    /// Trace profile used when neither the tenant nor `pii.traces` names one.
+    pub fn scrub_default(&self) -> &str {
+        &self.shared.cfg.scrub_default
+    }
+
     /// Never blocks. Over the byte limit the event is still queued, without content.
     pub fn try_send(&self, mut ev: GenAiEvent) -> bool {
         if ev.enqueued_at.is_none() {
@@ -180,6 +185,7 @@ async fn worker(shared: Arc<Shared>, process: ProcessFn, mut rx: mpsc::Unbounded
     let mut b = Batcher { shared: shared.clone(), process, pending: Vec::new(), pending_size: 0 };
     let mut tick = tokio::time::interval(shared.cfg.flush.max(Duration::from_millis(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let width = shared.cfg.scrub_concurrency.max(1);
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
@@ -187,16 +193,27 @@ async fn worker(shared: Arc<Shared>, process: ProcessFn, mut rx: mpsc::Unbounded
                     b.flush().await;
                     break;
                 }
-                Some(Msg::Event(ev, bytes)) => b.accept(ev, bytes).await,
-                Some(Msg::Shutdown(ack)) => {
-                    shared.closing.store(true, Ordering::SeqCst);
-                    while let Ok(m) = rx.try_recv() {
-                        if let Msg::Event(ev, bytes) = m {
-                            b.accept(ev, bytes).await;
+                Some(Msg::Event(ev, bytes)) => {
+                    let mut group = vec![(ev, bytes)];
+                    let mut stop = None;
+                    while group.len() < width {
+                        match rx.try_recv() {
+                            Ok(Msg::Event(ev, bytes)) => group.push((ev, bytes)),
+                            Ok(Msg::Shutdown(ack)) => {
+                                stop = Some(ack);
+                                break;
+                            }
+                            Err(_) => break,
                         }
                     }
-                    b.flush().await;
-                    let _ = ack.send(());
+                    b.accept_group(group).await;
+                    if let Some(ack) = stop {
+                        b.finish(&mut rx, ack).await;
+                        break;
+                    }
+                }
+                Some(Msg::Shutdown(ack)) => {
+                    b.finish(&mut rx, ack).await;
                     break;
                 }
             },
@@ -206,18 +223,49 @@ async fn worker(shared: Arc<Shared>, process: ProcessFn, mut rx: mpsc::Unbounded
 }
 
 impl Batcher {
-    async fn accept(&mut self, ev: GenAiEvent, bytes: usize) {
-        let enqueued = ev.enqueued_at.unwrap_or_else(Instant::now);
-        if enqueued.elapsed() > self.shared.cfg.content_ttl {
-            self.shared.metrics.dropped.with_label_values(&["ttl"]).inc();
-            self.shared.release(bytes);
-            return;
+    async fn finish(&mut self, rx: &mut mpsc::UnboundedReceiver<Msg>, ack: oneshot::Sender<()>) {
+        self.shared.closing.store(true, Ordering::SeqCst);
+        let width = self.shared.cfg.scrub_concurrency.max(1);
+        let mut group = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let Msg::Event(ev, bytes) = m {
+                group.push((ev, bytes));
+                if group.len() >= width {
+                    self.accept_group(std::mem::take(&mut group)).await;
+                }
+            }
         }
-        let span = (self.process)(ev).await;
-        self.pending_size += span.encoded_len();
-        self.pending.push(Item { span, bytes, enqueued });
-        if self.pending.len() >= MAX_BATCH_SPANS || self.pending_size >= MAX_BATCH_BYTES {
-            self.flush().await;
+        self.accept_group(group).await;
+        self.flush().await;
+        let _ = ack.send(());
+    }
+
+    /// Processes up to `scrub_concurrency` events at once; spans keep arrival order.
+    async fn accept_group(&mut self, group: Vec<(GenAiEvent, usize)>) {
+        use futures::StreamExt;
+        let mut live = Vec::with_capacity(group.len());
+        for (ev, bytes) in group {
+            let enqueued = ev.enqueued_at.unwrap_or_else(Instant::now);
+            if enqueued.elapsed() > self.shared.cfg.content_ttl {
+                self.shared.metrics.dropped.with_label_values(&["ttl"]).inc();
+                self.shared.release(bytes);
+                continue;
+            }
+            live.push((ev, bytes, enqueued));
+        }
+        let process = self.process.clone();
+        let width = self.shared.cfg.scrub_concurrency.max(1);
+        let mut spans = futures::stream::iter(live.into_iter().map(|(ev, bytes, enqueued)| {
+            let fut = (process)(ev);
+            async move { (fut.await, bytes, enqueued) }
+        }))
+        .buffered(width);
+        while let Some((span, bytes, enqueued)) = spans.next().await {
+            self.pending_size += span.encoded_len();
+            self.pending.push(Item { span, bytes, enqueued });
+            if self.pending.len() >= MAX_BATCH_SPANS || self.pending_size >= MAX_BATCH_BYTES {
+                self.flush().await;
+            }
         }
     }
 
@@ -685,5 +733,32 @@ mod tests {
         wait_for(|| h.shared.queue_bytes.load(Ordering::SeqCst) == 0).await;
         assert_eq!(h.shared.metrics.queue_bytes.get(), 0);
         assert_eq!(span_count(&m), 100);
+    }
+
+    #[tokio::test]
+    async fn exporter_parallel_scrub() {
+        let m = mock(ok()).await;
+        let p: ProcessFn = Arc::new(|ev: GenAiEvent| {
+            Box::pin(async move {
+                let ms = if ev.meta.request_id == "a" { 250 } else { 200 };
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                Span { name: ev.meta.request_id.clone(), ..Default::default() }
+            })
+        });
+        let (h, _) = start(cfg(&m.url, |c| c.scrub_concurrency = 4), p);
+        let t = Instant::now();
+        for id in ["a", "b", "c", "d"] {
+            h.try_send(ev(id));
+        }
+        wait_for(|| span_count(&m) == 4).await;
+        assert!(t.elapsed() < Duration::from_millis(600), "{:?}", t.elapsed());
+        let names: Vec<String> = m
+            .reqs
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(_, r)| r.resource_spans[0].scope_spans[0].spans.iter().map(|s| s.name.clone()))
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c", "d"]);
     }
 }

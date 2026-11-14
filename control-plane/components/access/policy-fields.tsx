@@ -99,7 +99,7 @@ function Chip({ on, onClick, children, title }: { on: boolean; onClick: () => vo
  * The guardrails policy as settings rows. It submits `guardrails_policy` as
  * JSON, blank when off.
  */
-export function GuardrailsFields({ policy, models }: { policy: GuardrailsPolicy | null; models: string[] }) {
+export function GuardrailsFields({ policy, models, piiProfiles }: { policy: GuardrailsPolicy | null; models: string[]; piiProfiles?: string[] }) {
   const [on, setOn] = useState(policy != null);
   const [p, setP] = useState<GuardrailsPolicy>(policy ?? PRESETS[0].policy);
   const [keywords, setKeywords] = useState((policy?.ban_keywords ?? []).join("\n"));
@@ -111,6 +111,14 @@ export function GuardrailsFields({ policy, models }: { policy: GuardrailsPolicy 
   const harm = current.input_scanners.includes("harm") || current.output_scanners.includes("harm");
   const usesKeywords = current.input_scanners.includes("ban_keywords") || current.output_scanners.includes("ban_keywords");
   const fields = ["guardrails_policy"];
+  const usesPii = current.input_scanners.includes("pii") || current.output_scanners.includes("pii");
+  const profileNames = [...new Set([...(piiProfiles ?? ["off", "regex", "ner"]), ...(current.pii_profile ? [current.pii_profile] : [])])].filter((n) => n !== "regex");
+  const strongPii = !!current.pii_profile && current.pii_profile !== "off" && current.pii_profile !== "regex";
+  const setPiiProfile = (v: string) =>
+    setP((x) => {
+      const { pii_profile: _drop, ...rest } = x;
+      return v ? { ...rest, pii_profile: v } : rest;
+    });
 
   return (
     <>
@@ -145,6 +153,22 @@ export function GuardrailsFields({ policy, models }: { policy: GuardrailsPolicy 
               </button>
             </div>
           </Setting>
+          {usesPii && (
+            <Setting id="set-guardrails-pii-profile" label="Personal info detector" hint="How the personal info scanner finds matches." fields={fields}>
+              <div className="max-w-sm">
+                <Select
+                  aria-label="Personal info profile"
+                  value={current.pii_profile ?? ""}
+                  onValueChange={setPiiProfile}
+                  className="h-9 text-[13px]"
+                  options={[{ value: "", label: "regex (default)" }, ...profileNames.map((n) => ({ value: n, label: n }))]}
+                />
+              </div>
+              {strongPii && current.fail_open && (
+                <p className="text-xs text-foreground">If the NER service is down, requests pass unredacted. Set fail open off for strict tenants.</p>
+              )}
+            </Setting>
+          )}
           {(custom || preset === "custom") && (
             <>
               <Setting label="Action" hint={ACTIONS.find((a) => a.value === current.action)?.hint} fields={fields}>

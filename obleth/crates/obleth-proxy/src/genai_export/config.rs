@@ -3,14 +3,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScrubMode {
-    Off,
-    Regex,
-    Ner,
-    Llm,
-}
-
 #[derive(Clone)]
 pub struct GenAiConfig {
     pub traces_url: String,
@@ -20,7 +12,7 @@ pub struct GenAiConfig {
     pub flush: Duration,
     pub max_request_bytes: usize,
     pub max_content_bytes: usize,
-    pub scrub: ScrubMode,
+    pub scrub_default: String,
     pub scrub_url: Option<String>,
     pub scrub_model: Option<String>,
     pub scrub_timeout: Duration,
@@ -37,7 +29,7 @@ impl std::fmt::Debug for GenAiConfig {
             .field("headers", &self.headers.len())
             .field("content_ttl", &self.content_ttl)
             .field("queue_max_bytes", &self.queue_max_bytes)
-            .field("scrub", &self.scrub)
+            .field("scrub_default", &self.scrub_default)
             .field("user_id_hmac_key", &self.user_id_hmac_key.is_some())
             .finish_non_exhaustive()
     }
@@ -77,20 +69,18 @@ impl GenAiConfig {
             .unwrap_or_default();
 
         let ttl_hours: u64 = num(env, "OBLETH_GENAI_CONTENT_TTL_HOURS", 24)?;
-        let scrub = match get(env, "OBLETH_GENAI_SCRUB") {
-            None | Some("regex") => ScrubMode::Regex,
-            Some("off") => ScrubMode::Off,
-            Some("ner") => ScrubMode::Ner,
-            Some("llm") => ScrubMode::Llm,
+        let scrub_default = match get(env, "OBLETH_GENAI_SCRUB") {
+            None => "regex",
+            Some(m @ ("regex" | "off" | "ner" | "llm")) => m,
             Some(other) => return Err(format!("OBLETH_GENAI_SCRUB: unknown mode {other}")),
-        };
-        let scrub_url = get(env, "OBLETH_GENAI_SCRUB_URL").map(str::to_string);
-        if matches!(scrub, ScrubMode::Ner | ScrubMode::Llm) && scrub_url.is_none() {
-            return Err("OBLETH_GENAI_SCRUB_URL: required for ner and llm modes".to_string());
         }
-        let scrub_concurrency: usize = num(env, "OBLETH_GENAI_SCRUB_CONCURRENCY", 8)?;
-        if scrub_concurrency == 0 {
-            return Err("OBLETH_GENAI_SCRUB_CONCURRENCY: must be at least 1".to_string());
+        .to_string();
+        let (pii, pii_error) = crate::pii::PiiEnv::from_env_map(env);
+        if let Some(e) = pii_error {
+            return Err(e);
+        }
+        if matches!(scrub_default.as_str(), "ner" | "llm") && pii.ner_url.is_none() {
+            return Err("OBLETH_PII_NER_URL: required for ner and llm modes".to_string());
         }
         let conversation_sources = get(env, "OBLETH_GENAI_CONVERSATION_SOURCES")
             .unwrap_or("client")
@@ -107,11 +97,11 @@ impl GenAiConfig {
             flush: Duration::from_millis(num(env, "OBLETH_GENAI_FLUSH_MS", 2000)?),
             max_request_bytes: num(env, "OBLETH_GENAI_MAX_REQUEST_BYTES", 4_194_304)?,
             max_content_bytes: num(env, "OBLETH_GENAI_MAX_CONTENT_BYTES", 262_144)?,
-            scrub,
-            scrub_url,
+            scrub_default,
+            scrub_url: pii.ner_url,
             scrub_model: get(env, "OBLETH_GENAI_SCRUB_MODEL").map(str::to_string),
-            scrub_timeout: Duration::from_millis(num(env, "OBLETH_GENAI_SCRUB_TIMEOUT_MS", 5000)?),
-            scrub_concurrency,
+            scrub_timeout: Duration::from_millis(pii.scrub_timeout_ms.unwrap_or(5000)),
+            scrub_concurrency: pii.concurrency,
             user_id_hmac_key: get(env, "OBLETH_GENAI_USER_ID_HMAC_KEY")
                 .map(|k| k.as_bytes().to_vec()),
             conversation_sources,
@@ -140,7 +130,7 @@ mod tests {
             .unwrap();
         assert_eq!(cfg.traces_url, "https://lf/api/public/otel/v1/traces");
         assert_eq!(cfg.content_ttl, Duration::from_secs(86400));
-        assert_eq!(cfg.scrub, ScrubMode::Regex);
+        assert_eq!(cfg.scrub_default, "regex");
         assert!(cfg.headers.is_empty());
         assert_eq!(cfg.queue_max_bytes, 67_108_864);
         assert_eq!(cfg.flush, Duration::from_millis(2000));
@@ -182,6 +172,34 @@ mod tests {
         ]))
         .unwrap()
         .unwrap();
-        assert_eq!(ok.scrub, ScrubMode::Llm);
+        assert_eq!(ok.scrub_default, "llm");
+    }
+
+    #[test]
+    fn config_uses_pii_env_aliases() {
+        let c = GenAiConfig::from_env_map(&env(&[
+            (EP, "https://lf"),
+            ("OBLETH_GENAI_SCRUB", "ner"),
+            ("OBLETH_GENAI_SCRUB_URL", "http://old"),
+            ("OBLETH_GENAI_SCRUB_CONCURRENCY", "3"),
+            ("OBLETH_GENAI_SCRUB_TIMEOUT_MS", "70"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.scrub_url.as_deref(), Some("http://old"));
+        assert_eq!(c.scrub_concurrency, 3);
+        assert_eq!(c.scrub_timeout, Duration::from_millis(70));
+        let c = GenAiConfig::from_env_map(&env(&[
+            (EP, "https://lf"),
+            ("OBLETH_GENAI_SCRUB", "ner"),
+            ("OBLETH_PII_NER_URL", "http://new"),
+            ("OBLETH_GENAI_SCRUB_URL", "http://old"),
+            ("OBLETH_PII_NER_CONCURRENCY", "5"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.scrub_url.as_deref(), Some("http://new"));
+        assert_eq!(c.scrub_concurrency, 5);
+        assert!(GenAiConfig::from_env_map(&env(&[(EP, "https://lf"), ("OBLETH_PII_NER_CONCURRENCY", "0")])).is_err());
     }
 }

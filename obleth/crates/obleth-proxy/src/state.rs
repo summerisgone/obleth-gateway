@@ -102,4 +102,6 @@ pub struct AppState {
     pub genai: Option<crate::genai_export::exporter::ExporterHandle>,
     /// Request bodies over this are exported without content.
     pub genai_max_request_bytes: usize,
+    /// PII detector shared by guardrails and GenAI export.
+    pub pii: Arc<crate::pii::PiiDetector>,
 }

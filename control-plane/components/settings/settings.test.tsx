@@ -2,9 +2,9 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applyAdviceFixAction, saveSettingsAction } from "@/app/actions";
+import { applyAdviceFixAction, checkPiiServiceAction, saveSettingsAction } from "@/app/actions";
 import type { AdviceReportView } from "@/lib/obleth";
-import { settingsData } from "./fixtures";
+import { boons, settingsData } from "./fixtures";
 import { SettingsPage } from "./settings-page";
 
 vi.mock("@/app/actions", () => ({
@@ -15,6 +15,7 @@ vi.mock("@/app/actions", () => ({
   testEnergyQueryAction: vi.fn(async () => ({ ok: true })),
   restoreBackupAction: vi.fn(async () => ({ ok: true })),
   applyAdviceFixAction: vi.fn(async () => ({ ok: true })),
+  checkPiiServiceAction: vi.fn(async () => ({ ok: true, data: { ok: true, latency_ms: 42, error: null } })),
   snoozeAdviceAction: vi.fn(async () => ({ ok: true })),
   restoreAdviceAction: vi.fn(async () => ({ ok: true })),
 }));
@@ -171,5 +172,46 @@ describe("the Settings page", () => {
     await act(async () => find.focus());
     await type(find, "prometheus");
     expect([...host.querySelectorAll('[role="option"]')].map((o) => o.textContent)).toEqual(["Energy"]);
+  });
+
+  it("pii_card_shows_url_readonly", async () => {
+    await render(<SettingsPage data={settingsData()} />);
+    const card = host.querySelector("#boon-pii")!;
+    expect(card.textContent).toContain("http://ner.internal:5001");
+    expect(card.querySelector('input[name="boons.pii_ner_url"]')).toBeNull();
+    await render(<SettingsPage data={settingsData({ boons: boons({ pii: { ner: { timeout_ms: null, model_timeout_ms: 1000 }, profiles: {}, traces: null, ner_url: null } }) })} />);
+    expect(host.querySelector("#boon-pii")!.textContent).toContain("not set: OBLETH_PII_NER_URL");
+  });
+
+  it("pii_card_saves_profiles_json", async () => {
+    await render(<SettingsPage data={settingsData()} />);
+    const area = host.querySelector<HTMLTextAreaElement>('textarea[name="boons.pii_profiles"]')!;
+    const next = JSON.stringify({ ru: { detector: "ner", entities: ["PERSON", "PHONE"], language: "ru", score_threshold: null } });
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(area, next);
+      area.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await frame();
+    await act(async () => button("Save changes").click());
+    expect(saved().get("sections")).toBe("boons");
+    expect(saved().get("boons.pii_profiles")).toBe(next);
+    expect(saved().get("boons.pii_model_timeout_ms")).toBe("1000");
+  });
+
+  it("pii_check_button_shows_result", async () => {
+    await render(<SettingsPage data={settingsData()} />);
+    await act(async () => button("Check service").click());
+    expect(host.querySelector("#boon-pii")!.textContent).toContain("Reachable, 42 ms");
+    vi.mocked(checkPiiServiceAction).mockResolvedValueOnce({ ok: true, data: { ok: false, latency_ms: null, error: "connection refused" } });
+    await act(async () => button("Check service").click());
+    expect(host.querySelector("#boon-pii")!.textContent).toContain("connection refused");
+  });
+
+  it("shows a profile name as text, not markup", async () => {
+    const pii = { ner: { timeout_ms: null, model_timeout_ms: 1000 }, profiles: { "<b>x</b>": { detector: "regex" as const, entities: [], language: null, score_threshold: null } }, traces: null, ner_url: null };
+    await render(<SettingsPage data={settingsData({ boons: boons({ pii }) })} />);
+    const card = host.querySelector("#boon-pii")!;
+    expect(card.querySelector("b")).toBeNull();
+    expect(card.textContent).toContain("<b>x</b>");
   });
 });

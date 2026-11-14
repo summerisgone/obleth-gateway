@@ -94,7 +94,7 @@ pub struct Usage {
     pub reasoning: Option<u64>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EventMeta {
     pub request_id: String,
     pub tenant_id: String,
@@ -114,7 +114,38 @@ pub struct EventMeta {
     pub ops_span_id: Option<String>,
     pub usage: Usage,
     pub error_type: Option<String>,
-    pub pii_guardrail: bool,
+    pub scrub: obleth_config::TraceProfile,
+}
+
+impl Default for EventMeta {
+    fn default() -> Self {
+        EventMeta {
+            request_id: String::new(),
+            tenant_id: String::new(),
+            key_id: String::new(),
+            client_model: String::new(),
+            routed_model: String::new(),
+            model_variant: String::new(),
+            provider: String::new(),
+            server_address: None,
+            server_port: None,
+            session_id: String::new(),
+            session_source: String::new(),
+            reasoning_effort: None,
+            cache_status: String::new(),
+            tool_loop_turns: 0,
+            ops_trace_id: None,
+            ops_span_id: None,
+            usage: Usage::default(),
+            error_type: None,
+            // No profile: content is dropped as scrub_failed until one is set.
+            scrub: obleth_config::TraceProfile {
+                name: String::new(),
+                profile: None,
+                strengthened: false,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

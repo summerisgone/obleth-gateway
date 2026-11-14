@@ -8,7 +8,7 @@ live in memory until they are sent, dropped or expired.
 Files:
 
 - `docker-compose.yml`: obleth service wired to Langfuse.
-- `../genai-scrubber/`: optional Presidio adapter for `OBLETH_GENAI_SCRUB=ner`.
+- `../genai-scrubber/`: optional Presidio adapter for `OBLETH_PII_NER_URL`.
 
 ## Start
 
@@ -36,7 +36,7 @@ Each header pair splits at its first `=`. Header values are never logged.
 
 ## Environment variables
 
-All 14 variables. Defaults apply when a variable is unset or empty. An invalid value (unknown scrub mode, bad number, `ner` or `llm` without a URL) turns the export off and logs `GenAI OTLP export is off: invalid configuration`; the gateway still starts. `GET /api/v1/genai-export` returns the reason in `error`, and the tenant's "Export to observability" setting shows it.
+All 16 variables. Defaults apply when a variable is unset or empty. An invalid value (unknown scrub mode, bad number, `ner` or `llm` without a URL) turns the export off and logs `GenAI OTLP export is off: invalid configuration`; the gateway still starts. `GET /api/v1/genai-export` returns the reason in `error`, and the tenant's "Export to observability" setting shows it.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -47,21 +47,102 @@ All 14 variables. Defaults apply when a variable is unset or empty. An invalid v
 | `OBLETH_GENAI_FLUSH_MS` | `2000` | Batch flush interval. Batches also flush at 256 spans or 4 MiB. |
 | `OBLETH_GENAI_MAX_REQUEST_BYTES` | `4194304` (4 MiB) | Larger request bodies are not captured. The span carries `obleth.content.dropped="request_too_large"`. |
 | `OBLETH_GENAI_MAX_CONTENT_BYTES` | `262144` (256 KiB) | Cap per content attribute. Text parts are cut first, then the oldest input messages are dropped. The `*_truncated` flag is set. |
-| `OBLETH_GENAI_SCRUB` | `regex` | `off`, `regex`, `ner` or `llm` (`llm` is experimental). |
-| `OBLETH_GENAI_SCRUB_URL` | unset | Required for `ner` and `llm`. The scrub service is called with `POST {url}`. Without it the export stays off; obleth still starts. |
-| `OBLETH_GENAI_SCRUB_MODEL` | unset | Model name for `llm`, sent to `POST {SCRUB_URL}/v1/chat/completions`. |
-| `OBLETH_GENAI_SCRUB_TIMEOUT_MS` | `5000` | Timeout per scrub call. A failed or slow scrub drops the content (`scrub_failed`). |
-| `OBLETH_GENAI_SCRUB_CONCURRENCY` | `8` | Scrub calls in flight at once. When none is free, content is dropped (`scrub_failed`). Minimum 1. |
+| `OBLETH_GENAI_SCRUB` | `regex` | Default trace profile: `off`, `regex`, `ner` or `llm` (`llm` is deprecated). Used only when `BoonSettings.pii.traces` is unset. |
+| `OBLETH_PII_NER_URL` | unset | NER service, called with `POST {url}`. Required for `ner` and `llm`. Without it the export stays off; obleth still starts. Read at start: a change needs a restart. |
+| `OBLETH_PII_NER_CONCURRENCY` | `8` | Trace scrub calls in flight at once. When none is free, content is dropped (`scrub_failed`). Minimum 1. Read at start. |
+| `OBLETH_GENAI_SCRUB_URL` | unset | Alias of `OBLETH_PII_NER_URL`. When both are set the new name wins and obleth logs a warning. |
+| `OBLETH_GENAI_SCRUB_CONCURRENCY` | `8` | Alias of `OBLETH_PII_NER_CONCURRENCY`; same precedence. |
+| `OBLETH_GENAI_SCRUB_MODEL` | unset | Deprecated. Model name for `llm`, sent to `POST {SCRUB_URL}/v1/chat/completions`. |
+| `OBLETH_GENAI_SCRUB_TIMEOUT_MS` | `5000` | Timeout per scrub call. Used only when `pii.ner.timeout_ms` is unset. A failed or slow scrub drops the content (`scrub_failed`). |
 | `OBLETH_GENAI_USER_ID_HMAC_KEY` | unset | Secret. HMAC key for `user.id` and for conversation ids that contain PII. Unset: no `user.id` attribute, and such conversation ids are not exported. |
 | `OBLETH_GENAI_CONVERSATION_SOURCES` | `client` | Comma-separated. `client` uses the id the client sends. `derived` also groups by a hash of the conversation start; chats from different users with the same opening messages can then merge into one session. |
 
-Scrub modes:
+Scrub detectors:
 
 - `regex` catches only US SSNs, emails, phone numbers and card numbers. It does not
   find names, addresses, IBANs or national IDs, so it is not GDPR scrubbing. Use
-  `ner` or `llm` for that.
-- If a tenant's guardrail policy redacts or blocks PII, export runs at least
-  `regex` even with `off`.
+  `ner` for that.
+- `ner` runs `regex` first, then sends the text to the NER service.
+- `llm` is deprecated (see below).
+
+## PII profiles
+
+Policy lives in `BoonSettings.pii`, set with `PUT /api/v1/settings/boons`. It
+applies without a restart. Precedence: `BoonSettings.pii`, then the env defaults
+above, then built-in values. The service URL and concurrency stay in env.
+
+```json
+{"pii": {
+  "ner": {"timeout_ms": 5000, "model_timeout_ms": 1000},
+  "profiles": {"names": {"detector": "ner", "entities": ["PERSON", "LOCATION"], "score_threshold": 0.5}},
+  "traces": "names"
+}}
+```
+
+- Profile fields: `detector` (`off`, `regex`, `ner`), `entities` (empty means all the
+  service knows), `language` and `score_threshold` (unset means the service default).
+- Built-in profiles `off`, `regex` and `ner` always exist; your own profiles cannot
+  reuse those names. Add your own only for an entity list or a language.
+- `pii.traces` is the default trace profile. A `ner` profile is refused while
+  `OBLETH_PII_NER_URL` is unset, as are a reference to a missing profile and
+  deleting a profile in use.
+- Per tenant, set the trace profile with `PUT /api/v1/tenants/{id}/genai-export`:
+
+  ```sh
+  curl -X PUT "http://127.0.0.1:9180/api/v1/tenants/<tenant-id>/genai-export" \
+    -H "authorization: Bearer $OBLETH_ADMIN_TOKEN" \
+    -H "content-type: application/json" \
+    -d '{"genai_export":true,"pii_trace_profile":"names"}'
+  ```
+
+  `pii_trace_profile` absent keeps the stored value, `null` inherits `pii.traces`.
+  Order: tenant, `pii.traces`, `OBLETH_GENAI_SCRUB`, `regex`.
+- Guardrails use a profile through `pii_profile` in the tenant policy; without it the
+  scanner is `regex` as before.
+- `POST /api/v1/settings/boons/pii/check` sends a test text to the NER service and
+  returns `{ok, latency_ms, error}`.
+- Each span carries `obleth.content.scrubbed` (`none`, `regex`, `ner` or `llm`) and
+  `obleth.content.scrub_profile` (the profile name, `<trace>+<guard>` when guardrails
+  strengthened it).
+
+Union invariant: traces are never weaker than guardrails. When a tenant's policy has
+the `pii` scanner and `action` is `redact` or `block` (not `log_only`), the trace
+profile is the union of the trace profile and the guardrails profile: the stronger
+detector, the union of entities (an empty list means all and absorbs the rest), and
+language and threshold from the stronger detector (the trace profile on a tie).
+
+Failures:
+
+| Where | Timeout | Concurrency | Detector fails (error, timeout, missing profile) |
+|---|---|---|---|
+| Traces | `pii.ner.timeout_ms` (5000) | `OBLETH_PII_NER_CONCURRENCY`, no waiting | content dropped, `obleth.content.dropped="scrub_failed"`; the client request is unaffected |
+| Model, `block` / `redact` | `pii.ner.model_timeout_ms` (1000) | not limited by obleth | `fail_open: true`: request passes unchanged, metric `pii_detector_failures_total`; `false`: 503 |
+| Model, `log_only` | `pii.ner.timeout_ms` | background task | metric only |
+
+`fail_open` defaults to `true`, so with an unreachable NER service the model sees the
+PII. Set `fail_open: false` for strict tenants. Trace scrubbing runs up to
+`OBLETH_PII_NER_CONCURRENCY` events in parallel.
+
+## Deprecated: `llm`
+
+`OBLETH_GENAI_SCRUB=llm` works in this release, logs a warning at start, and
+`GET /api/v1/genai-export` returns `deprecated: "llm"`. It is removed in the next
+release: the export then turns off with a reason in `error`. Move to `ner`. An LLM
+service can sit behind the NER contract below.
+
+`GET /api/v1/genai-export` also returns `profiles` (names) and `ner_configured`.
+
+## NER service contract
+
+```json
+POST {url}
+{"texts": ["..."], "entities": ["PERSON"], "language": "en", "score_threshold": 0.5}
+-> {"texts": ["..."]}
+```
+
+`entities`, `language` and `score_threshold` are sent only when the profile sets
+them, so older adapters keep working. The reply must have the same length. Models,
+recognizers and tags are configured in the service, not in obleth.
 
 ## Enable per tenant and per key
 
@@ -106,7 +187,7 @@ A key exports when its tenant is on and the key is not `false`.
 
 ## Billing gap
 
-Scrub calls made in `llm` mode are not billed to the tenant in v1. Billing them as
+Scrub calls made in `llm` mode (deprecated) are not billed to the tenant in v1. Billing them as
 `payload_scrub` is deferred, so their cost is not recovered from the tenant.
 
 ## Host hardening
@@ -126,12 +207,13 @@ with export enabled:
 
 ## Optional: Presidio scrubber
 
-To use `OBLETH_GENAI_SCRUB=ner`, build and run the adapter in `../genai-scrubber/`,
+To use the `ner` detector, build and run the adapter in `../genai-scrubber/`,
 on a network the obleth container can reach, then set:
 
 ```sh
-OBLETH_GENAI_SCRUB=ner
-OBLETH_GENAI_SCRUB_URL=http://genai-scrubber:8000/
+OBLETH_PII_NER_URL=http://genai-scrubber:8000/
 ```
 
-The adapter is English-only.
+Then set `OBLETH_GENAI_SCRUB=ner`, or `{"pii": {"traces": "ner"}}` through the boons
+settings. The adapter uses Presidio's default setup (English); for other
+languages see `../genai-scrubber/README.md`.

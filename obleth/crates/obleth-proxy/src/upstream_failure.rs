@@ -1348,6 +1348,7 @@ mod pipeline {
             crash_guard: crate::crash_guard::CrashGuard::disabled(),
             genai: None,
             genai_max_request_bytes: 0,
+            pii: crate::pii::PiiDetector::for_tests(),
             batches: None,
         };
         Some(Gateway { state, wal_dir })
