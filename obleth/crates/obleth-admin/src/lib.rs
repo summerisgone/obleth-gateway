@@ -147,6 +147,9 @@ pub struct AdminState {
     /// The GenAI exporter's scrub mode (`off`, `regex`, `ner`, `llm`); `None`
     /// when the exporter is not configured (`OBLETH_GENAI_OTLP_ENDPOINT` unset).
     pub genai_scrub: Option<String>,
+    /// Why the GenAI exporter is off despite its settings (an invalid
+    /// `OBLETH_GENAI_*` value); `None` when it is on or simply not configured.
+    pub genai_error: Option<String>,
 }
 
 /// A boxed call into the data plane's classifier: `(prompt, available_tags)`
@@ -5473,12 +5476,15 @@ async fn set_tenant_tracing_handler(
 pub struct GenaiExportStatus {
     pub configured: bool,
     pub scrub: Option<String>,
+    /// Set when an invalid `OBLETH_GENAI_*` value turned the export off.
+    pub error: Option<String>,
 }
 
 async fn get_genai_export_status(State(state): State<AdminState>) -> Json<GenaiExportStatus> {
     Json(GenaiExportStatus {
         configured: state.genai_scrub.is_some(),
         scrub: state.genai_scrub.clone(),
+        error: state.genai_error.clone(),
     })
 }
 
@@ -10895,6 +10901,7 @@ mod tests {
                 alerts,
                 local_cache_tx: None,
                 genai_scrub: None,
+                genai_error: None,
             };
             Some(TestApp {
                 app: router(state),
@@ -11829,7 +11836,7 @@ mod tests {
             .expect("build request");
         let (status, body) = send(&t.app, req).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
-        assert_eq!(body, serde_json::json!({ "configured": false, "scrub": null }));
+        assert_eq!(body, serde_json::json!({ "configured": false, "scrub": null, "error": null }));
     }
 
     /// The whole point of the endpoint: a full routing verdict with no upstream

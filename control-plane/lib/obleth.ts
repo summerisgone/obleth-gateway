@@ -83,6 +83,8 @@ export interface GenaiExportStatus {
   configured: boolean;
   /** `OBLETH_GENAI_SCRUB`; null when not configured. */
   scrub: "off" | "regex" | "ner" | "llm" | null;
+  /** Why export is off although it was set up: an invalid `OBLETH_GENAI_*` value. Older gateways omit it. */
+  error?: string | null;
 }
 
 export interface ApiKey {

@@ -118,6 +118,13 @@ const SCRUB_NOTE: Record<NonNullable<GenaiExportStatus["scrub"]>, string> = {
 
 function GenaiExportNote({ status }: { status: GenaiExportStatus | null }) {
   if (!status) return <p className="text-xs text-muted-foreground">The gateway did not say how it exports. Check OBLETH_GENAI_* on the gateway.</p>;
+  if (status.error) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        Export is off on this gateway: a GenAI setting is invalid (<span className="font-mono text-[11.5px]">{status.error}</span>). The flag is kept, but nothing is sent until the setting is fixed.
+      </p>
+    );
+  }
   if (!status.configured || !status.scrub) {
     return (
       <p className="text-xs text-muted-foreground">

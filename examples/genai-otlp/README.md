@@ -36,7 +36,7 @@ Each header pair splits at its first `=`. Header values are never logged.
 
 ## Environment variables
 
-All 14 variables. Defaults apply when a variable is unset or empty. An invalid value (unknown scrub mode, bad number, `ner` or `llm` without a URL) turns the export off and logs `GenAI OTLP export is off: invalid configuration`; the gateway still starts.
+All 14 variables. Defaults apply when a variable is unset or empty. An invalid value (unknown scrub mode, bad number, `ner` or `llm` without a URL) turns the export off and logs `GenAI OTLP export is off: invalid configuration`; the gateway still starts. `GET /api/v1/genai-export` returns the reason in `error`, and the tenant's "Export to observability" setting shows it.
 
 | Variable | Default | Meaning |
 |---|---|---|

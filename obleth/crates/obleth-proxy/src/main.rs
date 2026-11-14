@@ -453,11 +453,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // A bad GenAI setting turns only the export off; the gateway still starts.
+    let mut genai_error = None;
     let genai_cfg =
         match genai_export::config::GenAiConfig::from_env_map(&std::env::vars().collect()) {
             Ok(cfg) => cfg.map(Arc::new),
             Err(e) => {
                 tracing::error!(error = %e, "GenAI OTLP export is off: invalid configuration");
+                genai_error = Some(e);
                 None
             }
         };
@@ -717,6 +719,7 @@ async fn main() -> anyhow::Result<()> {
         })),
         capacity_discovery: capacity_discovery.clone(),
         genai_scrub,
+        genai_error,
         // Advice findings are judged through the real /v1/verdicts pipeline
         // (auth, fairshare, ledger) as the reserved control-plane key, so the
         // judging shows up in usage like any other caller.

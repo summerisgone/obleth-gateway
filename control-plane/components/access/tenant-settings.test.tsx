@@ -99,6 +99,14 @@ describe("a tenant's settings", () => {
     expect(host.querySelector("#set-genai-export")!.textContent).toContain("OBLETH_GENAI_OTLP_ENDPOINT is not set");
   });
 
+  it("names the invalid GenAI setting instead of a missing endpoint", async () => {
+    const error = "OBLETH_GENAI_SCRUB_URL: required for ner and llm modes";
+    await render(tenant({ genai_export: true }), { configured: false, scrub: null, error });
+    const note = host.querySelector("#set-genai-export")!.textContent!;
+    expect(note).toContain(error);
+    expect(note).not.toContain("OBLETH_GENAI_OTLP_ENDPOINT is not set");
+  });
+
   it("won't save a harmful-content scanner without a guard model", async () => {
     await render(tenant({ guardrails_policy: { action: "block", input_scanners: ["harm"], output_scanners: [], guard_model: null, ban_keywords: [], fail_open: true } }));
     await type("weight", "151");
