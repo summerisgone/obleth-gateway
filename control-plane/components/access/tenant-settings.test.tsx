@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { saveTenantSettingsAction } from "@/app/actions";
 import { TenantSettings } from "./tenant-settings";
-import type { Tenant } from "@/lib/obleth";
+import type { GenaiExportStatus, Tenant } from "@/lib/obleth";
 
 vi.mock("@/app/actions", () => ({ saveTenantSettingsAction: vi.fn(async () => ({ ok: true })) }));
 
@@ -14,7 +14,7 @@ const tenant = (over: Partial<Tenant> = {}): Tenant => ({
   active_from: "2026-08-17T07:00:00Z", active_until: null,
   weekly_windows: [1, 2, 3, 4, 5].map((day) => ({ day, start_min: 420, end_min: 1320 })),
   budget_tokens: null, budget_cost_usd: 300, budget_period: "monthly", budget_started_at: null,
-  allowed_models: null, guardrails_policy: null, compression_policy: null, tracing_enabled: false, synthetic: false,
+  allowed_models: null, guardrails_policy: null, compression_policy: null, tracing_enabled: false, synthetic: false, genai_export: false,
   created_at: "", updated_at: "", ...over,
 });
 
@@ -34,9 +34,9 @@ afterEach(async () => {
   host.remove();
 });
 
-async function render(t = tenant()) {
+async function render(t = tenant(), genai: GenaiExportStatus | null = null) {
   const others = [t, tenant({ id: "t2", name: "brain-training", weight: 100 }), tenant({ id: "t3", name: "svc", weight: 100 })];
-  await act(async () => root.render(<TenantSettings tenant={t} tenants={others} models={["m1", "m2"]} budget={null} onDirty={() => {}} onSaved={() => {}} />));
+  await act(async () => root.render(<TenantSettings tenant={t} tenants={others} models={["m1", "m2"]} budget={null} genai={genai} onDirty={() => {}} onSaved={() => {}} />));
   await frame();
 }
 
@@ -78,6 +78,25 @@ describe("a tenant's settings", () => {
     expect(windows).toHaveLength(5);
     expect(windows[0]).toEqual({ day: 1, start_min: 540, end_min: 1020 });
     expect(document.querySelector('[aria-label="Unsaved changes"]')!.textContent).toContain("Weekly hours");
+  });
+
+  it("saves the GenAI export flag on its own and names the scrub mode", async () => {
+    await render(tenant(), { configured: true, scrub: "regex" });
+    const note = host.querySelector("#set-genai-export")!.textContent!;
+    expect(note).toContain("OBLETH_GENAI_SCRUB=regex");
+    expect(note).toContain("Names and addresses stay");
+    await act(async () => host.querySelector<HTMLInputElement>('[name="genai_export"]')!.click());
+    await frame();
+    const bar = document.querySelector('[aria-label="Unsaved changes"]')!;
+    await act(async () => [...bar.querySelectorAll("button")].find((b) => b.textContent === "Save changes")!.click());
+    const sent = vi.mocked(saveTenantSettingsAction).mock.calls[0][0];
+    expect(sent.get("sections")).toBe("genai");
+    expect(sent.get("genai_export")).toBe("on");
+  });
+
+  it("says when the gateway has no GenAI collector", async () => {
+    await render(tenant({ genai_export: true }), { configured: false, scrub: null });
+    expect(host.querySelector("#set-genai-export")!.textContent).toContain("OBLETH_GENAI_OTLP_ENDPOINT is not set");
   });
 
   it("won't save a harmful-content scanner without a guard model", async () => {

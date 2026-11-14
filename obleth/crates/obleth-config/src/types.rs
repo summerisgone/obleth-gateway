@@ -145,6 +145,10 @@ pub struct Tenant {
     /// exclude.
     #[serde(default)]
     pub synthetic: bool,
+    /// Whether this tenant's completions are exported as GenAI spans (a key
+    /// can only opt out).
+    #[serde(default)]
+    pub genai_export: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }

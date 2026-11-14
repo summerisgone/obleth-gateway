@@ -36,7 +36,7 @@ Each header pair splits at its first `=`. Header values are never logged.
 
 ## Environment variables
 
-All 14 variables. Defaults apply when a variable is unset or empty.
+All 14 variables. Defaults apply when a variable is unset or empty. An invalid value (unknown scrub mode, bad number, `ner` or `llm` without a URL) turns the export off and logs `GenAI OTLP export is off: invalid configuration`; the gateway still starts.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -48,7 +48,7 @@ All 14 variables. Defaults apply when a variable is unset or empty.
 | `OBLETH_GENAI_MAX_REQUEST_BYTES` | `4194304` (4 MiB) | Larger request bodies are not captured. The span carries `obleth.content.dropped="request_too_large"`. |
 | `OBLETH_GENAI_MAX_CONTENT_BYTES` | `262144` (256 KiB) | Cap per content attribute. Text parts are cut first, then the oldest input messages are dropped. The `*_truncated` flag is set. |
 | `OBLETH_GENAI_SCRUB` | `regex` | `off`, `regex`, `ner` or `llm` (`llm` is experimental). |
-| `OBLETH_GENAI_SCRUB_URL` | unset | Required for `ner` and `llm`. The scrub service is called with `POST {url}`. |
+| `OBLETH_GENAI_SCRUB_URL` | unset | Required for `ner` and `llm`. The scrub service is called with `POST {url}`. Without it the export stays off; obleth still starts. |
 | `OBLETH_GENAI_SCRUB_MODEL` | unset | Model name for `llm`, sent to `POST {SCRUB_URL}/v1/chat/completions`. |
 | `OBLETH_GENAI_SCRUB_TIMEOUT_MS` | `5000` | Timeout per scrub call. A failed or slow scrub drops the content (`scrub_failed`). |
 | `OBLETH_GENAI_SCRUB_CONCURRENCY` | `8` | Scrub calls in flight at once. When none is free, content is dropped (`scrub_failed`). Minimum 1. |

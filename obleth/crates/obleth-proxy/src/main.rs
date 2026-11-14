@@ -452,11 +452,26 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("GET /v1/load is off (OBLETH_LOAD_ENDPOINT)");
     }
 
+    // A bad GenAI setting turns only the export off; the gateway still starts.
     let genai_cfg =
-        genai_export::config::GenAiConfig::from_env_map(&std::env::vars().collect())
-            .map_err(|e| anyhow::anyhow!(e))?
-            .map(Arc::new);
+        match genai_export::config::GenAiConfig::from_env_map(&std::env::vars().collect()) {
+            Ok(cfg) => cfg.map(Arc::new),
+            Err(e) => {
+                tracing::error!(error = %e, "GenAI OTLP export is off: invalid configuration");
+                None
+            }
+        };
     let genai_max_request_bytes = genai_cfg.as_ref().map_or(0, |c| c.max_request_bytes);
+    let genai_scrub = genai_cfg.as_ref().map(|c| {
+        use genai_export::config::ScrubMode;
+        match c.scrub {
+            ScrubMode::Off => "off",
+            ScrubMode::Regex => "regex",
+            ScrubMode::Ner => "ner",
+            ScrubMode::Llm => "llm",
+        }
+        .to_string()
+    });
     let genai = match genai_cfg {
         Some(cfg) => {
             let client = reqwest::Client::builder()
@@ -701,6 +716,7 @@ async fn main() -> anyhow::Result<()> {
             }
         })),
         capacity_discovery: capacity_discovery.clone(),
+        genai_scrub,
         // Advice findings are judged through the real /v1/verdicts pipeline
         // (auth, fairshare, ledger) as the reserved control-plane key, so the
         // judging shows up in usage like any other caller.

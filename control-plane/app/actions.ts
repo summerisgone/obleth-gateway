@@ -568,6 +568,7 @@ export type TenantSettingsSection =
   | "weight"
   | "quota"
   | "tracing"
+  | "genai"
   | "synthetic"
   | "schedule"
   | "budget"
@@ -575,7 +576,7 @@ export type TenantSettingsSection =
   | "guardrails"
   | "compression";
 
-const TENANT_SECTIONS: readonly TenantSettingsSection[] = ["profile", "group", "weight", "quota", "tracing", "synthetic", "schedule", "budget", "allowlist", "guardrails", "compression"];
+const TENANT_SECTIONS: readonly TenantSettingsSection[] = ["profile", "group", "weight", "quota", "tracing", "genai", "synthetic", "schedule", "budget", "allowlist", "guardrails", "compression"];
 
 const TENANT_SECTION_LABELS: Record<TenantSettingsSection, string> = {
   profile: "Profile",
@@ -583,6 +584,7 @@ const TENANT_SECTION_LABELS: Record<TenantSettingsSection, string> = {
   weight: "Weight",
   quota: "Limits",
   tracing: "Tracing",
+  genai: "GenAI export",
   synthetic: "Synthetic",
   schedule: "Access hours",
   budget: "Budget",
@@ -668,6 +670,8 @@ export async function saveTenantSettingsAction(formData: FormData): Promise<Sett
         await obleth.setQuota(id, tpm, mif, audit);
       } else if (section === "tracing") {
         await obleth.setTenantTracing(id, formData.get("tracing_enabled") === "on", audit);
+      } else if (section === "genai") {
+        await obleth.setTenantGenaiExport(id, formData.get("genai_export") === "on", audit);
       } else if (section === "synthetic") {
         await obleth.setTenantSynthetic(id, formData.get("synthetic") === "on", audit);
       } else if (section === "schedule") {

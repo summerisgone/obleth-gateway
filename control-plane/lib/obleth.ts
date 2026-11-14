@@ -71,8 +71,18 @@ export interface Tenant {
   compression_policy: CompressionPolicy | null;
   tracing_enabled: boolean;
   synthetic: boolean;
+  /** Completions are exported as GenAI spans; a key can only opt out. */
+  genai_export: boolean;
   created_at: string;
   updated_at: string;
+}
+
+/** The gateway's GenAI export setup, from its environment. */
+export interface GenaiExportStatus {
+  /** `OBLETH_GENAI_OTLP_ENDPOINT` is set. */
+  configured: boolean;
+  /** `OBLETH_GENAI_SCRUB`; null when not configured. */
+  scrub: "off" | "regex" | "ner" | "llm" | null;
 }
 
 export interface ApiKey {
@@ -2680,6 +2690,13 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify({ tracing_enabled }),
     }),
+  setTenantGenaiExport: (id: string, genai_export: boolean, options?: AuditOptions) =>
+    api<void>(`/tenants/${seg(id)}/genai-export`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ genai_export }),
+    }),
+  genaiExportStatus: () => api<GenaiExportStatus>("/genai-export"),
   setTenantSynthetic: (
     id: string,
     synthetic: boolean,

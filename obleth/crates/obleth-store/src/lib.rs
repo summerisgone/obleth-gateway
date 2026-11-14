@@ -399,7 +399,7 @@ impl Store {
 
     pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
         let rows = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, genai_export, created_at, updated_at
              from tenants order by created_at",
         )
         .fetch_all(&self.pool)
@@ -433,7 +433,7 @@ impl Store {
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Tenant> {
         let row = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, genai_export, created_at, updated_at
              from tenants where id = $1",
         )
         .bind(id)
@@ -445,7 +445,7 @@ impl Store {
 
     pub async fn tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
         let row = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, genai_export, created_at, updated_at
              from tenants where name = $1",
         )
         .bind(name)
@@ -4436,6 +4436,7 @@ fn tenant_from_row(row: &PgRow) -> Result<Tenant> {
         guardrails_policy: guardrails_policy_from_row(row)?,
         compression_policy: compression_policy_from_row(row)?,
         synthetic: row.try_get("synthetic").unwrap_or(false),
+        genai_export: row.try_get("genai_export").unwrap_or(false),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -9922,6 +9923,31 @@ mod tests {
             return;
         }
         assert!(!resolved_genai_export(true, Some(false)).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn tenant_reads_return_genai_export() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+        let tenant = store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 0, None, None)
+            .await
+            .expect("create tenant");
+        fixtures.track_tenant(tenant.id);
+        assert!(!store.get_tenant(tenant.id).await.expect("get").genai_export);
+        store
+            .set_tenant_genai_export(tenant.id, true)
+            .await
+            .expect("set tenant flag");
+        assert!(store.get_tenant(tenant.id).await.expect("get").genai_export);
+        let listed = store.list_tenants().await.expect("list");
+        assert!(listed.iter().find(|t| t.id == tenant.id).expect("listed").genai_export);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

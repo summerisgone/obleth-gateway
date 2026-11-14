@@ -144,6 +144,9 @@ pub struct AdminState {
     /// findings. Injected by the binary that owns the data plane; `None`
     /// (a standalone admin process) leaves findings unjudged.
     pub judge: Option<advice::JudgeFn>,
+    /// The GenAI exporter's scrub mode (`off`, `regex`, `ner`, `llm`); `None`
+    /// when the exporter is not configured (`OBLETH_GENAI_OTLP_ENDPOINT` unset).
+    pub genai_scrub: Option<String>,
 }
 
 /// A boxed call into the data plane's classifier: `(prompt, available_tags)`
@@ -215,6 +218,7 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/tenants/:id/genai-export",
             put(set_tenant_genai_export_handler),
         )
+        .route("/api/v1/genai-export", get(get_genai_export_status))
         .route(
             "/api/v1/keys/:id/end-user-fairshare",
             put(set_key_end_user_fairshare_handler),
@@ -5462,6 +5466,20 @@ async fn set_tenant_tracing_handler(
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Whether the gateway exports GenAI spans at all, and how it scrubs them.
+#[derive(Debug, Serialize)]
+pub struct GenaiExportStatus {
+    pub configured: bool,
+    pub scrub: Option<String>,
+}
+
+async fn get_genai_export_status(State(state): State<AdminState>) -> Json<GenaiExportStatus> {
+    Json(GenaiExportStatus {
+        configured: state.genai_scrub.is_some(),
+        scrub: state.genai_scrub.clone(),
+    })
 }
 
 async fn set_tenant_genai_export_handler(
@@ -10876,6 +10894,7 @@ mod tests {
                 ssrf: ssrf::SsrfPolicy::from_env(),
                 alerts,
                 local_cache_tx: None,
+                genai_scrub: None,
             };
             Some(TestApp {
                 app: router(state),
@@ -11796,6 +11815,21 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn genai_export_status_reports_unconfigured() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let req = axum::http::Request::get("/api/v1/genai-export")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (status, body) = send(&t.app, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body, serde_json::json!({ "configured": false, "scrub": null }));
     }
 
     /// The whole point of the endpoint: a full routing verdict with no upstream

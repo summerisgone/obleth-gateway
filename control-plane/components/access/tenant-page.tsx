@@ -28,7 +28,7 @@ import {
 import type { AdminUser } from "@/lib/auth/users";
 import { logsHref } from "@/lib/log-links";
 import { money } from "@/lib/models-model";
-import type { ApiKey, BudgetUsage, Tenant } from "@/lib/obleth";
+import type { ApiKey, BudgetUsage, GenaiExportStatus, Tenant } from "@/lib/obleth";
 import { compact } from "@/lib/overview-model";
 import { cn, getJson } from "@/lib/utils";
 
@@ -52,6 +52,7 @@ const SETTINGS: { id: string; label: string; card: NavId; words: string }[] = [
   { id: "set-guardrails", label: "Guardrails", card: "guardrails", words: "pii ferpa redact block injection scanner safety" },
   { id: "set-compression", label: "Compression", card: "compression", words: "dedup compact lossy" },
   { id: "set-tracing", label: "Trace requests", card: "advanced", words: "tracing spans timeline" },
+  { id: "set-genai-export", label: "Export to observability", card: "advanced", words: "genai otel otlp langfuse export scrub pii" },
   { id: "set-synthetic", label: "Synthetic traffic", card: "advanced", words: "benchmark test" },
 ];
 
@@ -239,6 +240,7 @@ export function TenantPage({
   people,
   budgets,
   models,
+  genai,
 }: {
   tenant: Tenant;
   tenants: Tenant[];
@@ -246,6 +248,7 @@ export function TenantPage({
   people: AdminUser[];
   budgets: BudgetUsage[];
   models: string[];
+  genai: GenaiExportStatus | null;
 }) {
   const router = useRouter();
   const { confirm, confirmElement } = useConfirm();
@@ -493,7 +496,7 @@ export function TenantPage({
             </div>
           </div>
 
-          <TenantSettings tenant={tenant} tenants={tenants} models={models} budget={budget && usage ? { ...budget, usedCost: usage.used_cost_usd, usedTokens: usage.used_tokens } : null} onDirty={setDirty} onSaved={onSaved} />
+          <TenantSettings tenant={tenant} tenants={tenants} models={models} budget={budget && usage ? { ...budget, usedCost: usage.used_cost_usd, usedTokens: usage.used_tokens } : null} genai={genai} onDirty={setDirty} onSaved={onSaved} />
 
           <div className="grid gap-4 xl:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
             <section id="keys" aria-label="Keys" className="scroll-mt-24 rounded-xl border border-border bg-card">
