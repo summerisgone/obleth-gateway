@@ -1,0 +1,48 @@
+# obleth gateway exporting GenAI spans to Langfuse. Standalone example: point
+# the datastore and upstream variables at the stack you already run.
+# See README.md in this directory.
+#
+#   docker compose -f examples/genai-otlp/docker-compose.yml up -d
+services:
+  obleth:
+    image: ghcr.io/thediymaker/obleth-gateway/obleth:${OBLETH_VERSION:-latest}
+    restart: unless-stopped
+    # OBLETH_SHUTDOWN_GRACE_SECS (300) plus the telemetry flush, as in deploy/docker.
+    stop_grace_period: 345s
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9180:9180"
+    environment:
+      OBLETH_PROXY_LISTEN: 0.0.0.0:8080
+      OBLETH_ADMIN_LISTEN: 0.0.0.0:9180
+      OBLETH_METRICS_LISTEN: 0.0.0.0:9091
+      OBLETH_DATABASE_URL: ${OBLETH_DATABASE_URL:-postgres://obleth:change-me@postgres:5432/obleth}
+      OBLETH_REDIS_URL: ${OBLETH_REDIS_URL:-redis://:change-me@redis:6379}
+      OBLETH_CLICKHOUSE_URL: ${OBLETH_CLICKHOUSE_URL:-http://clickhouse:8123}
+      OBLETH_CLICKHOUSE_DB: ${CLICKHOUSE_DB:-obleth}
+      OBLETH_CLICKHOUSE_USER: ${CLICKHOUSE_USER:-obleth}
+      OBLETH_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change-me}
+      OBLETH_UPSTREAM_BASE_URL: ${OBLETH_UPSTREAM_BASE_URL:-http://upstream:8000}
+      OBLETH_ADMIN_TOKEN: ${OBLETH_ADMIN_TOKEN:-change-me}
+      # Base64 (32 bytes) to encrypt upstream secrets at rest. Empty = plaintext.
+      OBLETH_ENCRYPTION_KEY: ${OBLETH_ENCRYPTION_KEY:-}
+
+      # GenAI export (ADR 0001). Off until OBLETH_GENAI_OTLP_ENDPOINT is set.
+      OBLETH_GENAI_OTLP_ENDPOINT: ${LANGFUSE_OTLP_ENDPOINT:-http://langfuse-web:3000/api/public/otel}
+      # LANGFUSE_BASIC_AUTH is base64 of public_key:secret_key. Replace the placeholder.
+      OBLETH_GENAI_OTLP_HEADERS: "Authorization=Basic ${LANGFUSE_BASIC_AUTH:-<base64 public_key:secret_key>},x-langfuse-ingestion-version=4"
+      OBLETH_GENAI_CONTENT_TTL_HOURS: ${OBLETH_GENAI_CONTENT_TTL_HOURS:-24}
+      OBLETH_GENAI_QUEUE_MAX_BYTES: ${OBLETH_GENAI_QUEUE_MAX_BYTES:-67108864}
+      OBLETH_GENAI_FLUSH_MS: ${OBLETH_GENAI_FLUSH_MS:-2000}
+      OBLETH_GENAI_MAX_REQUEST_BYTES: ${OBLETH_GENAI_MAX_REQUEST_BYTES:-4194304}
+      OBLETH_GENAI_MAX_CONTENT_BYTES: ${OBLETH_GENAI_MAX_CONTENT_BYTES:-262144}
+      OBLETH_GENAI_SCRUB: ${OBLETH_GENAI_SCRUB:-regex}
+      # With OBLETH_GENAI_SCRUB=ner set this to http://genai-scrubber:8000/ (see README).
+      OBLETH_GENAI_SCRUB_URL: ${OBLETH_GENAI_SCRUB_URL:-}
+      # Model name for OBLETH_GENAI_SCRUB=llm only.
+      OBLETH_GENAI_SCRUB_MODEL: ${OBLETH_GENAI_SCRUB_MODEL:-}
+      OBLETH_GENAI_SCRUB_TIMEOUT_MS: ${OBLETH_GENAI_SCRUB_TIMEOUT_MS:-5000}
+      OBLETH_GENAI_SCRUB_CONCURRENCY: ${OBLETH_GENAI_SCRUB_CONCURRENCY:-8}
+      # Secret. Unset = no user.id attribute and no hashed conversation ids.
+      OBLETH_GENAI_USER_ID_HMAC_KEY: ${OBLETH_GENAI_USER_ID_HMAC_KEY:-}
+      OBLETH_GENAI_CONVERSATION_SOURCES: ${OBLETH_GENAI_CONVERSATION_SOURCES:-client}
