@@ -11,7 +11,10 @@ fn text_part(s: &str) -> Value {
 }
 
 fn tok(s: &str, extra: &str) -> bool {
-    !s.is_empty() && s.len() <= 255 && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
+    !s.is_empty()
+        && s.len() <= 255
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
 }
 
 // Only token-shaped pieces survive: free text in a url or mime never reaches the span.
@@ -33,7 +36,9 @@ fn host_only(url: &str) -> String {
 fn image_part(url: &str) -> Value {
     if let Some(rest) = url.strip_prefix("data:") {
         let mime = rest.split([';', ',']).next().unwrap_or("");
-        let ok = mime.split_once('/').is_some_and(|(a, b)| tok(a, "+.-") && tok(b, "+.-"));
+        let ok = mime
+            .split_once('/')
+            .is_some_and(|(a, b)| tok(a, "+.-") && tok(b, "+.-"));
         let mime = if ok { mime } else { "unknown" };
         json!({"type": "blob", "modality": "image", "mime_type": mime})
     } else {
@@ -54,7 +59,9 @@ fn content_parts(c: &Value) -> Vec<Value> {
                     }
                     Some("image_url") | Some("input_image") => {
                         let u = o.get("image_url").or_else(|| o.get("url"))?;
-                        let url = u.as_str().or_else(|| u.get("url").and_then(Value::as_str))?;
+                        let url = u
+                            .as_str()
+                            .or_else(|| u.get("url").and_then(Value::as_str))?;
                         Some(image_part(url))
                     }
                     _ => None,
@@ -191,7 +198,11 @@ pub fn output_messages(out: &CollectedOutput) -> Vec<Value> {
                     "arguments": parse_args(&t.arguments),
                 }));
             }
-            let role = if ch.role.is_empty() { "assistant" } else { &ch.role };
+            let role = if ch.role.is_empty() {
+                "assistant"
+            } else {
+                &ch.role
+            };
             json!({
                 "role": role,
                 "parts": parts,
@@ -244,7 +255,10 @@ fn truncate_vec(v: &mut Vec<Value>, max: usize, can_drop: bool) -> bool {
         let excess = size - max;
         let mut texts = Vec::new();
         v.iter_mut().for_each(|x| collect_texts(x, &mut texts));
-        let longest = texts.into_iter().max_by_key(|s| s.len()).filter(|s| !s.is_empty());
+        let longest = texts
+            .into_iter()
+            .max_by_key(|s| s.len())
+            .filter(|s| !s.is_empty());
         if let Some(s) = longest {
             cut_str(s, excess);
             changed = true;
@@ -285,7 +299,11 @@ pub fn build_span(
 ) -> Span {
     let m = &ev.meta;
     let op = ev.surface.operation_name();
-    let provider = if m.provider.is_empty() { "openai" } else { m.provider.as_str() };
+    let provider = if m.provider.is_empty() {
+        "openai"
+    } else {
+        m.provider.as_str()
+    };
     let mut a: Vec<KeyValue> = Vec::new();
     a.push(s("gen_ai.operation.name", op));
     a.push(s("gen_ai.provider.name", provider));
@@ -302,7 +320,9 @@ pub fn build_span(
             .choices
             .iter()
             .filter_map(|c| c.finish_reason.as_deref())
-            .map(|r| AnyValue { value: Some(AV::StringValue(semconv_finish(Some(r)))) })
+            .map(|r| AnyValue {
+                value: Some(AV::StringValue(semconv_finish(Some(r)))),
+            })
             .collect();
         if !fr.is_empty() {
             a.push(kv(
@@ -327,8 +347,16 @@ pub fn build_span(
         fl("gen_ai.request.top_k", p.top_k, &mut a);
         il("gen_ai.request.max_tokens", p.max_tokens, &mut a);
         il("gen_ai.request.seed", p.seed, &mut a);
-        fl("gen_ai.request.frequency_penalty", p.frequency_penalty, &mut a);
-        fl("gen_ai.request.presence_penalty", p.presence_penalty, &mut a);
+        fl(
+            "gen_ai.request.frequency_penalty",
+            p.frequency_penalty,
+            &mut a,
+        );
+        fl(
+            "gen_ai.request.presence_penalty",
+            p.presence_penalty,
+            &mut a,
+        );
         il("gen_ai.request.choice.count", p.choice_count, &mut a);
         if p.stream {
             a.push(kv("gen_ai.request.stream", AV::BoolValue(true)));
@@ -342,7 +370,10 @@ pub fn build_span(
     }
     if let Some(t) = ev.ttft_unix_nanos {
         let secs = t.saturating_sub(ev.start_unix_nanos) as f64 / 1e9;
-        a.push(kv("gen_ai.response.time_to_first_chunk", AV::DoubleValue(secs)));
+        a.push(kv(
+            "gen_ai.response.time_to_first_chunk",
+            AV::DoubleValue(secs),
+        ));
         let dt = chrono::DateTime::from_timestamp_nanos(t as i64);
         a.push(s(
             "langfuse.observation.completion_start_time",
@@ -389,7 +420,10 @@ pub fn build_span(
     a.push(s("obleth.routed_model", &m.routed_model));
     a.push(s("obleth.model_variant", &m.model_variant));
     a.push(s("obleth.cache_status", &m.cache_status));
-    a.push(kv("obleth.tool_loop.turns", AV::IntValue(m.tool_loop_turns as i64)));
+    a.push(kv(
+        "obleth.tool_loop.turns",
+        AV::IntValue(m.tool_loop_turns as i64),
+    ));
     if let Some(t) = &m.ops_trace_id {
         a.push(s("obleth.ops.trace_id", t));
     }
@@ -464,7 +498,8 @@ mod tests {
 
     #[test]
     fn completions_example() {
-        let (_, c) = parse_request(ApiSurface::Completions, br#"{"model":"m","prompt":"p"}"#).unwrap();
+        let (_, c) =
+            parse_request(ApiSurface::Completions, br#"{"model":"m","prompt":"p"}"#).unwrap();
         assert_eq!(
             c.input,
             vec![json!({"role":"user","parts":[{"type":"text","content":"p"}]})]
@@ -489,8 +524,10 @@ mod tests {
         };
         assert_eq!(
             output_messages(&out),
-            vec![json!({"role":"assistant","parts":[{"type":"text","content":"ok"},
-                {"type":"tool_call","id":"c1","name":"f","arguments":{"a":1}}],"finish_reason":"tool_call"})]
+            vec![
+                json!({"role":"assistant","parts":[{"type":"text","content":"ok"},
+                {"type":"tool_call","id":"c1","name":"f","arguments":{"a":1}}],"finish_reason":"tool_call"})
+            ]
         );
     }
 
@@ -543,7 +580,13 @@ mod tests {
     #[test]
     fn n2_two_outputs() {
         let out = CollectedOutput {
-            choices: vec![OutputChoice::default(), OutputChoice { index: 1, ..Default::default() }],
+            choices: vec![
+                OutputChoice::default(),
+                OutputChoice {
+                    index: 1,
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
         assert_eq!(output_messages(&out).len(), 2);
@@ -581,7 +624,11 @@ mod tests {
 
     fn ev() -> GenAiEvent {
         GenAiEvent {
-            meta: EventMeta { client_model: "gpt".into(), provider: "".into(), ..Default::default() },
+            meta: EventMeta {
+                client_model: "gpt".into(),
+                provider: "".into(),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -601,7 +648,9 @@ mod tests {
         assert_eq!(sp.trace_id.len(), 16);
         assert_eq!(sp.span_id.len(), 8);
         assert_eq!(sp.name, "chat gpt");
-        assert!(matches!(find(&sp, "gen_ai.provider.name"), Some(AV::StringValue(v)) if v == "openai"));
+        assert!(
+            matches!(find(&sp, "gen_ai.provider.name"), Some(AV::StringValue(v)) if v == "openai")
+        );
         assert!(find(&sp, "gen_ai.request.stream").is_none());
         assert!(sp.status.is_none());
     }
@@ -609,11 +658,21 @@ mod tests {
     #[test]
     fn encoding_escapes_content() {
         let c = Content {
-            input: vec![json!({"role":"user","parts":[{"type":"text","content":"a\"b\n\u{1F600}\\"}]})],
+            input: vec![
+                json!({"role":"user","parts":[{"type":"text","content":"a\"b\n\u{1F600}\\"}]}),
+            ],
             ..Default::default()
         };
-        let sp = build_span(&ev(), None, Some(&c), "none", &[("obleth.content.input_truncated", true)]);
-        let Some(AV::StringValue(s)) = find(&sp, "gen_ai.input.messages") else { panic!() };
+        let sp = build_span(
+            &ev(),
+            None,
+            Some(&c),
+            "none",
+            &[("obleth.content.input_truncated", true)],
+        );
+        let Some(AV::StringValue(s)) = find(&sp, "gen_ai.input.messages") else {
+            panic!()
+        };
         let back: Value = serde_json::from_str(s).unwrap();
         assert_eq!(back[0]["parts"][0]["content"], "a\"b\n\u{1F600}\\");
         assert!(find(&sp, "obleth.content.input_truncated").is_some());
@@ -636,14 +695,27 @@ mod tests {
         assert!(c.input[0]["parts"][0]["arguments"].is_object());
         let out = CollectedOutput {
             choices: vec![OutputChoice {
-                tool_calls: vec![ToolCallOut { id: "c".into(), name: "f".into(), arguments: args }],
+                tool_calls: vec![ToolCallOut {
+                    id: "c".into(),
+                    name: "f".into(),
+                    arguments: args,
+                }],
                 ..Default::default()
             }],
             ..Default::default()
         };
         let m = output_messages(&out);
         assert!(m[0]["parts"][0]["arguments"].is_object());
-        let sp = build_span(&ev(), None, Some(&Content { output: m, ..Default::default() }), "none", &[]);
+        let sp = build_span(
+            &ev(),
+            None,
+            Some(&Content {
+                output: m,
+                ..Default::default()
+            }),
+            "none",
+            &[],
+        );
         assert!(find(&sp, "gen_ai.output.messages").is_some());
     }
 
@@ -655,7 +727,11 @@ mod tests {
         e.ttft_unix_nanos = Some(2_500_000_000);
         let sp = build_span(&e, None, None, "none", &[]);
         assert_eq!(sp.status.as_ref().unwrap().code, StatusCode::Error as i32);
-        assert!(matches!(find(&sp, "gen_ai.response.time_to_first_chunk"), Some(AV::DoubleValue(v)) if (*v - 1.5).abs() < 1e-9));
-        assert!(matches!(find(&sp, "langfuse.observation.completion_start_time"), Some(AV::StringValue(v)) if v.starts_with("1970-01-01T00:00:02.5")));
+        assert!(
+            matches!(find(&sp, "gen_ai.response.time_to_first_chunk"), Some(AV::DoubleValue(v)) if (*v - 1.5).abs() < 1e-9)
+        );
+        assert!(
+            matches!(find(&sp, "langfuse.observation.completion_start_time"), Some(AV::StringValue(v)) if v.starts_with("1970-01-01T00:00:02.5"))
+        );
     }
 }

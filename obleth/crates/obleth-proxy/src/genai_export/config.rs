@@ -124,7 +124,9 @@ mod tests {
 
     #[test]
     fn config_defaults() {
-        assert!(GenAiConfig::from_env_map(&HashMap::new()).unwrap().is_none());
+        assert!(GenAiConfig::from_env_map(&HashMap::new())
+            .unwrap()
+            .is_none());
         let cfg = GenAiConfig::from_env_map(&env(&[(EP, "https://lf/api/public/otel")]))
             .unwrap()
             .unwrap();
@@ -141,8 +143,9 @@ mod tests {
         assert_eq!(cfg.conversation_sources, vec!["client".to_string()]);
         assert!(cfg.user_id_hmac_key.is_none());
 
-        let err = GenAiConfig::from_env_map(&env(&[(EP, "https://lf"), ("OBLETH_GENAI_SCRUB", "bogus")]))
-            .unwrap_err();
+        let err =
+            GenAiConfig::from_env_map(&env(&[(EP, "https://lf"), ("OBLETH_GENAI_SCRUB", "bogus")]))
+                .unwrap_err();
         assert_eq!(err, "OBLETH_GENAI_SCRUB: unknown mode bogus");
     }
 
@@ -163,7 +166,8 @@ mod tests {
 
     #[test]
     fn ner_requires_url() {
-        let e = GenAiConfig::from_env_map(&env(&[(EP, "https://lf"), ("OBLETH_GENAI_SCRUB", "ner")]));
+        let e =
+            GenAiConfig::from_env_map(&env(&[(EP, "https://lf"), ("OBLETH_GENAI_SCRUB", "ner")]));
         assert!(e.is_err());
         let ok = GenAiConfig::from_env_map(&env(&[
             (EP, "https://lf"),
@@ -200,6 +204,10 @@ mod tests {
         .unwrap();
         assert_eq!(c.scrub_url.as_deref(), Some("http://new"));
         assert_eq!(c.scrub_concurrency, 5);
-        assert!(GenAiConfig::from_env_map(&env(&[(EP, "https://lf"), ("OBLETH_PII_NER_CONCURRENCY", "0")])).is_err());
+        assert!(GenAiConfig::from_env_map(&env(&[
+            (EP, "https://lf"),
+            ("OBLETH_PII_NER_CONCURRENCY", "0")
+        ]))
+        .is_err());
     }
 }

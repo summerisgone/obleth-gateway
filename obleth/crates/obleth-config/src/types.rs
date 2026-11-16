@@ -3584,9 +3584,7 @@ pub enum GuardrailsAction {
 }
 
 /// PII detector backend, ordered by strength: `off < regex < ner`.
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, ToSchema,
-)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PiiDetectorKind {
     Off,
@@ -3633,7 +3631,11 @@ impl PiiProfile {
     /// entities (empty = all), settings from the stronger side, tie -> `self`.
     pub fn union(&self, guard: &PiiProfile) -> PiiProfile {
         let detector = self.detector.max(guard.detector);
-        let pick = if guard.detector > self.detector { guard } else { self };
+        let pick = if guard.detector > self.detector {
+            guard
+        } else {
+            self
+        };
         let all = |p: &PiiProfile| p.detector != PiiDetectorKind::Off && p.entities.is_empty();
         let entities = if all(self) || all(guard) {
             Vec::new()
@@ -5748,11 +5750,7 @@ mod tests {
         }
     }
 
-    fn pii_policy(
-        action: GuardrailsAction,
-        input: &[&str],
-        output: &[&str],
-    ) -> GuardrailsPolicy {
+    fn pii_policy(action: GuardrailsAction, input: &[&str], output: &[&str]) -> GuardrailsPolicy {
         GuardrailsPolicy {
             action,
             input_scanners: input.iter().map(|s| s.to_string()).collect(),

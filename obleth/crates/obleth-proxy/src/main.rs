@@ -454,7 +454,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
-    let PiiGenAiStartup { pii_env, genai_cfg, genai_error } = pii_genai_startup(&env_map);
+    let PiiGenAiStartup {
+        pii_env,
+        genai_cfg,
+        genai_error,
+    } = pii_genai_startup(&env_map);
     for w in &pii_env.warnings {
         tracing::warn!("{w}");
     }
@@ -462,7 +466,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(error = %e, "GenAI OTLP export is off: invalid PII or GenAI configuration");
     }
     if genai_cfg.as_ref().is_some_and(|c| c.scrub_default == "llm") {
-        tracing::warn!("OBLETH_GENAI_SCRUB=llm is deprecated and will be removed; use a ner profile");
+        tracing::warn!(
+            "OBLETH_GENAI_SCRUB=llm is deprecated and will be removed; use a ner profile"
+        );
     }
     let pii_detector = Arc::new(pii::PiiDetector::new(
         &pii_env,
@@ -1767,11 +1773,23 @@ struct PiiGenAiStartup {
 fn pii_genai_startup(env: &std::collections::HashMap<String, String>) -> PiiGenAiStartup {
     let (pii_env, pii_error) = pii::PiiEnv::from_env_map(env);
     if pii_error.is_some() {
-        return PiiGenAiStartup { pii_env, genai_cfg: None, genai_error: pii_error };
+        return PiiGenAiStartup {
+            pii_env,
+            genai_cfg: None,
+            genai_error: pii_error,
+        };
     }
     match genai_export::config::GenAiConfig::from_env_map(env) {
-        Ok(cfg) => PiiGenAiStartup { pii_env, genai_cfg: cfg.map(Arc::new), genai_error: None },
-        Err(e) => PiiGenAiStartup { pii_env, genai_cfg: None, genai_error: Some(e) },
+        Ok(cfg) => PiiGenAiStartup {
+            pii_env,
+            genai_cfg: cfg.map(Arc::new),
+            genai_error: None,
+        },
+        Err(e) => PiiGenAiStartup {
+            pii_env,
+            genai_cfg: None,
+            genai_error: Some(e),
+        },
     }
 }
 
@@ -1791,7 +1809,11 @@ mod pii_startup_tests {
         .collect();
         let st = pii_genai_startup(&env);
         assert!(st.genai_cfg.is_none());
-        assert!(st.genai_error.as_deref().unwrap().contains("OBLETH_PII_NER_CONCURRENCY"));
+        assert!(st
+            .genai_error
+            .as_deref()
+            .unwrap()
+            .contains("OBLETH_PII_NER_CONCURRENCY"));
         assert!(st.pii_env.ner_url.is_none());
         let det = pii::PiiDetector::new(
             &st.pii_env,
@@ -1814,7 +1836,11 @@ mod pii_startup_tests {
         .collect();
         let st = pii_genai_startup(&env);
         assert!(st.genai_cfg.is_none());
-        assert!(st.genai_error.as_deref().unwrap().contains("OBLETH_GENAI_SCRUB_TIMEOUT_MS"));
+        assert!(st
+            .genai_error
+            .as_deref()
+            .unwrap()
+            .contains("OBLETH_GENAI_SCRUB_TIMEOUT_MS"));
         assert_eq!(st.pii_env.warnings.len(), 1);
         let det = pii::PiiDetector::new(
             &st.pii_env,
@@ -1841,8 +1867,11 @@ mod pii_startup_tests {
 
     #[test]
     fn valid_env_starts_export() {
-        let env: std::collections::HashMap<String, String> =
-            [("OBLETH_GENAI_OTLP_ENDPOINT".to_string(), "http://127.0.0.1:1".to_string())].into();
+        let env: std::collections::HashMap<String, String> = [(
+            "OBLETH_GENAI_OTLP_ENDPOINT".to_string(),
+            "http://127.0.0.1:1".to_string(),
+        )]
+        .into();
         let st = pii_genai_startup(&env);
         assert!(st.genai_cfg.is_some() && st.genai_error.is_none());
     }

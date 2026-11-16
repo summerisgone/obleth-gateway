@@ -69,15 +69,17 @@ impl PiiEnv {
             }
         };
         let ner_url = pick("OBLETH_PII_NER_URL", "OBLETH_GENAI_SCRUB_URL");
-        let conc = pick("OBLETH_PII_NER_CONCURRENCY", "OBLETH_GENAI_SCRUB_CONCURRENCY");
+        let conc = pick(
+            "OBLETH_PII_NER_CONCURRENCY",
+            "OBLETH_GENAI_SCRUB_CONCURRENCY",
+        );
         let concurrency = match conc {
             None => 8,
             Some(v) => match v.parse::<usize>() {
                 Ok(n) if n >= 1 => n,
                 _ => {
-                    let e = format!(
-                        "OBLETH_PII_NER_CONCURRENCY must be an integer >= 1, got {v:?}"
-                    );
+                    let e =
+                        format!("OBLETH_PII_NER_CONCURRENCY must be an integer >= 1, got {v:?}");
                     let env = PiiEnv {
                         ner_url: None,
                         concurrency: 8,
@@ -159,18 +161,25 @@ impl PiiDetector {
             PiiDetectorKind::Regex => Ok(texts.iter().map(|t| regex::scan_pii(t).1).collect()),
             PiiDetectorKind::Ner => {
                 let url = self.url.as_deref().ok_or(PiiError::NotConfigured)?;
-                let redacted: Vec<String> =
-                    texts.iter().map(|t| regex::scan_pii(t).1).collect();
+                let redacted: Vec<String> = texts.iter().map(|t| regex::scan_pii(t).1).collect();
                 let snap = self.settings.load();
                 let (_permit, ms) = match lane {
                     Lane::Traces => (
                         Some(self.sem.try_acquire().map_err(|_| PiiError::Busy)?),
-                        snap.pii.ner.timeout_ms.or(self.env_timeout_ms).unwrap_or(5000),
+                        snap.pii
+                            .ner
+                            .timeout_ms
+                            .or(self.env_timeout_ms)
+                            .unwrap_or(5000),
                     ),
                     Lane::Model => (None, snap.pii.ner.model_timeout_ms),
                     Lane::Background => (
                         None,
-                        snap.pii.ner.timeout_ms.or(self.env_timeout_ms).unwrap_or(5000),
+                        snap.pii
+                            .ner
+                            .timeout_ms
+                            .or(self.env_timeout_ms)
+                            .unwrap_or(5000),
                     ),
                 };
                 drop(snap);
@@ -193,7 +202,10 @@ mod tests {
     use std::sync::Mutex;
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     fn prof(kind: PiiDetectorKind) -> PiiProfile {
@@ -268,8 +280,16 @@ mod tests {
 
     #[test]
     fn env_bad_concurrency_and_timeout() {
-        assert!(PiiEnv::from_env_map(&env(&[("OBLETH_PII_NER_CONCURRENCY", "0")])).1.is_some());
-        assert!(PiiEnv::from_env_map(&env(&[("OBLETH_GENAI_SCRUB_CONCURRENCY", "x")])).1.is_some());
+        assert!(
+            PiiEnv::from_env_map(&env(&[("OBLETH_PII_NER_CONCURRENCY", "0")]))
+                .1
+                .is_some()
+        );
+        assert!(
+            PiiEnv::from_env_map(&env(&[("OBLETH_GENAI_SCRUB_CONCURRENCY", "x")]))
+                .1
+                .is_some()
+        );
         let (e, err) = PiiEnv::from_env_map(&env(&[
             ("OBLETH_PII_NER_URL", "http://n"),
             ("OBLETH_GENAI_SCRUB_TIMEOUT_MS", "x"),
@@ -290,12 +310,20 @@ mod tests {
     async fn regex_and_off() {
         let (d, _) = detector(None, 1);
         let out = d
-            .redact(&texts("mail a@b.co"), &prof(PiiDetectorKind::Regex), Lane::Model)
+            .redact(
+                &texts("mail a@b.co"),
+                &prof(PiiDetectorKind::Regex),
+                Lane::Model,
+            )
             .await;
         assert_eq!(out, Ok(texts("mail [REDACTED:EMAIL]")));
-        let out = d.redact(&texts("x"), &prof(PiiDetectorKind::Off), Lane::Traces).await;
+        let out = d
+            .redact(&texts("x"), &prof(PiiDetectorKind::Off), Lane::Traces)
+            .await;
         assert_eq!(out, Ok(texts("x")));
-        let out = d.redact(&texts("x"), &prof(PiiDetectorKind::Ner), Lane::Traces).await;
+        let out = d
+            .redact(&texts("x"), &prof(PiiDetectorKind::Ner), Lane::Traces)
+            .await;
         assert_eq!(out, Err(PiiError::NotConfigured));
         assert!(!d.ner_configured());
     }
@@ -326,7 +354,9 @@ mod tests {
     async fn ner_wrong_len_fails() {
         let (url, _) = fake(0, true).await;
         let (d, _) = detector(Some(url), 2);
-        let r = d.redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Traces).await;
+        let r = d
+            .redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Traces)
+            .await;
         assert!(matches!(r, Err(PiiError::BadReply(_))));
     }
 
@@ -336,7 +366,9 @@ mod tests {
         let (d, _) = detector(Some(url), 1);
         let _held = d.sem.try_acquire().unwrap();
         let t = std::time::Instant::now();
-        let r = d.redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Traces).await;
+        let r = d
+            .redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Traces)
+            .await;
         assert_eq!(r, Err(PiiError::Busy));
         assert!(t.elapsed() < Duration::from_millis(100));
     }
@@ -346,7 +378,9 @@ mod tests {
         let (url, _) = fake(0, false).await;
         let (d, _) = detector(Some(url), 1);
         let _held = d.sem.try_acquire().unwrap();
-        let r = d.redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Model).await;
+        let r = d
+            .redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Model)
+            .await;
         assert_eq!(r, Ok(texts("a")));
     }
 
@@ -357,11 +391,15 @@ mod tests {
         let mut b = BoonSettings::default();
         b.pii.ner.model_timeout_ms = 50;
         s.store(Arc::new(b.clone()));
-        let r = d.redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Model).await;
+        let r = d
+            .redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Model)
+            .await;
         assert_eq!(r, Err(PiiError::Timeout));
         b.pii.ner.model_timeout_ms = 2000;
         s.store(Arc::new(b));
-        let r = d.redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Model).await;
+        let r = d
+            .redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Model)
+            .await;
         assert_eq!(r, Ok(texts("a")));
     }
 
@@ -370,12 +408,16 @@ mod tests {
         let (url, _) = fake(300, false).await;
         let (mut d, s) = detector(Some(url), 2);
         d.env_timeout_ms = Some(50);
-        let r = d.redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Traces).await;
+        let r = d
+            .redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Traces)
+            .await;
         assert_eq!(r, Err(PiiError::Timeout));
         let mut b = BoonSettings::default();
         b.pii.ner.timeout_ms = Some(2000);
         s.store(Arc::new(b));
-        let r = d.redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Traces).await;
+        let r = d
+            .redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Traces)
+            .await;
         assert_eq!(r, Ok(texts("a")));
     }
 
@@ -388,7 +430,9 @@ mod tests {
         b.pii.ner.model_timeout_ms = 20;
         b.pii.ner.timeout_ms = Some(2000);
         s.store(Arc::new(b));
-        let r = d.redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Background).await;
+        let r = d
+            .redact(&texts("a"), &prof(PiiDetectorKind::Ner), Lane::Background)
+            .await;
         assert_eq!(r, Ok(texts("a")));
     }
 
@@ -397,7 +441,11 @@ mod tests {
         let (url, seen) = fake(0, false).await;
         let (d, _) = detector(Some(url), 2);
         let out = d
-            .redact(&texts("mail a@b.co"), &prof(PiiDetectorKind::Ner), Lane::Traces)
+            .redact(
+                &texts("mail a@b.co"),
+                &prof(PiiDetectorKind::Ner),
+                Lane::Traces,
+            )
             .await
             .unwrap();
         assert_eq!(out, texts("mail [REDACTED:EMAIL]"));

@@ -216,6 +216,9 @@ mod tests {
             capacity_discovery: capacity_discovery::CapacityDiscovery::disabled(),
             judge: None,
             jwt_issuers: issuers,
+            genai_scrub: None,
+            pii_ner_url: None,
+            genai_error: None,
             health: ModelHealthRuntime {
                 scheduled_enabled: false,
                 default_interval_secs: 60,

@@ -1761,8 +1761,9 @@ async fn run_pipeline(
         req_meta.genai_route = genai_route_of(route.as_deref(), &state.upstream_base);
         // Created before `accounting` clones the meta, so the cancellation
         // guard and the stream share one collector.
-        req_meta.genai_collector =
-            Some(crate::genai_export::collector::Collector::new(GENAI_COLLECT_MAX));
+        req_meta.genai_collector = Some(crate::genai_export::collector::Collector::new(
+            GENAI_COLLECT_MAX,
+        ));
     }
     // The name the client used, for its usage row and response headers. The
     // ledger's `model` stays the parent's.
@@ -7100,7 +7101,11 @@ impl ReplyTap {
 }
 
 /// Collects a whole reply body, as the client gets it.
-fn tap_body(collector: &crate::genai_export::collector::Collector, content_type: &str, body: &[u8]) {
+fn tap_body(
+    collector: &crate::genai_export::collector::Collector,
+    content_type: &str,
+    body: &[u8],
+) {
     if relays_event_stream(content_type) {
         collector.feed_sse(body);
     } else {
@@ -7111,10 +7116,7 @@ fn tap_body(collector: &crate::genai_export::collector::Collector, content_type:
 /// Host and port of an upstream URL; the port defaults from the scheme.
 fn server_of(url: &str) -> (Option<String>, Option<u16>) {
     match reqwest::Url::parse(url) {
-        Ok(u) => (
-            u.host_str().map(str::to_string),
-            u.port_or_known_default(),
-        ),
+        Ok(u) => (u.host_str().map(str::to_string), u.port_or_known_default()),
         Err(_) => (None, None),
     }
 }
@@ -10618,14 +10620,42 @@ mod tests {
         let key = genai_key(true);
         let body = Bytes::from_static(b"{}");
         let mut h = HeaderMap::new();
-        h.insert(crate::responses::SURFACE_HEADER, "responses".parse().unwrap());
-        let c = super::capture_genai(Some(99), &key, false, &Method::POST, "/v1/chat/completions", &h, &body)
-            .unwrap();
+        h.insert(
+            crate::responses::SURFACE_HEADER,
+            "responses".parse().unwrap(),
+        );
+        let c = super::capture_genai(
+            Some(99),
+            &key,
+            false,
+            &Method::POST,
+            "/v1/chat/completions",
+            &h,
+            &body,
+        )
+        .unwrap();
         assert_eq!(c.surface, ApiSurface::Responses);
-        let c = super::capture_genai(Some(99), &key, false, &Method::POST, "/v1/completions", &HeaderMap::new(), &body)
-            .unwrap();
+        let c = super::capture_genai(
+            Some(99),
+            &key,
+            false,
+            &Method::POST,
+            "/v1/completions",
+            &HeaderMap::new(),
+            &body,
+        )
+        .unwrap();
         assert_eq!(c.surface, ApiSurface::Completions);
-        assert!(super::capture_genai(Some(99), &key, false, &Method::POST, "/v1/embeddings", &HeaderMap::new(), &body).is_none());
+        assert!(super::capture_genai(
+            Some(99),
+            &key,
+            false,
+            &Method::POST,
+            "/v1/embeddings",
+            &HeaderMap::new(),
+            &body
+        )
+        .is_none());
     }
 
     const SSE_CHAT: &[u8] = b"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
@@ -10677,8 +10707,20 @@ mod tests {
         let mut meta = genai_meta();
         meta.genai = capture(Some(1 << 20), &genai_key(true), false, b"{}");
         meta.genai_collector = Some(guard_view);
-        let ev = super::genai_event(&obleth_config::PiiSettings::default(), "regex", &genai_key(true), &meta, Uuid::nil(), "m", (1, 1, 0), 0, 5, "off", "client_cancel")
-            .unwrap();
+        let ev = super::genai_event(
+            &obleth_config::PiiSettings::default(),
+            "regex",
+            &genai_key(true),
+            &meta,
+            Uuid::nil(),
+            "m",
+            (1, 1, 0),
+            0,
+            5,
+            "off",
+            "client_cancel",
+        )
+        .unwrap();
         assert_eq!(ev.output.unwrap().choices[0].text, "hel");
     }
 
@@ -10696,7 +10738,10 @@ mod tests {
 
     #[test]
     fn cache_hit_output() {
-        for (ct, body) in [("text/event-stream", SSE_CHAT), ("application/json", JSON_CHAT)] {
+        for (ct, body) in [
+            ("text/event-stream", SSE_CHAT),
+            ("application/json", JSON_CHAT),
+        ] {
             let c = tap_collector();
             super::tap_body(&c, ct, body);
             assert!(!c.snapshot().choices[0].text.is_empty(), "{ct}");
@@ -10724,8 +10769,20 @@ mod tests {
     fn upstream_error_has_error_type() {
         let mut meta = genai_meta();
         meta.genai = capture(Some(1 << 20), &genai_key(true), false, b"{}");
-        let ev = super::genai_event(&obleth_config::PiiSettings::default(), "regex", &genai_key(true), &meta, Uuid::nil(), "m", (0, 0, 0), 0, 5, "off", "upstream_error")
-            .unwrap();
+        let ev = super::genai_event(
+            &obleth_config::PiiSettings::default(),
+            "regex",
+            &genai_key(true),
+            &meta,
+            Uuid::nil(),
+            "m",
+            (0, 0, 0),
+            0,
+            5,
+            "off",
+            "upstream_error",
+        )
+        .unwrap();
         assert_eq!(ev.meta.error_type.as_deref(), Some("upstream_error"));
     }
 
@@ -10735,8 +10792,20 @@ mod tests {
         let key = genai_key(true);
         let mut meta = genai_meta();
         meta.genai = capture(Some(1 << 20), &key, false, b"{\"model\":\"m\"}");
-        let ev = super::genai_event(&obleth_config::PiiSettings::default(), "regex", &key, &meta, Uuid::nil(), "m", (11, 7, 3), 40, 100, "miss", "")
-            .expect("event");
+        let ev = super::genai_event(
+            &obleth_config::PiiSettings::default(),
+            "regex",
+            &key,
+            &meta,
+            Uuid::nil(),
+            "m",
+            (11, 7, 3),
+            40,
+            100,
+            "miss",
+            "",
+        )
+        .expect("event");
         assert_eq!(ev.meta.usage.input, Some(11));
         assert_eq!(ev.meta.usage.output, Some(7));
         assert_eq!(ev.meta.usage.cache_read, Some(3));
@@ -10751,13 +10820,38 @@ mod tests {
         assert_eq!(ev.meta.scrub.name, "regex");
         let mut tenant_key = genai_key(true);
         tenant_key.pii_trace_profile = Some("off".into());
-        let ev2 = super::genai_event(&obleth_config::PiiSettings::default(), "regex", &tenant_key, &meta, Uuid::nil(), "m", (0, 0, 0), 0, 5, "off", "")
-            .unwrap();
+        let ev2 = super::genai_event(
+            &obleth_config::PiiSettings::default(),
+            "regex",
+            &tenant_key,
+            &meta,
+            Uuid::nil(),
+            "m",
+            (0, 0, 0),
+            0,
+            5,
+            "off",
+            "",
+        )
+        .unwrap();
         assert_eq!(ev2.meta.scrub.name, "off");
         assert!(ev.ttft_unix_nanos.is_some());
         assert!(ev.request_body.is_some());
         // No capture, no event.
-        assert!(super::genai_event(&obleth_config::PiiSettings::default(), "regex", &key, &genai_meta(), Uuid::nil(), "m", (0, 0, 0), 0, 0, "off", "").is_none());
+        assert!(super::genai_event(
+            &obleth_config::PiiSettings::default(),
+            "regex",
+            &key,
+            &genai_meta(),
+            Uuid::nil(),
+            "m",
+            (0, 0, 0),
+            0,
+            0,
+            "off",
+            ""
+        )
+        .is_none());
 
         // The event reaches the exporter's process step.
         let env = std::collections::HashMap::from([(
@@ -10770,7 +10864,12 @@ mod tests {
             let _ = tx.send(ev);
             Box::pin(async { Default::default() })
         });
-        let handle = Exporter::start(cfg, reqwest::Client::new(), process, &prometheus::Registry::new());
+        let handle = Exporter::start(
+            cfg,
+            reqwest::Client::new(),
+            process,
+            &prometheus::Registry::new(),
+        );
         assert!(handle.try_send(ev));
         let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await

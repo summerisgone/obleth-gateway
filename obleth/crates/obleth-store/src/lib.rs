@@ -10240,7 +10240,13 @@ mod tests {
             .expect("set tenant flag");
         assert!(store.get_tenant(tenant.id).await.expect("get").genai_export);
         let listed = store.list_tenants().await.expect("list");
-        assert!(listed.iter().find(|t| t.id == tenant.id).expect("listed").genai_export);
+        assert!(
+            listed
+                .iter()
+                .find(|t| t.id == tenant.id)
+                .expect("listed")
+                .genai_export
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

@@ -8,9 +8,7 @@ use futures::future::BoxFuture;
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
-use opentelemetry_proto::tonic::common::v1::{
-    any_value, AnyValue, InstrumentationScope, KeyValue,
-};
+use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prometheus::{IntCounter, IntCounterVec, IntGauge, Opts, Registry};
@@ -71,7 +69,9 @@ impl Shared {
     fn release(&self, n: usize) {
         let _ = self
             .queue_bytes
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| Some(c.saturating_sub(n)));
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                Some(c.saturating_sub(n))
+            });
         self.metrics
             .queue_bytes
             .set(self.queue_bytes.load(Ordering::SeqCst) as i64);
@@ -182,7 +182,12 @@ struct Batcher {
 }
 
 async fn worker(shared: Arc<Shared>, process: ProcessFn, mut rx: mpsc::UnboundedReceiver<Msg>) {
-    let mut b = Batcher { shared: shared.clone(), process, pending: Vec::new(), pending_size: 0 };
+    let mut b = Batcher {
+        shared: shared.clone(),
+        process,
+        pending: Vec::new(),
+        pending_size: 0,
+    };
     let mut tick = tokio::time::interval(shared.cfg.flush.max(Duration::from_millis(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let width = shared.cfg.scrub_concurrency.max(1);
@@ -247,7 +252,11 @@ impl Batcher {
         for (ev, bytes) in group {
             let enqueued = ev.enqueued_at.unwrap_or_else(Instant::now);
             if enqueued.elapsed() > self.shared.cfg.content_ttl {
-                self.shared.metrics.dropped.with_label_values(&["ttl"]).inc();
+                self.shared
+                    .metrics
+                    .dropped
+                    .with_label_values(&["ttl"])
+                    .inc();
                 self.shared.release(bytes);
                 continue;
             }
@@ -262,7 +271,11 @@ impl Batcher {
         .buffered(width);
         while let Some((span, bytes, enqueued)) = spans.next().await {
             self.pending_size += span.encoded_len();
-            self.pending.push(Item { span, bytes, enqueued });
+            self.pending.push(Item {
+                span,
+                bytes,
+                enqueued,
+            });
             if self.pending.len() >= MAX_BATCH_SPANS || self.pending_size >= MAX_BATCH_BYTES {
                 self.flush().await;
             }
@@ -282,7 +295,9 @@ impl Batcher {
 fn str_kv(key: &str, v: &str) -> KeyValue {
     KeyValue {
         key: key.to_string(),
-        value: Some(AnyValue { value: Some(any_value::Value::StringValue(v.to_string())) }),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(v.to_string())),
+        }),
         ..Default::default()
     }
 }
@@ -319,9 +334,12 @@ fn build_request(cfg: &GenAiConfig, spans: Vec<Span>) -> ExportTraceServiceReque
 }
 
 fn strip_content(span: &mut Span) {
-    span.attributes.retain(|kv| !CONTENT_ATTRS.contains(&kv.key.as_str()));
-    span.attributes.retain(|kv| kv.key != "obleth.content.dropped");
-    span.attributes.push(str_kv("obleth.content.dropped", "too_large"));
+    span.attributes
+        .retain(|kv| !CONTENT_ATTRS.contains(&kv.key.as_str()));
+    span.attributes
+        .retain(|kv| kv.key != "obleth.content.dropped");
+    span.attributes
+        .push(str_kv("obleth.content.dropped", "too_large"));
 }
 
 fn already_stripped(span: &Span) -> bool {
@@ -396,7 +414,10 @@ async fn send_group(shared: &Shared, mut items: Vec<Item>, stack: &mut Vec<Vec<I
         let (outcome, rejected) = post(shared, &items).await;
         match outcome {
             Outcome::Done => {
-                shared.metrics.exported.inc_by((items.len() - rejected) as u64);
+                shared
+                    .metrics
+                    .exported
+                    .inc_by((items.len() - rejected) as u64);
                 if rejected > 0 {
                     shared
                         .metrics
@@ -460,7 +481,11 @@ mod tests {
         responder: Responder,
     }
 
-    async fn handle(State(st): State<MockState>, headers: HeaderMap, body: bytes::Bytes) -> StatusCode {
+    async fn handle(
+        State(st): State<MockState>,
+        headers: HeaderMap,
+        body: bytes::Bytes,
+    ) -> StatusCode {
         let req = ExportTraceServiceRequest::decode(body.as_ref()).unwrap();
         let n = {
             let mut g = st.reqs.lock().unwrap();
@@ -472,14 +497,20 @@ mod tests {
 
     async fn mock(responder: Responder) -> Mock {
         let reqs = Arc::new(Mutex::new(Vec::new()));
-        let st = MockState { reqs: reqs.clone(), responder };
+        let st = MockState {
+            reqs: reqs.clone(),
+            responder,
+        };
         let app = axum::Router::new()
             .route("/v1/traces", axum::routing::post(handle))
             .with_state(st);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        Mock { url: format!("http://{addr}"), reqs }
+        Mock {
+            url: format!("http://{addr}"),
+            reqs,
+        }
     }
 
     fn ok() -> Responder {
@@ -489,7 +520,10 @@ mod tests {
     fn cfg(url: &str, tweak: impl FnOnce(&mut GenAiConfig)) -> Arc<GenAiConfig> {
         let env: HashMap<String, String> = [
             ("OBLETH_GENAI_OTLP_ENDPOINT".to_string(), url.to_string()),
-            ("OBLETH_GENAI_OTLP_HEADERS".to_string(), "authorization=Basic xyz".to_string()),
+            (
+                "OBLETH_GENAI_OTLP_HEADERS".to_string(),
+                "authorization=Basic xyz".to_string(),
+            ),
         ]
         .into();
         let mut c = GenAiConfig::from_env_map(&env).unwrap().unwrap();
@@ -501,7 +535,10 @@ mod tests {
     fn named_process() -> ProcessFn {
         Arc::new(|ev: GenAiEvent| {
             Box::pin(async move {
-                let mut s = Span { name: ev.meta.request_id.clone(), ..Default::default() };
+                let mut s = Span {
+                    name: ev.meta.request_id.clone(),
+                    ..Default::default()
+                };
                 if ev.dropped.is_none() {
                     s.attributes.push(str_kv("gen_ai.input.messages", "[]"));
                 }
@@ -556,17 +593,33 @@ mod tests {
         assert_eq!(headers["content-type"], "application/x-protobuf");
         assert_eq!(headers["authorization"], "Basic xyz");
         let rs = &req.resource_spans[0];
-        assert_eq!(rs.scope_spans[0].scope.as_ref().unwrap().name, "obleth.genai");
+        assert_eq!(
+            rs.scope_spans[0].scope.as_ref().unwrap().name,
+            "obleth.genai"
+        );
         assert_eq!(rs.scope_spans[0].spans.len(), 1);
         assert_eq!(rs.scope_spans[0].spans[0].name, "r1");
-        assert!(rs.resource.as_ref().unwrap().attributes.iter().any(|kv| kv.key == "service.name"));
-        assert!(reg.gather().iter().any(|f| f.name() == "obleth_genai_exported_total"));
+        assert!(rs
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes
+            .iter()
+            .any(|kv| kv.key == "service.name"));
+        assert!(reg
+            .gather()
+            .iter()
+            .any(|f| f.name() == "obleth_genai_exported_total"));
     }
 
     #[tokio::test]
     async fn retries_503_then_ok() {
         let m = mock(Arc::new(|n, _| {
-            if n == 0 { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK }
+            if n == 0 {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            }
         }))
         .await;
         let (h, _) = start(cfg(&m.url, |_| {}), named_process());
@@ -585,7 +638,10 @@ mod tests {
             }
         }))
         .await;
-        let (h, _) = start(cfg(&m.url, |c| c.flush = Duration::from_millis(200)), named_process());
+        let (h, _) = start(
+            cfg(&m.url, |c| c.flush = Duration::from_millis(200)),
+            named_process(),
+        );
         h.try_send(ev("a"));
         h.try_send(ev("b"));
         wait_for(|| h.shared.metrics.exported.get() == 2).await;
@@ -603,7 +659,10 @@ mod tests {
     async fn single_413_resent_without_content() {
         let m = mock(Arc::new(|_, r| {
             let s = &r.resource_spans[0].scope_spans[0].spans[0];
-            if s.attributes.iter().any(|kv| kv.key == "gen_ai.input.messages") {
+            if s.attributes
+                .iter()
+                .any(|kv| kv.key == "gen_ai.input.messages")
+            {
                 StatusCode::PAYLOAD_TOO_LARGE
             } else {
                 StatusCode::OK
@@ -616,7 +675,10 @@ mod tests {
         let g = m.reqs.lock().unwrap();
         assert_eq!(g.len(), 2);
         let s = &g[1].1.resource_spans[0].scope_spans[0].spans[0];
-        assert!(!s.attributes.iter().any(|kv| kv.key == "gen_ai.input.messages"));
+        assert!(!s
+            .attributes
+            .iter()
+            .any(|kv| kv.key == "gen_ai.input.messages"));
         assert!(already_stripped(s));
     }
 
@@ -653,7 +715,10 @@ mod tests {
         let mut e = ev("a");
         e.request_body = Some(bytes::Bytes::from_static(b"{}"));
         e.output = Some(CollectedOutput {
-            choices: vec![OutputChoice { text: "x".into(), ..Default::default() }],
+            choices: vec![OutputChoice {
+                text: "x".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         });
         h.try_send(e);
@@ -668,7 +733,10 @@ mod tests {
     #[tokio::test]
     async fn ttl_expired_dropped() {
         let m = mock(ok()).await;
-        let (h, _) = start(cfg(&m.url, |c| c.content_ttl = Duration::from_secs(1)), named_process());
+        let (h, _) = start(
+            cfg(&m.url, |c| c.content_ttl = Duration::from_secs(1)),
+            named_process(),
+        );
         let mut e = ev("a");
         e.enqueued_at = Instant::now().checked_sub(Duration::from_secs(5));
         h.try_send(e);
@@ -681,7 +749,10 @@ mod tests {
     #[tokio::test]
     async fn shutdown_flushes_pending() {
         let m = mock(ok()).await;
-        let (h, _) = start(cfg(&m.url, |c| c.flush = Duration::from_secs(60)), named_process());
+        let (h, _) = start(
+            cfg(&m.url, |c| c.flush = Duration::from_secs(60)),
+            named_process(),
+        );
         h.try_send(ev("a"));
         h.shutdown(Duration::from_secs(5)).await;
         assert_eq!(span_count(&m), 1);
@@ -720,7 +791,10 @@ mod tests {
     #[tokio::test]
     async fn queue_bytes_returns_to_zero() {
         let m = mock(ok()).await;
-        let (h, _) = start(cfg(&m.url, |c| c.flush = Duration::from_millis(5)), named_process());
+        let (h, _) = start(
+            cfg(&m.url, |c| c.flush = Duration::from_millis(5)),
+            named_process(),
+        );
         for i in 0..100 {
             let mut e = ev(&format!("r{i}"));
             e.request_body = Some(bytes::Bytes::from(vec![b'x'; 100]));
@@ -742,7 +816,10 @@ mod tests {
             Box::pin(async move {
                 let ms = if ev.meta.request_id == "a" { 250 } else { 200 };
                 tokio::time::sleep(Duration::from_millis(ms)).await;
-                Span { name: ev.meta.request_id.clone(), ..Default::default() }
+                Span {
+                    name: ev.meta.request_id.clone(),
+                    ..Default::default()
+                }
             })
         });
         let (h, _) = start(cfg(&m.url, |c| c.scrub_concurrency = 4), p);
@@ -751,13 +828,22 @@ mod tests {
             h.try_send(ev(id));
         }
         wait_for(|| span_count(&m) == 4).await;
-        assert!(t.elapsed() < Duration::from_millis(600), "{:?}", t.elapsed());
+        assert!(
+            t.elapsed() < Duration::from_millis(600),
+            "{:?}",
+            t.elapsed()
+        );
         let names: Vec<String> = m
             .reqs
             .lock()
             .unwrap()
             .iter()
-            .flat_map(|(_, r)| r.resource_spans[0].scope_spans[0].spans.iter().map(|s| s.name.clone()))
+            .flat_map(|(_, r)| {
+                r.resource_spans[0].scope_spans[0]
+                    .spans
+                    .iter()
+                    .map(|s| s.name.clone())
+            })
             .collect();
         assert_eq!(names, vec!["a", "b", "c", "d"]);
     }

@@ -89,10 +89,7 @@ impl Inner {
             return;
         };
         for (pos, c) in choices.iter().enumerate() {
-            let index = c
-                .get("index")
-                .and_then(Value::as_u64)
-                .unwrap_or(pos as u64) as u32;
+            let index = c.get("index").and_then(Value::as_u64).unwrap_or(pos as u64) as u32;
             if index > 1024 {
                 self.out.truncated = true;
                 continue;
@@ -214,7 +211,9 @@ mod tests {
         c.set_json(br#"{"choices":[{"index":4000000000,"message":{"content":"x"}}]}"#);
         assert!(c.snapshot().choices.is_empty());
         let long = "n".repeat(1000);
-        let body = format!(r#"{{"choices":[{{"message":{{"tool_calls":[{{"id":"{long}","function":{{"name":"{long}"}}}}]}}}}]}}"#);
+        let body = format!(
+            r#"{{"choices":[{{"message":{{"tool_calls":[{{"id":"{long}","function":{{"name":"{long}"}}}}]}}}}]}}"#
+        );
         c.set_json(body.as_bytes());
         let t = &c.snapshot().choices[0].tool_calls[0];
         assert!(t.id.len() <= 256 && t.name.len() <= 256);
@@ -329,7 +328,9 @@ mod tests {
     #[test]
     fn reasoning_collected() {
         let c = Collector::new(1000);
-        c.feed_sse(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n");
+        c.feed_sse(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
+        );
         assert_eq!(c.snapshot().choices[0].reasoning, "think");
     }
 }

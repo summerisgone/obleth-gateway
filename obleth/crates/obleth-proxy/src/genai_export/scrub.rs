@@ -25,8 +25,16 @@ pub struct Scrubber {
 }
 
 impl Scrubber {
-    pub fn new(cfg: Arc<GenAiConfig>, http: reqwest::Client, detector: Arc<PiiDetector>) -> Scrubber {
-        Scrubber { cfg, http, detector }
+    pub fn new(
+        cfg: Arc<GenAiConfig>,
+        http: reqwest::Client,
+        detector: Arc<PiiDetector>,
+    ) -> Scrubber {
+        Scrubber {
+            cfg,
+            http,
+            detector,
+        }
     }
 
     /// Returns the scrub marker applied. Any Err means the caller must drop the content.
@@ -89,7 +97,8 @@ impl Scrubber {
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
             .ok_or("llm bad reply")?;
-        let parsed: Value = serde_json::from_str(content.trim()).map_err(|_| "llm bad reply".to_string())?;
+        let parsed: Value =
+            serde_json::from_str(content.trim()).map_err(|_| "llm bad reply".to_string())?;
         let out = string_array(Some(&parsed)).ok_or("llm bad reply")?;
         if out.len() != texts.len() {
             return Err("llm length mismatch".into());
@@ -112,7 +121,12 @@ fn string_array(v: Option<&Value>) -> Option<Vec<String>> {
 
 /// Visits every scrubbable string leaf in a fixed order.
 fn walk(c: &mut Content, f: &mut dyn FnMut(&mut String)) {
-    for v in c.system.iter_mut().chain(c.input.iter_mut()).chain(c.output.iter_mut()) {
+    for v in c
+        .system
+        .iter_mut()
+        .chain(c.input.iter_mut())
+        .chain(c.output.iter_mut())
+    {
         visit_node(v, f);
     }
 }
@@ -133,7 +147,11 @@ fn visit_node(v: &mut Value, f: &mut dyn FnMut(&mut String)) {
 
 fn visit_part(v: &mut Value, f: &mut dyn FnMut(&mut String)) {
     let Some(obj) = v.as_object_mut() else { return };
-    let ty = obj.get("type").and_then(Value::as_str).unwrap_or("").to_owned();
+    let ty = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
     match ty.as_str() {
         "text" | "reasoning" => {
             if let Some(Value::String(s)) = obj.get_mut("content") {
@@ -202,7 +220,11 @@ pub fn hmac_hex(key: &[u8], msg: &str) -> String {
     let mut outer = Sha256::new();
     outer.update(k.map(|b| b ^ 0x5c));
     outer.update(ih);
-    outer.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    outer
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 pub fn conversation_id(raw: &str, key: Option<&[u8]>) -> Option<String> {
@@ -256,7 +278,10 @@ mod tests {
             scrub_timeout_ms: Some(300),
             warnings: vec![],
         };
-        (Arc::new(PiiDetector::new(&env, reqwest::Client::new(), h.clone())), h)
+        (
+            Arc::new(PiiDetector::new(&env, reqwest::Client::new(), h.clone())),
+            h,
+        )
     }
 
     fn scrubber_url(c: GenAiConfig, ner: Option<String>) -> Scrubber {
@@ -294,7 +319,10 @@ mod tests {
     }
 
     fn first_text(c: &Content) -> String {
-        c.input[0]["parts"][0]["content"].as_str().unwrap().to_string()
+        c.input[0]["parts"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     async fn serve(app: axum::Router) -> String {
@@ -340,7 +368,10 @@ mod tests {
     async fn off_leaves_text() {
         let s = scrubber(cfg(None));
         let mut c = text_content("mail a@b.io");
-        assert_eq!(s.scrub(&mut c, &tp("off", PiiDetectorKind::Off)).await, Ok("none"));
+        assert_eq!(
+            s.scrub(&mut c, &tp("off", PiiDetectorKind::Off)).await,
+            Ok("none")
+        );
         assert_eq!(first_text(&c), "mail a@b.io");
     }
 
@@ -348,7 +379,11 @@ mod tests {
     async fn unknown_profile_scrub_failed() {
         let s = scrubber(cfg(None));
         let mut c = text_content("mail a@b.io");
-        let gone = TraceProfile { name: "gone".into(), profile: None, strengthened: false };
+        let gone = TraceProfile {
+            name: "gone".into(),
+            profile: None,
+            strengthened: false,
+        };
         assert!(s.scrub(&mut c, &gone).await.is_err());
         assert_eq!(first_text(&c), "mail a@b.io");
     }
@@ -371,7 +406,10 @@ mod tests {
         let s = scrubber(cfg(Some(format!("{url}/"))));
         let mut c = text_content("hello a@b.io");
         c.system = vec![json!({"type":"text","content":"sys"})];
-        assert_eq!(s.scrub(&mut c, &tp("ner", PiiDetectorKind::Ner)).await, Ok("ner"));
+        assert_eq!(
+            s.scrub(&mut c, &tp("ner", PiiDetectorKind::Ner)).await,
+            Ok("ner")
+        );
         assert_eq!(first_text(&c), "HELLO [REDACTED:EMAIL]");
         assert_eq!(c.system[0]["content"], "SYS");
     }
@@ -380,7 +418,10 @@ mod tests {
     async fn ner_without_url_fails() {
         let s = scrubber(cfg(None));
         let mut c = text_content("x");
-        assert!(s.scrub(&mut c, &tp("ner", PiiDetectorKind::Ner)).await.is_err());
+        assert!(s
+            .scrub(&mut c, &tp("ner", PiiDetectorKind::Ner))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -409,14 +450,21 @@ mod tests {
         let url = serve(app).await;
         let s = scrubber(cfg(Some(format!("{url}/"))));
         let mut c = text_content("x");
-        assert!(s.scrub(&mut c, &tp("ner", PiiDetectorKind::Ner)).await.is_err());
+        assert!(s
+            .scrub(&mut c, &tp("ner", PiiDetectorKind::Ner))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn busy_when_no_permit() {
         let url = counting_ner(Arc::new(AtomicUsize::new(0)), 150).await;
         let (d, _) = detector_with(Some(url), 1, BoonSettings::default());
-        let s = Arc::new(Scrubber::new(Arc::new(cfg(None)), reqwest::Client::new(), d));
+        let s = Arc::new(Scrubber::new(
+            Arc::new(cfg(None)),
+            reqwest::Client::new(),
+            d,
+        ));
         let t = tp("ner", PiiDetectorKind::Ner);
         let s2 = s.clone();
         let t2 = t.clone();
@@ -462,7 +510,10 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         let mut c = text_content("a@b.io");
-        assert_eq!(sc.scrub(&mut c, &resolve(Some("off"), None)).await, Ok("none"));
+        assert_eq!(
+            sc.scrub(&mut c, &resolve(Some("off"), None)).await,
+            Ok("none")
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(first_text(&c), "a@b.io");
 
@@ -483,7 +534,10 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         let mut c = text_content("a@b.io");
-        assert_eq!(sc.scrub(&mut c, &resolve(Some("ner"), None)).await, Ok("ner"));
+        assert_eq!(
+            sc.scrub(&mut c, &resolve(Some("ner"), None)).await,
+            Ok("ner")
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
@@ -506,7 +560,10 @@ mod tests {
         let url = serve(app).await;
         let s = scrubber(cfg(Some(url)));
         let mut c = text_content("hi a@b.io");
-        assert_eq!(s.scrub(&mut c, &tp("llm", PiiDetectorKind::Regex)).await, Ok("llm"));
+        assert_eq!(
+            s.scrub(&mut c, &tp("llm", PiiDetectorKind::Regex)).await,
+            Ok("llm")
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(first_text(&c), "hi [REDACTED:EMAIL]");
     }
@@ -533,7 +590,10 @@ mod tests {
         let url = llm_server(13).await;
         let s = scrubber(cfg(Some(url)));
         let mut c = text_content("abcdefghij");
-        assert!(s.scrub(&mut c, &tp("llm", PiiDetectorKind::Regex)).await.is_err());
+        assert!(s
+            .scrub(&mut c, &tp("llm", PiiDetectorKind::Regex))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -541,7 +601,10 @@ mod tests {
         let url = llm_server(10).await;
         let s = scrubber(cfg(Some(url)));
         let mut c = text_content("abcdefghij");
-        assert_eq!(s.scrub(&mut c, &tp("llm", PiiDetectorKind::Regex)).await, Ok("llm"));
+        assert_eq!(
+            s.scrub(&mut c, &tp("llm", PiiDetectorKind::Regex)).await,
+            Ok("llm")
+        );
     }
 
     #[tokio::test]
@@ -568,8 +631,12 @@ mod tests {
     async fn tool_ids_and_names_scrubbed() {
         let s = scrubber(cfg(None));
         let mut c = Content {
-            input: vec![json!({"role":"tool","parts":[{"type":"tool_call_response","id":"a@b.io","response":"x"}]})],
-            output: vec![json!({"role":"assistant","parts":[{"type":"tool_call","id":"c@d.io","name":"e@f.io","arguments":{}}]})],
+            input: vec![
+                json!({"role":"tool","parts":[{"type":"tool_call_response","id":"a@b.io","response":"x"}]}),
+            ],
+            output: vec![
+                json!({"role":"assistant","parts":[{"type":"tool_call","id":"c@d.io","name":"e@f.io","arguments":{}}]}),
+            ],
             ..Default::default()
         };
         s.scrub(&mut c, &regex_tp()).await.unwrap();
@@ -582,7 +649,10 @@ mod tests {
         let s = scrubber(cfg(None));
         let mut c = text_content("\"привет\" \u{1F600} \\ \n a@b.io");
         s.scrub(&mut c, &regex_tp()).await.unwrap();
-        assert_eq!(first_text(&c), "\"привет\" \u{1F600} \\ \n [REDACTED:EMAIL]");
+        assert_eq!(
+            first_text(&c),
+            "\"привет\" \u{1F600} \\ \n [REDACTED:EMAIL]"
+        );
     }
 
     #[test]

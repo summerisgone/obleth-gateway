@@ -2241,7 +2241,12 @@ async fn patch_tenant_guardrails(
     Json(body): Json<SetTenantGuardrails>,
 ) -> Result<Json<Tenant>> {
     if let Some(name) = body.policy.as_ref().and_then(|p| p.pii_profile.as_deref()) {
-        let pii = state.store.get_boon_settings().await?.unwrap_or_default().pii;
+        let pii = state
+            .store
+            .get_boon_settings()
+            .await?
+            .unwrap_or_default()
+            .pii;
         if pii.resolve(name).is_none() {
             return Err(AdminError::BadRequest(format!(
                 "pii_profile: unknown profile {name:?}"
@@ -3953,10 +3958,7 @@ fn validate_pii_settings(
 }
 
 /// Refuse a `pii` section that drops a profile some tenant still names.
-async fn check_pii_references(
-    state: &AdminState,
-    pii: &obleth_config::PiiSettings,
-) -> Result<()> {
+async fn check_pii_references(state: &AdminState, pii: &obleth_config::PiiSettings) -> Result<()> {
     for t in state.store.list_tenants().await? {
         let refs = [
             t.pii_trace_profile.as_deref(),
@@ -4459,8 +4461,7 @@ async fn put_boon_settings(
             .map_err(|e| AdminError::BadRequest(format!("speculation_verify_url_template: {e}")))?;
     }
     if let Some(pii) = body.pii.as_ref() {
-        validate_pii_settings(pii, state.pii_ner_url.as_deref())
-            .map_err(AdminError::BadRequest)?;
+        validate_pii_settings(pii, state.pii_ner_url.as_deref()).map_err(AdminError::BadRequest)?;
         check_pii_references(&state, pii).await?;
     }
     state.store.put_boon_settings(&settings).await?;
@@ -5663,7 +5664,12 @@ pub struct GenaiExportStatus {
 async fn get_genai_export_status(
     State(state): State<AdminState>,
 ) -> Result<Json<GenaiExportStatus>> {
-    let pii = state.store.get_boon_settings().await?.unwrap_or_default().pii;
+    let pii = state
+        .store
+        .get_boon_settings()
+        .await?
+        .unwrap_or_default()
+        .pii;
     let mut profiles: Vec<String> = ["off", "regex", "ner"]
         .into_iter()
         .map(String::from)
@@ -5688,7 +5694,12 @@ async fn set_tenant_genai_export_handler(
     Json(body): Json<SetTenantGenaiExport>,
 ) -> Result<StatusCode> {
     if let Some(Some(name)) = body.pii_trace_profile.as_ref() {
-        let pii = state.store.get_boon_settings().await?.unwrap_or_default().pii;
+        let pii = state
+            .store
+            .get_boon_settings()
+            .await?
+            .unwrap_or_default()
+            .pii;
         if pii.resolve(name).is_none() {
             return Err(AdminError::BadRequest(format!(
                 "pii_trace_profile: unknown profile {name:?}"
@@ -12057,7 +12068,11 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
-    fn authed(method: &str, path: &str, body: serde_json::Value) -> axum::http::Request<axum::body::Body> {
+    fn authed(
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
         axum::http::Request::builder()
             .method(method)
             .uri(path)
@@ -12071,13 +12086,28 @@ mod tests {
         serde_json::json!({ "detector": "regex", "entities": [], "language": null, "score_threshold": null })
     }
 
-    async fn boons_pii_put(t: &harness::TestApp, pii: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        send(&t.app, authed("PUT", "/api/v1/settings/boons", serde_json::json!({ "pii": pii }))).await
+    async fn boons_pii_put(
+        t: &harness::TestApp,
+        pii: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        send(
+            &t.app,
+            authed(
+                "PUT",
+                "/api/v1/settings/boons",
+                serde_json::json!({ "pii": pii }),
+            ),
+        )
+        .await
     }
 
     async fn pii_test_tenant(t: &harness::TestApp) -> (Uuid, String) {
         let name = format!("t-{}", Uuid::new_v4());
-        let tenant = t.store.create_tenant(&name, 100, 0, None, None).await.expect("tenant");
+        let tenant = t
+            .store
+            .create_tenant(&name, 100, 0, None, None)
+            .await
+            .expect("tenant");
         (tenant.id, name)
     }
 
@@ -12087,10 +12117,19 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let restore = t.store.get_boon_settings().await.expect("read").unwrap_or_default();
-        let (s1, b1) = boons_pii_put(&t, serde_json::json!({
-            "profiles": { "ru": { "detector": "ner", "entities": [], "language": "ru" } }
-        })).await;
+        let restore = t
+            .store
+            .get_boon_settings()
+            .await
+            .expect("read")
+            .unwrap_or_default();
+        let (s1, b1) = boons_pii_put(
+            &t,
+            serde_json::json!({
+                "profiles": { "ru": { "detector": "ner", "entities": [], "language": "ru" } }
+            }),
+        )
+        .await;
         let (s2, b2) = boons_pii_put(&t, serde_json::json!({ "traces": "ner" })).await;
         let _ = t.store.put_boon_settings(&restore).await;
         assert_eq!(s1, StatusCode::BAD_REQUEST, "{b1}");
@@ -12102,16 +12141,30 @@ mod tests {
         let Some(t) = test_admin_app_tweaked(|s| {
             s.pii_ner_url = Some("http://user:secret@ner.internal:5001/scrub".to_string());
         })
-        .await else {
+        .await
+        else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let restore = t.store.get_boon_settings().await.expect("read").unwrap_or_default();
-        let (status, body) = boons_pii_put(&t, serde_json::json!({
-            "profiles": { "ru": { "detector": "ner", "entities": [], "language": "ru" } },
-            "traces": "ru"
-        })).await;
-        let (_, get) = send(&t.app, authed("GET", "/api/v1/settings/boons", serde_json::json!(null))).await;
+        let restore = t
+            .store
+            .get_boon_settings()
+            .await
+            .expect("read")
+            .unwrap_or_default();
+        let (status, body) = boons_pii_put(
+            &t,
+            serde_json::json!({
+                "profiles": { "ru": { "detector": "ner", "entities": [], "language": "ru" } },
+                "traces": "ru"
+            }),
+        )
+        .await;
+        let (_, get) = send(
+            &t.app,
+            authed("GET", "/api/v1/settings/boons", serde_json::json!(null)),
+        )
+        .await;
         let _ = t.store.put_boon_settings(&restore).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["pii"]["ner_url"], "http://ner.internal:5001/scrub");
@@ -12125,7 +12178,12 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let restore = t.store.get_boon_settings().await.expect("read").unwrap_or_default();
+        let restore = t
+            .store
+            .get_boon_settings()
+            .await
+            .expect("read")
+            .unwrap_or_default();
         let (status, body) = boons_pii_put(&t, serde_json::json!({ "traces": "nope" })).await;
         let _ = t.store.put_boon_settings(&restore).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -12137,10 +12195,22 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let restore = t.store.get_boon_settings().await.expect("read").unwrap_or_default();
+        let restore = t
+            .store
+            .get_boon_settings()
+            .await
+            .expect("read")
+            .unwrap_or_default();
         let mut results = Vec::new();
         for name in ["off", "regex", "ner"] {
-            results.push(boons_pii_put(&t, serde_json::json!({ "profiles": { name: regex_profile() } })).await.0);
+            results.push(
+                boons_pii_put(
+                    &t,
+                    serde_json::json!({ "profiles": { name: regex_profile() } }),
+                )
+                .await
+                .0,
+            );
         }
         let _ = t.store.put_boon_settings(&restore).await;
         assert_eq!(results, vec![StatusCode::BAD_REQUEST; 3]);
@@ -12152,19 +12222,46 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let restore = t.store.get_boon_settings().await.expect("read").unwrap_or_default();
+        let restore = t
+            .store
+            .get_boon_settings()
+            .await
+            .expect("read")
+            .unwrap_or_default();
         let (trace_tenant, trace_name) = pii_test_tenant(&t).await;
         let (guard_tenant, guard_name) = pii_test_tenant(&t).await;
 
-        let (s0, b0) = boons_pii_put(&t, serde_json::json!({ "profiles": { "ru": regex_profile() } })).await;
-        t.store.set_tenant_pii_trace_profile(trace_tenant, Some("ru")).await.expect("trace ref");
+        let (s0, b0) = boons_pii_put(
+            &t,
+            serde_json::json!({ "profiles": { "ru": regex_profile() } }),
+        )
+        .await;
+        t.store
+            .set_tenant_pii_trace_profile(trace_tenant, Some("ru"))
+            .await
+            .expect("trace ref");
         let (sa, ba) = boons_pii_put(&t, serde_json::json!({ "profiles": {} })).await;
-        t.store.set_tenant_pii_trace_profile(trace_tenant, None).await.expect("clear ref");
-        let (sp, bp) = send(&t.app, authed("PATCH", &format!("/api/v1/tenants/{guard_tenant}/guardrails"), serde_json::json!({
-            "policy": { "action": "redact", "input_scanners": ["pii"], "pii_profile": "ru" }
-        }))).await;
+        t.store
+            .set_tenant_pii_trace_profile(trace_tenant, None)
+            .await
+            .expect("clear ref");
+        let (sp, bp) = send(
+            &t.app,
+            authed(
+                "PATCH",
+                &format!("/api/v1/tenants/{guard_tenant}/guardrails"),
+                serde_json::json!({
+                    "policy": { "action": "redact", "input_scanners": ["pii"], "pii_profile": "ru" }
+                }),
+            ),
+        )
+        .await;
         let (sb, bb) = boons_pii_put(&t, serde_json::json!({ "profiles": {} })).await;
-        let (sc, bc) = boons_pii_put(&t, serde_json::json!({ "profiles": { "ru": regex_profile() } })).await;
+        let (sc, bc) = boons_pii_put(
+            &t,
+            serde_json::json!({ "profiles": { "ru": regex_profile() } }),
+        )
+        .await;
 
         let _ = t.store.put_boon_settings(&restore).await;
         let _ = t.store.delete_tenant(trace_tenant).await;
@@ -12201,16 +12298,51 @@ mod tests {
         };
         let (id, _) = pii_test_tenant(&t).await;
         let path = format!("/api/v1/tenants/{id}/genai-export");
-        let (s1, _) = send(&t.app, authed("PUT", &path, serde_json::json!({ "genai_export": true, "pii_trace_profile": "off" }))).await;
+        let (s1, _) = send(
+            &t.app,
+            authed(
+                "PUT",
+                &path,
+                serde_json::json!({ "genai_export": true, "pii_trace_profile": "off" }),
+            ),
+        )
+        .await;
         let p1 = t.store.get_tenant(id).await.expect("get").pii_trace_profile;
-        let (s2, _) = send(&t.app, authed("PUT", &path, serde_json::json!({ "genai_export": true }))).await;
+        let (s2, _) = send(
+            &t.app,
+            authed("PUT", &path, serde_json::json!({ "genai_export": true })),
+        )
+        .await;
         let p2 = t.store.get_tenant(id).await.expect("get").pii_trace_profile;
-        let (s3, b3) = send(&t.app, authed("PUT", &path, serde_json::json!({ "genai_export": true, "pii_trace_profile": "nope" }))).await;
+        let (s3, b3) = send(
+            &t.app,
+            authed(
+                "PUT",
+                &path,
+                serde_json::json!({ "genai_export": true, "pii_trace_profile": "nope" }),
+            ),
+        )
+        .await;
         let p3 = t.store.get_tenant(id).await.expect("get").pii_trace_profile;
-        let (s4, _) = send(&t.app, authed("PUT", &path, serde_json::json!({ "genai_export": true, "pii_trace_profile": null }))).await;
+        let (s4, _) = send(
+            &t.app,
+            authed(
+                "PUT",
+                &path,
+                serde_json::json!({ "genai_export": true, "pii_trace_profile": null }),
+            ),
+        )
+        .await;
         let p4 = t.store.get_tenant(id).await.expect("get").pii_trace_profile;
         let _ = t.store.delete_tenant(id).await;
-        assert_eq!((s1, s2, s4), (StatusCode::NO_CONTENT, StatusCode::NO_CONTENT, StatusCode::NO_CONTENT));
+        assert_eq!(
+            (s1, s2, s4),
+            (
+                StatusCode::NO_CONTENT,
+                StatusCode::NO_CONTENT,
+                StatusCode::NO_CONTENT
+            )
+        );
         assert_eq!(p1.as_deref(), Some("off"));
         assert_eq!(p2.as_deref(), Some("off"));
         assert_eq!(s3, StatusCode::BAD_REQUEST, "{b3}");
@@ -12224,9 +12356,20 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let (status, body) = send(&t.app, authed("POST", "/api/v1/settings/boons/pii/check", serde_json::json!({}))).await;
+        let (status, body) = send(
+            &t.app,
+            authed(
+                "POST",
+                "/api/v1/settings/boons/pii/check",
+                serde_json::json!({}),
+            ),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, serde_json::json!({ "ok": false, "latency_ms": null, "error": "OBLETH_PII_NER_URL is not set" }));
+        assert_eq!(
+            body,
+            serde_json::json!({ "ok": false, "latency_ms": null, "error": "OBLETH_PII_NER_URL is not set" })
+        );
         let unauth = axum::http::Request::post("/api/v1/settings/boons/pii/check")
             .body(axum::body::Body::empty())
             .expect("build request");
@@ -12239,20 +12382,37 @@ mod tests {
             s.genai_scrub = Some("llm".to_string());
             s.pii_ner_url = Some("http://ner".to_string());
         })
-        .await else {
+        .await
+        else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let restore = t.store.get_boon_settings().await.expect("read").unwrap_or_default();
-        let (put, pb) = boons_pii_put(&t, serde_json::json!({ "profiles": { "ru": regex_profile() } })).await;
-        let (status, body) = send(&t.app, authed("GET", "/api/v1/genai-export", serde_json::json!(null))).await;
+        let restore = t
+            .store
+            .get_boon_settings()
+            .await
+            .expect("read")
+            .unwrap_or_default();
+        let (put, pb) = boons_pii_put(
+            &t,
+            serde_json::json!({ "profiles": { "ru": regex_profile() } }),
+        )
+        .await;
+        let (status, body) = send(
+            &t.app,
+            authed("GET", "/api/v1/genai-export", serde_json::json!(null)),
+        )
+        .await;
         let _ = t.store.put_boon_settings(&restore).await;
         assert_eq!(put, StatusCode::OK, "{pb}");
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, serde_json::json!({
-            "configured": true, "scrub": "llm", "error": null,
-            "profiles": ["ner", "off", "regex", "ru"], "ner_configured": true, "deprecated": "llm"
-        }));
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "configured": true, "scrub": "llm", "error": null,
+                "profiles": ["ner", "off", "regex", "ru"], "ner_configured": true, "deprecated": "llm"
+            })
+        );
     }
 
     #[test]

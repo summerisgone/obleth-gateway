@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
 use std::sync::Arc;
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use axum::http::StatusCode;
@@ -618,7 +618,10 @@ async fn run_ner(
             Ok(out) => return Ok(Some(out)),
             Err(e) => (pii_reason(&e), e.to_string()),
         },
-        _ => ("missing_profile", "the policy's pii_profile does not resolve".to_string()),
+        _ => (
+            "missing_profile",
+            "the policy's pii_profile does not resolve".to_string(),
+        ),
     };
     cx.metrics.record_pii_failure("model", reason);
     tracing::warn!(reason, tenant = %cx.tenant_name, "guardrails pii detector failed");
@@ -755,7 +758,9 @@ async fn ner_output_stage(
     }
     match Box::pin(run_ner(cx, plan, Lane::Model, true, texts)).await {
         Ok(None) => Ok(false),
-        Ok(Some(_)) if block => Err(GuardrailsBlock::policy("response blocked by content policy")),
+        Ok(Some(_)) if block => Err(GuardrailsBlock::policy(
+            "response blocked by content policy",
+        )),
         Ok(Some(out)) => {
             write_back(|f| each_output_string(completion, f), out);
             // Log-probabilities spell the removed text out token by token.
@@ -1083,11 +1088,7 @@ pub(super) async fn apply_input(
                     continue;
                 }
                 if let Some(content) = msg.get_mut("content") {
-                    if redact_content_in_place(
-                        content,
-                        &eff.input_scanners,
-                        &eff.ban_keywords,
-                    ) {
+                    if redact_content_in_place(content, &eff.input_scanners, &eff.ban_keywords) {
                         sanitized = true;
                     }
                 }
@@ -2084,7 +2085,10 @@ mod tests {
         drop(seen);
         assert_eq!(json["messages"][0]["content"], "I am [PERSON]");
         assert_eq!(json["messages"][1]["content"], "Ivan said hi");
-        assert_eq!(json["messages"][2]["content"][0]["text"], "[PERSON] is a secret");
+        assert_eq!(
+            json["messages"][2]["content"][0]["text"],
+            "[PERSON] is a secret"
+        );
         assert_eq!(json["prompt"], "call [PERSON]");
     }
 
@@ -2150,7 +2154,9 @@ mod tests {
         let cx = cx(None);
         let mut json = request();
         let before = json.clone();
-        assert!(!ner_input_stage(&cx, &plan, &policy, &mut json).await.unwrap());
+        assert!(!ner_input_stage(&cx, &plan, &policy, &mut json)
+            .await
+            .unwrap());
         assert_eq!(json, before);
         assert!(failures(&cx, "missing_profile"));
         let closed = GuardrailsPolicy {
@@ -2186,7 +2192,13 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 1);
 
         let down = self::cx(None);
-        spawn_pii_monitor(down.clone(), ner_plan(), vec!["x".into()], "output", uuid::Uuid::nil());
+        spawn_pii_monitor(
+            down.clone(),
+            ner_plan(),
+            vec!["x".into()],
+            "output",
+            uuid::Uuid::nil(),
+        );
         for _ in 0..50 {
             if failures(&down, "not_configured") {
                 break;
@@ -2208,7 +2220,9 @@ mod tests {
         assert_eq!(eff.input_scanners, vec!["ban_keywords".to_string()]);
         assert!(run_tier1_input_scanners("mail a@b.co", &eff).is_none());
         let mut json = request();
-        assert!(!ner_input_stage(&cx, &plan, &policy, &mut json).await.unwrap());
+        assert!(!ner_input_stage(&cx, &plan, &policy, &mut json)
+            .await
+            .unwrap());
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -2228,7 +2242,9 @@ mod tests {
         assert_eq!(completion["choices"][0]["logprobs"], Value::Null);
         let eff = sync_policy(&policy, &plan);
         redact_output_in_place(&mut completion, &eff.output_scanners, &eff.ban_keywords);
-        let out = completion["choices"][0]["message"]["content"].as_str().unwrap();
+        let out = completion["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap();
         assert!(out.starts_with("[PERSON] keeps a "));
         assert!(!out.contains("secret"));
     }
