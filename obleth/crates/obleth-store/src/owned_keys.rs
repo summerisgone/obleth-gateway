@@ -29,7 +29,7 @@ const OWNED_KEY_COLUMNS: &str = "id, tenant_id, name, description, key_prefix,
     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
     disabled, tracing_enabled, end_user_fairshare, created_at, updated_at,
     kind, identity_issuer, identity_subject, identity_claims,
-    weight, max_in_flight, owner_issuer, owner_subject";
+    weight, max_in_flight, background, allowed_networks, owner_issuer, owner_subject";
 
 fn owned_key_from_row(row: &PgRow) -> Result<OwnedKey> {
     Ok(OwnedKey {
