@@ -318,6 +318,7 @@ pub struct ResponsePlan {
 pub struct GuardrailsOutputPlan {
     pub policy: obleth_config::GuardrailsPolicy,
     pub settings: obleth_config::GuardrailsBoonSettings,
+    pub(crate) pii: guardrails::PiiPlan,
 }
 
 /// Structured-output-boon response work: validate (and repair) the completion
@@ -356,16 +357,18 @@ async fn guard_input(
     let Some(policy) = &key.guardrails_policy else {
         return false;
     };
-    let guard_outcome = guardrails::apply_input(
+    let pii = guardrails::pii_plan(&settings.pii, policy);
+    let guard_outcome = Box::pin(guardrails::apply_input(
         state,
         &settings.guardrails,
+        &pii,
         policy,
         key,
         session_id,
         request_id,
         json,
         tracer,
-    )
+    ))
     .await;
     if let Some(block) = guard_outcome.blocked {
         outcome.blocked = Some(block);
@@ -395,6 +398,7 @@ async fn guard_input(
         plan.guardrails = Some(GuardrailsOutputPlan {
             policy: policy.clone(),
             settings: settings.guardrails.clone(),
+            pii,
         });
     }
     false
@@ -410,6 +414,11 @@ impl BoonEngine {
     /// Current settings snapshot (cheap `Arc` clone).
     pub fn settings(&self) -> Arc<BoonSettings> {
         self.settings.load_full()
+    }
+
+    /// The shared swap cell, for components that read settings per call.
+    pub fn settings_handle(&self) -> Arc<ArcSwap<BoonSettings>> {
+        self.settings.clone()
     }
 
     /// Replace the settings (called by the periodic refresh task).
@@ -434,9 +443,11 @@ impl BoonEngine {
             return Ok(false);
         };
         let settings = self.settings();
+        let pii = guardrails::pii_plan(&settings.pii, policy);
         let out = guardrails::apply_input(
             state,
             &settings.guardrails,
+            &pii,
             policy,
             key,
             session_id,
@@ -1530,6 +1541,7 @@ mod tests {
 
     pub(super) fn test_route() -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
+            provider: String::new(),
             description: String::new(),
             model_name: "test".to_string(),
             aliases: Vec::new(),
@@ -1592,6 +1604,8 @@ mod tests {
         policy: Option<obleth_config::CompressionPolicy>,
     ) -> obleth_config::ResolvedKey {
         let mut k = obleth_config::ResolvedKey {
+            pii_trace_profile: None,
+            genai_export: false,
             key_id: uuid::Uuid::nil(),
             tenant_id: uuid::Uuid::nil(),
             tenant_name: "t".into(),
@@ -1889,6 +1903,8 @@ mod tests {
             // Build via the redis crate's test-shaped literal is not accessible here;
             // construct the minimal key inline.
             obleth_config::ResolvedKey {
+                pii_trace_profile: None,
+                genai_export: false,
                 key_id: uuid::Uuid::nil(),
                 tenant_id: uuid::Uuid::nil(),
                 tenant_name: "t".into(),

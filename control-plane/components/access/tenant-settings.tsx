@@ -9,7 +9,7 @@ import { WeekGrid } from "@/components/access/week-grid";
 import { SelectField, Setting, Switch, TextArea, TextField } from "@/components/models/fields";
 import { clockIn, groupShare, isTimeZone, utcToZoned, zonedToUtc, type BudgetView } from "@/lib/access-model";
 import { money } from "@/lib/models-model";
-import type { Tenant } from "@/lib/obleth";
+import type { GenaiExportStatus, GuardrailsPolicy, Tenant } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 
 /** The save call that owns each field; null for fields that never save. */
@@ -19,6 +19,7 @@ export function tenantFieldSection(name: string): TenantSettingsSection | null {
   if (name === "weight") return "weight";
   if (name === "tokens_per_minute" || name === "max_in_flight") return "quota";
   if (name === "tracing_enabled") return "tracing";
+  if (name === "genai_export" || name === "pii_trace_profile") return "genai";
   if (name === "synthetic") return "synthetic";
   if (["timezone", "weekly_windows", "active_from", "active_until"].includes(name)) return "schedule";
   if (name.startsWith("budget_")) return "budget";
@@ -38,6 +39,8 @@ const LABELS: Record<string, string> = {
   tokens_per_minute: "Token rate",
   max_in_flight: "In flight",
   tracing_enabled: "Tracing",
+  genai_export: "GenAI export",
+  pii_trace_profile: "Trace scrubbing",
   synthetic: "Synthetic",
   timezone: "Time zone",
   weekly_windows: "Weekly hours",
@@ -67,6 +70,7 @@ export const SECTION_CARD: Record<TenantSettingsSection, string> = {
   guardrails: "guardrails",
   compression: "compression",
   tracing: "advanced",
+  genai: "advanced",
   synthetic: "advanced",
 };
 
@@ -103,6 +107,80 @@ function WeightField({ tenant, tenants, group }: { tenant: Tenant; tenants: Tena
         {peers.length ? ` alongside ${peers.length} other tenant${peers.length === 1 ? "" : "s"}.` : ", the only active tenant there."}
       </p>
     </Setting>
+  );
+}
+
+const SCRUB_NOTE: Record<NonNullable<GenaiExportStatus["scrub"]>, string> = {
+  off: "Off: prompts and answers leave the gateway as they are, personal data included.",
+  regex: "Regex: e-mails, phone numbers, SSNs and card numbers are replaced with [REDACTED:...] tags. Names and addresses stay.",
+  ner: "NER: after the regex pass, the scrubber service (Presidio) removes names, addresses and other entities. If it fails or is busy, the content is dropped and only metadata is sent.",
+  llm: "LLM (deprecated): after the regex pass, a model rewrites the text without personal data. If it fails or is busy, the content is dropped and only metadata is sent. It will be removed in the next release; use NER.",
+};
+
+const STRENGTH: Record<string, number> = { off: 0, regex: 1, ner: 2 };
+
+/** ADR-0002 s4: the trace profile a tenant gets, and why. */
+export function effectiveTraceLine(tenantProfile: string | null, policy: GuardrailsPolicy | null, scrub: string | null): string {
+  const trace = tenantProfile || null;
+  const base = trace ?? "gateway default";
+  const guarded = policy != null && policy.action !== "log_only" && (policy.input_scanners.includes("pii") || policy.output_scanners.includes("pii"));
+  const guard = guarded ? policy.pii_profile ?? "regex" : null;
+  const baseName = trace ?? scrub ?? "";
+  let line = `Effective trace profile: ${base}${trace ? " (set on this tenant)" : ""}.`;
+  if (guard && guard !== baseName) {
+    const g = STRENGTH[guard];
+    const b = STRENGTH[baseName];
+    if (g !== undefined && b !== undefined) {
+      if (g > b) line = `Effective trace profile: ${trace ? `${trace}+${guard}` : `${base} + ${guard}`}, strengthened by guardrails.`;
+    } else {
+      line = `Effective trace profile: ${base}, plus guardrails profile ${guard}.`;
+    }
+  }
+  return line;
+}
+
+function TraceProfileField({ tenant, status }: { tenant: Tenant; status: GenaiExportStatus }) {
+  const [value, setValue] = useState(tenant.pii_trace_profile ?? "");
+  if (!status.profiles) return null;
+  const names = [...new Set([...status.profiles, ...(tenant.pii_trace_profile ? [tenant.pii_trace_profile] : [])])];
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="w-72">
+        <SelectField
+          name="pii_trace_profile"
+          label="Trace scrubbing profile"
+          value={value}
+          onChange={setValue}
+          options={[{ value: "", label: "Inherit gateway default" }, ...names.map((n) => ({ value: n, label: n }))]}
+        />
+      </div>
+      <p className="text-xs text-muted-foreground">{effectiveTraceLine(value || null, tenant.guardrails_policy, status.scrub)}</p>
+    </div>
+  );
+}
+
+function GenaiExportNote({ status }: { status: GenaiExportStatus | null }) {
+  if (!status) return <p className="text-xs text-muted-foreground">The gateway did not say how it exports. Check OBLETH_GENAI_* on the gateway.</p>;
+  if (status.error) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        Export is off on this gateway: a GenAI setting is invalid (<span className="font-mono text-[11.5px]">{status.error}</span>). The flag is kept, but nothing is sent until the setting is fixed.
+      </p>
+    );
+  }
+  if (!status.configured || !status.scrub) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        Export is off on this gateway: <span className="font-mono text-[11.5px]">OBLETH_GENAI_OTLP_ENDPOINT</span> is not set. The flag is kept, but nothing is sent.
+      </p>
+    );
+  }
+  return (
+    <p className="text-xs text-muted-foreground">
+      Scrubbing (<span className="font-mono text-[11.5px]">OBLETH_GENAI_SCRUB={status.scrub}</span>), set for the whole gateway: {SCRUB_NOTE[status.scrub]}
+      {status.scrub === "off" && " Requests a PII guardrail redacts are still scrubbed by regex."}
+      {status.deprecated === "llm" && <b className="mt-1 block font-medium text-foreground">LLM scrubbing is deprecated and will be removed in the next release. Use NER.</b>}
+    </p>
   );
 }
 
@@ -241,6 +319,7 @@ export function TenantSettings({
   tenants,
   models,
   budget,
+  genai = null,
   onDirty,
   onSaved,
 }: {
@@ -248,6 +327,7 @@ export function TenantSettings({
   tenants: Tenant[];
   models: string[];
   budget: (BudgetView & { usedCost: number; usedTokens: number }) | null;
+  genai?: GenaiExportStatus | null;
   onDirty: (cards: string[]) => void;
   onSaved: (data: FormData) => void;
 }) {
@@ -315,7 +395,7 @@ export function TenantSettings({
       </SettingsCard>
 
       <SettingsCard id="guardrails" title="Guardrails" description="Screen its requests and responses in the gateway, for every one of its keys.">
-        <GuardrailsFields policy={tenant.guardrails_policy} models={models} />
+        <GuardrailsFields policy={tenant.guardrails_policy} models={models} piiProfiles={genai?.profiles} />
       </SettingsCard>
 
       <SettingsCard id="compression" title="Compression" description="Shrink what its requests send to the model before dispatch.">
@@ -325,6 +405,11 @@ export function TenantSettings({
       <SettingsCard id="advanced" title="Advanced">
         <Setting id="set-tracing" label="Trace requests" hint="Keep each step of every request, for the request panel's timeline." fields={["tracing_enabled"]} was={{ field: "tracing_enabled", checkbox: true }}>
           <Switch name="tracing_enabled" label="Trace requests" defaultChecked={tenant.tracing_enabled} />
+        </Setting>
+        <Setting id="set-genai-export" label="Export to observability" hint="Send each completion, prompt and answer included, as an OpenTelemetry GenAI span to the gateway's collector (Langfuse or similar). A key can opt out." fields={["genai_export", "pii_trace_profile"]} was={{ field: "genai_export", checkbox: true }}>
+          <Switch name="genai_export" label="Export completions" defaultChecked={tenant.genai_export} />
+          {genai && genai.configured && !genai.error && genai.scrub && <TraceProfileField tenant={tenant} status={genai} />}
+          <GenaiExportNote status={genai} />
         </Setting>
         <Setting id="set-synthetic" label="Synthetic traffic" hint="Benchmark and test traffic: its requests are tagged as benchmark and left out of usage and cost stats by default." fields={["synthetic"]} was={{ field: "synthetic", checkbox: true }}>
           <Switch name="synthetic" label="Synthetic traffic" defaultChecked={tenant.synthetic} />

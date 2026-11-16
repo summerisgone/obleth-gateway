@@ -26,6 +26,7 @@ export const boons = (over: Partial<BoonSettingsView> = {}): BoonSettingsView =>
   speculation_unlisted_categories_speculate: false, speculation_verify_url_template: null,
   web_search_enabled: false, web_search_tool: null, web_search_tool_description: "Search.", web_search_max_results: 5,
   web_search_max_searches_per_request: 3, web_search_timeout_ms: 15000,
+  pii: { ner: { timeout_ms: null, model_timeout_ms: 1000 }, profiles: { ru: { detector: "ner", entities: ["PERSON"], language: "ru", score_threshold: 0.5 } }, traces: null, ner_url: "http://ner.internal:5001" },
   ...over,
 }) as BoonSettingsView;
 

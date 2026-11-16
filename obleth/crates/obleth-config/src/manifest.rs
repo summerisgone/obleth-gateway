@@ -1259,6 +1259,7 @@ mod tests {
     fn route(name: &str) -> ModelRoute {
         let now = chrono::Utc::now();
         ModelRoute {
+            provider: String::new(),
             id: uuid::Uuid::new_v4(),
             model_name: name.to_string(),
             aliases: Vec::new(),

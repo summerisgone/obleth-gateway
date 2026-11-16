@@ -34,6 +34,7 @@ pub struct Metrics {
     jwks_refresh: IntCounterVec,
     knowledge_retrievals: IntCounterVec,
     auto_routes: IntCounterVec,
+    pii_detector_failures: IntCounterVec,
 }
 
 impl Metrics {
@@ -198,6 +199,14 @@ impl Metrics {
             &["model", "reason"],
         )
         .unwrap();
+        let pii_detector_failures = IntCounterVec::new(
+            Opts::new(
+                "obleth_pii_detector_failures_total",
+                "PII detector failures by lane and reason",
+            ),
+            &["lane", "reason"],
+        )
+        .unwrap();
 
         registry.register(Box::new(requests.clone())).unwrap();
         registry.register(Box::new(tokens_in.clone())).unwrap();
@@ -240,6 +249,9 @@ impl Metrics {
             .register(Box::new(knowledge_retrievals.clone()))
             .unwrap();
         registry.register(Box::new(auto_routes.clone())).unwrap();
+        registry
+            .register(Box::new(pii_detector_failures.clone()))
+            .unwrap();
 
         Metrics {
             registry,
@@ -266,7 +278,15 @@ impl Metrics {
             jwks_refresh,
             knowledge_retrievals,
             auto_routes,
+            pii_detector_failures,
         }
+    }
+
+    /// Record a PII detector failure. `lane` is `model` or `traces`.
+    pub fn record_pii_failure(&self, lane: &str, reason: &str) {
+        self.pii_detector_failures
+            .with_label_values(&[lane, reason])
+            .inc();
     }
 
     /// Record one upstream dispatch attempt outcome. `outcome` is one of
@@ -379,6 +399,10 @@ impl Metrics {
     /// when stickiness is off.
     pub fn record_auto_route(&self, model: &str, reason: &str) {
         self.auto_routes.with_label_values(&[model, reason]).inc();
+    }
+
+    pub fn registry(&self) -> &Registry {
+        &self.registry
     }
 
     pub fn encode(&self) -> String {

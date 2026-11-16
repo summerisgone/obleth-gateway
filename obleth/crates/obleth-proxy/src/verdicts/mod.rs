@@ -701,6 +701,11 @@ async fn handler_inner(
         failure: None,
         crash_fp: String::new(),
         client: client.clone(),
+        genai: None,
+        genai_collector: None,
+        genai_start_nanos: 0,
+        genai_route: Default::default(),
+        genai_tool_turns: 0,
     };
     if let Some(t) = tracer.as_mut() {
         t.set_conversation(&req_meta.session_id, req_meta.session_id_source);
@@ -2341,6 +2346,9 @@ mod model_choice_tests {
             jobs: crate::jobs::JobStore::new(store, Default::default()),
             load: None,
             crash_guard: crate::crash_guard::CrashGuard::disabled(),
+            genai: None,
+            genai_max_request_bytes: 0,
+            pii: crate::pii::PiiDetector::for_tests(),
             batches: None,
         };
         Some(Gateway { state, wal_dir })

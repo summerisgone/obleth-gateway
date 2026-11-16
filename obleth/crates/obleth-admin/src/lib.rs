@@ -148,6 +148,14 @@ pub struct AdminState {
     pub judge: Option<advice::JudgeFn>,
     /// JWT issuers the gateway accepts, from the same config as the data plane.
     pub jwt_issuers: Vec<obleth_config::JwtIssuerConfig>,
+    /// The GenAI exporter's scrub mode (`off`, `regex`, `ner`, `llm`); `None`
+    /// when the exporter is not configured (`OBLETH_GENAI_OTLP_ENDPOINT` unset).
+    pub genai_scrub: Option<String>,
+    /// `OBLETH_PII_NER_URL`; `None` when no NER service is configured.
+    pub pii_ner_url: Option<String>,
+    /// Why the GenAI exporter is off despite its settings (an invalid
+    /// `OBLETH_GENAI_*` value); `None` when it is on or simply not configured.
+    pub genai_error: Option<String>,
 }
 
 /// A boxed call into the data plane's classifier: `(prompt, available_tags)`
@@ -211,6 +219,15 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/keys/:id/disabled", put(set_key_disabled))
         .route("/api/v1/keys/:id/tenant", put(move_key))
         .route("/api/v1/keys/:id/tracing", put(set_key_tracing_handler))
+        .route(
+            "/api/v1/keys/:id/genai-export",
+            put(set_key_genai_export_handler),
+        )
+        .route(
+            "/api/v1/tenants/:id/genai-export",
+            put(set_tenant_genai_export_handler),
+        )
+        .route("/api/v1/genai-export", get(get_genai_export_status))
         .route(
             "/api/v1/keys/:id/end-user-fairshare",
             put(set_key_end_user_fairshare_handler),
@@ -459,6 +476,7 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/settings/boons",
             get(get_boon_settings).put(put_boon_settings),
         )
+        .route("/api/v1/settings/boons/pii/check", post(check_pii_ner))
         .route(
             "/api/v1/settings/knowledge",
             get(knowledge::get_knowledge_settings).put(knowledge::put_knowledge_settings),
@@ -736,6 +754,27 @@ pub struct SetDisabled {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetKeyTracing {
     pub tracing_enabled: bool,
+}
+
+/// Body of `PUT /api/v1/keys/{id}/genai-export`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetKeyGenaiExport {
+    /// `false` opts the key out; `null` inherits the tenant. `true` cannot
+    /// enable a tenant that has export off.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<bool>)]
+    pub genai_export: Option<Option<bool>>,
+}
+
+/// Body of `PUT /api/v1/tenants/{id}/genai-export`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetTenantGenaiExport {
+    pub genai_export: bool,
+    /// PII profile for this tenant's traces. Absent keeps the current value,
+    /// `null` inherits the gateway default, a string must name a known profile.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<String>)]
+    pub pii_trace_profile: Option<Option<String>>,
 }
 
 /// Body of `PUT /api/v1/keys/{id}/end-user-fairshare`.
@@ -1090,6 +1129,10 @@ pub struct CreateModel {
     /// `unknown` — undeclared, not "full precision".
     #[serde(default)]
     pub quantization: Option<String>,
+    /// Upstream provider name for GenAI export; omitted leaves it unchanged
+    /// (empty on create), `""` resets it to `openai`.
+    #[serde(default)]
+    pub provider: Option<String>,
     pub input_cost_per_token: Option<f64>,
     pub output_cost_per_token: Option<f64>,
     #[serde(default)]
@@ -1230,6 +1273,10 @@ pub struct UpdateModel {
     /// leaves the current value unchanged.
     #[serde(default)]
     pub quantization: Option<String>,
+    /// Upstream provider name for GenAI export; omitted leaves it unchanged
+    /// (empty on create), `""` resets it to `openai`.
+    #[serde(default)]
+    pub provider: Option<String>,
     pub input_cost_per_token: Option<f64>,
     pub output_cost_per_token: Option<f64>,
     #[serde(default)]
@@ -2193,6 +2240,14 @@ async fn patch_tenant_guardrails(
     headers: HeaderMap,
     Json(body): Json<SetTenantGuardrails>,
 ) -> Result<Json<Tenant>> {
+    if let Some(name) = body.policy.as_ref().and_then(|p| p.pii_profile.as_deref()) {
+        let pii = state.store.get_boon_settings().await?.unwrap_or_default().pii;
+        if pii.resolve(name).is_none() {
+            return Err(AdminError::BadRequest(format!(
+                "pii_profile: unknown profile {name:?}"
+            )));
+        }
+    }
     let tenant = state
         .store
         .update_tenant_guardrails_policy(id, body.policy)
@@ -2312,6 +2367,8 @@ pub struct ModelRouteView {
     /// routing; it is reported so clients can tell a `fp8` deployment from a
     /// `bf16` one without reading it out of the model's name.
     pub quantization: String,
+    /// Upstream provider name for GenAI export (empty = `openai`).
+    pub provider: String,
     pub input_cost_per_token: f64,
     pub output_cost_per_token: f64,
     /// Per-generated-image cost in USD (`image` models).
@@ -2604,6 +2661,7 @@ impl From<ModelRoute> for ModelRouteView {
             upstream_headers,
             model_type,
             quantization,
+            provider,
             input_cost_per_token,
             output_cost_per_token,
             cost_per_image,
@@ -2663,6 +2721,7 @@ impl From<ModelRoute> for ModelRouteView {
             upstream_header_names: obleth_config::upstream_header_names(&upstream_headers),
             model_type,
             quantization,
+            provider,
             input_cost_per_token,
             output_cost_per_token,
             cost_per_image,
@@ -3502,10 +3561,20 @@ async fn simulate_route(
     )))
 }
 
+/// `BoonSettings.pii` plus the read-only NER service address.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PiiSettingsView {
+    #[serde(flatten)]
+    pub settings: obleth_config::PiiSettings,
+    /// `OBLETH_PII_NER_URL` with any userinfo removed. Read-only; ignored on PUT.
+    pub ner_url: Option<String>,
+}
+
 /// View of the persisted model-"boons" settings, flattened per boon
 /// (vision, structured output, tool loop).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BoonSettingsView {
+    pub pii: PiiSettingsView,
     pub vision_enabled: bool,
     pub vision_fallback_model: Option<String>,
     pub vision_describe_prompt: String,
@@ -3572,6 +3641,10 @@ pub struct BoonSettingsView {
 impl BoonSettingsView {
     fn from_settings(s: &BoonSettings) -> Self {
         BoonSettingsView {
+            pii: PiiSettingsView {
+                settings: s.pii.clone(),
+                ner_url: None,
+            },
             vision_enabled: s.vision.enabled,
             vision_fallback_model: s.vision.fallback_model.clone(),
             vision_describe_prompt: s.vision.prompt().to_string(),
@@ -3637,6 +3710,9 @@ impl BoonSettingsView {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateBoonSettings {
+    /// Replaces the whole `pii` section. Absent keeps the stored one.
+    #[serde(default)]
+    pub pii: Option<obleth_config::PiiSettings>,
     #[serde(default)]
     pub vision_enabled: Option<bool>,
     /// `model_name` of the vision describer model. Empty string clears it.
@@ -3826,7 +3902,134 @@ pub struct UpdateBoonSettings {
 )]
 async fn get_boon_settings(State(state): State<AdminState>) -> Result<Json<BoonSettingsView>> {
     let settings = state.store.get_boon_settings().await?.unwrap_or_default();
-    Ok(Json(BoonSettingsView::from_settings(&settings)))
+    Ok(Json(boon_view(&state, &settings)))
+}
+
+fn boon_view(state: &AdminState, settings: &BoonSettings) -> BoonSettingsView {
+    let mut view = BoonSettingsView::from_settings(settings);
+    view.pii.ner_url = state.pii_ner_url.as_deref().map(strip_url_userinfo);
+    view
+}
+
+/// Drop `user:pass@` from a URL's authority without otherwise rewriting it.
+fn strip_url_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        return url.to_string();
+    };
+    let rest = &url[scheme_end..];
+    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_len].rfind('@') {
+        Some(at) => format!("{}{}", &url[..scheme_end], &rest[at + 1..]),
+        None => url.to_string(),
+    }
+}
+
+/// Reject a `pii` section the gateway could not run: user profiles shadowing
+/// built-ins, NER with no service configured, a default trace profile that
+/// does not exist.
+fn validate_pii_settings(
+    pii: &obleth_config::PiiSettings,
+    ner_url: Option<&str>,
+) -> std::result::Result<(), String> {
+    for (name, profile) in &pii.profiles {
+        if matches!(name.as_str(), "off" | "regex" | "ner") {
+            return Err(format!("pii.profiles: {name:?} is a built-in profile name"));
+        }
+        if profile.detector == obleth_config::PiiDetectorKind::Ner && ner_url.is_none() {
+            return Err(format!(
+                "pii.profiles.{name}: detector ner needs OBLETH_PII_NER_URL, which is not set"
+            ));
+        }
+    }
+    if let Some(traces) = pii.traces.as_deref() {
+        if pii.resolve(traces).is_none() {
+            return Err(format!("pii.traces: unknown profile {traces:?}"));
+        }
+        if traces == "ner" && ner_url.is_none() {
+            return Err("pii.traces: ner needs OBLETH_PII_NER_URL, which is not set".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a `pii` section that drops a profile some tenant still names.
+async fn check_pii_references(
+    state: &AdminState,
+    pii: &obleth_config::PiiSettings,
+) -> Result<()> {
+    for t in state.store.list_tenants().await? {
+        let refs = [
+            t.pii_trace_profile.as_deref(),
+            t.guardrails_policy
+                .as_ref()
+                .and_then(|p| p.pii_profile.as_deref()),
+        ];
+        for name in refs.into_iter().flatten() {
+            if pii.resolve(name).is_none() {
+                return Err(AdminError::BadRequest(format!(
+                    "pii.profiles: profile {name:?} is still used by tenant {:?}",
+                    t.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Result of probing the NER service.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PiiCheckResult {
+    pub ok: bool,
+    pub latency_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/settings/boons/pii/check", tag = "settings",
+    responses((status = 200, body = PiiCheckResult))
+)]
+async fn check_pii_ner(State(state): State<AdminState>) -> Result<Json<PiiCheckResult>> {
+    let Some(url) = state.pii_ner_url.as_deref() else {
+        return Ok(Json(PiiCheckResult {
+            ok: false,
+            latency_ms: None,
+            error: Some("OBLETH_PII_NER_URL is not set".to_string()),
+        }));
+    };
+    let timeout_ms = state
+        .store
+        .get_boon_settings()
+        .await?
+        .unwrap_or_default()
+        .pii
+        .ner
+        .timeout_ms
+        .unwrap_or(5000);
+    let started = std::time::Instant::now();
+    let reply = reqwest::Client::new()
+        .post(url)
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .json(&serde_json::json!({ "texts": ["obleth check"] }))
+        .send()
+        .await;
+    let latency = started.elapsed().as_millis() as u64;
+    let outcome = match reply {
+        Err(e) => Err(if e.is_timeout() {
+            format!("timed out after {timeout_ms} ms")
+        } else {
+            "request failed".to_string()
+        }),
+        Ok(r) if !r.status().is_success() => Err(format!("service replied {}", r.status())),
+        Ok(r) => match r.json::<serde_json::Value>().await {
+            Ok(v) if v.get("texts").and_then(|t| t.as_array()).map(Vec::len) == Some(1) => Ok(()),
+            _ => Err("reply is not {\"texts\": [one text]}".to_string()),
+        },
+    };
+    Ok(Json(PiiCheckResult {
+        ok: outcome.is_ok(),
+        latency_ms: Some(latency),
+        error: outcome.err(),
+    }))
 }
 
 /// Trim, drop blanks, de-duplicate order-stably, and fall back to the built-in
@@ -4104,6 +4307,7 @@ async fn put_boon_settings(
             ),
         },
         guardrails: existing.guardrails.clone(),
+        pii: body.pii.clone().unwrap_or_else(|| existing.pii.clone()),
         compression: obleth_config::CompressionBoonSettings {
             enabled: body
                 .compression_enabled
@@ -4254,6 +4458,11 @@ async fn put_boon_settings(
             .await
             .map_err(|e| AdminError::BadRequest(format!("speculation_verify_url_template: {e}")))?;
     }
+    if let Some(pii) = body.pii.as_ref() {
+        validate_pii_settings(pii, state.pii_ner_url.as_deref())
+            .map_err(AdminError::BadRequest)?;
+        check_pii_references(&state, pii).await?;
+    }
     state.store.put_boon_settings(&settings).await?;
     state
         .store
@@ -4296,10 +4505,12 @@ async fn put_boon_settings(
                 "web_search_max_results": settings.web_search.max_results,
                 "web_search_max_searches_per_request": settings.web_search.max_searches_per_request,
                 "web_search_timeout_ms": settings.web_search.timeout_ms,
+                "pii_profiles": settings.pii.profiles.keys().collect::<Vec<_>>(),
+                "pii_traces": settings.pii.traces,
             }),
         )
         .await?;
-    Ok(Json(BoonSettingsView::from_settings(&settings)))
+    Ok(Json(boon_view(&state, &settings)))
 }
 
 /// View of the persisted energy-accounting settings.
@@ -5429,6 +5640,112 @@ async fn set_tenant_tracing_handler(
             "tenant",
             &id.to_string(),
             serde_json::json!({ "tracing_enabled": body.tracing_enabled }),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Whether the gateway exports GenAI spans at all, and how it scrubs them.
+#[derive(Debug, Serialize)]
+pub struct GenaiExportStatus {
+    pub configured: bool,
+    pub scrub: Option<String>,
+    /// Set when an invalid `OBLETH_GENAI_*` value turned the export off.
+    pub error: Option<String>,
+    /// Names a tenant may pick as its trace profile, built-ins included.
+    pub profiles: Vec<String>,
+    /// Whether `OBLETH_PII_NER_URL` is set.
+    pub ner_configured: bool,
+    /// `"llm"` while the deprecated `OBLETH_GENAI_SCRUB=llm` is in use.
+    pub deprecated: Option<String>,
+}
+
+async fn get_genai_export_status(
+    State(state): State<AdminState>,
+) -> Result<Json<GenaiExportStatus>> {
+    let pii = state.store.get_boon_settings().await?.unwrap_or_default().pii;
+    let mut profiles: Vec<String> = ["off", "regex", "ner"]
+        .into_iter()
+        .map(String::from)
+        .chain(pii.profiles.keys().cloned())
+        .collect();
+    profiles.sort();
+    profiles.dedup();
+    Ok(Json(GenaiExportStatus {
+        configured: state.genai_scrub.is_some(),
+        scrub: state.genai_scrub.clone(),
+        error: state.genai_error.clone(),
+        profiles,
+        ner_configured: state.pii_ner_url.is_some(),
+        deprecated: (state.genai_scrub.as_deref() == Some("llm")).then(|| "llm".to_string()),
+    }))
+}
+
+async fn set_tenant_genai_export_handler(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetTenantGenaiExport>,
+) -> Result<StatusCode> {
+    if let Some(Some(name)) = body.pii_trace_profile.as_ref() {
+        let pii = state.store.get_boon_settings().await?.unwrap_or_default().pii;
+        if pii.resolve(name).is_none() {
+            return Err(AdminError::BadRequest(format!(
+                "pii_trace_profile: unknown profile {name:?}"
+            )));
+        }
+    }
+    state
+        .store
+        .set_tenant_genai_export(id, body.genai_export)
+        .await?;
+    if let Some(profile) = body.pii_trace_profile.as_ref() {
+        state
+            .store
+            .set_tenant_pii_trace_profile(id, profile.as_deref())
+            .await?;
+    }
+    sync_tenant_keys(&state, id).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            if body.genai_export {
+                "enable_tenant_genai_export"
+            } else {
+                "disable_tenant_genai_export"
+            },
+            "tenant",
+            &id.to_string(),
+            serde_json::json!({
+                "genai_export": body.genai_export,
+                "pii_trace_profile": body.pii_trace_profile,
+            }),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_key_genai_export_handler(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetKeyGenaiExport>,
+) -> Result<StatusCode> {
+    // Absent and explicit null both inherit the tenant.
+    let on = body.genai_export.flatten();
+    state.store.set_key_genai_export(id, on).await?;
+    if let Some(resolved) = state.store.resolved_key_by_id(id).await? {
+        sync_tenant_keys(&state, resolved.tenant_id).await?;
+    }
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_key_genai_export",
+            "api_key",
+            &id.to_string(),
+            serde_json::json!({ "genai_export": on }),
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -8053,6 +8370,11 @@ async fn create_model(
             .set_model_session_affinity(model.id, &session_affinity)
             .await?
     };
+    // Set the same way, before the first publish.
+    let model = match body.provider.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => state.store.set_model_provider(model.id, p).await?,
+        _ => model,
+    };
     // Staged the same way, before the first publish.
     let model = if initial_status == obleth_config::ModelStatus::Staged {
         let lifecycle = obleth_config::ModelLifecycle {
@@ -8266,6 +8588,10 @@ async fn update_model(
                 .set_model_session_affinity(id, &affinity)
                 .await?
         }
+        _ => model,
+    };
+    let model = match body.provider.as_deref() {
+        Some(p) if p.trim() != model.provider => state.store.set_model_provider(id, p).await?,
         _ => model,
     };
     if model_health::probe_config_changed(&existing, &model) {
@@ -10340,6 +10666,7 @@ fn resolved_model_of(
     knowledge_collections: Vec<Uuid>,
 ) -> ResolvedModel {
     ResolvedModel {
+        provider: model.provider.clone(),
         model_name: model.model_name.clone(),
         aliases: model.aliases.clone(),
         lifecycle: model.lifecycle.clone(),
@@ -10706,7 +11033,25 @@ mod tests {
         /// [`test_admin_app`] against an explicit Redis URL (e.g. a
         /// restricted ACL user, to inject cache failures).
         pub(super) async fn test_admin_app_on(redis_url: &str) -> Option<TestApp> {
-            test_admin_app_with(redis_url, capacity_discovery::CapacityDiscovery::disabled()).await
+            test_admin_app_with(
+                redis_url,
+                capacity_discovery::CapacityDiscovery::disabled(),
+                |_| {},
+            )
+            .await
+        }
+
+        /// [`test_admin_app`] with the state adjusted before the router is built.
+        pub(super) async fn test_admin_app_tweaked(
+            tweak: impl FnOnce(&mut AdminState),
+        ) -> Option<TestApp> {
+            let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
+            test_admin_app_with(
+                &redis_url,
+                capacity_discovery::CapacityDiscovery::disabled(),
+                tweak,
+            )
+            .await
         }
 
         /// [`test_admin_app`] with the gateway's capacity discovery settings.
@@ -10717,6 +11062,7 @@ mod tests {
             test_admin_app_with(
                 &redis_url,
                 capacity_discovery::CapacityDiscovery::new(discovery),
+                |_| {},
             )
             .await
         }
@@ -10726,12 +11072,13 @@ mod tests {
             discovery: capacity_discovery::CapacityDiscovery,
         ) -> Option<TestApp> {
             let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
-            test_admin_app_with(&redis_url, discovery).await
+            test_admin_app_with(&redis_url, discovery, |_| {}).await
         }
 
         async fn test_admin_app_with(
             redis_url: &str,
             capacity_discovery: capacity_discovery::CapacityDiscovery,
+            tweak: impl FnOnce(&mut AdminState),
         ) -> Option<TestApp> {
             let db_url = test_db_url()?;
 
@@ -10751,7 +11098,7 @@ mod tests {
             let fairshare_history = Arc::new(FairshareHistory::new(1800));
             let http = reqwest::Client::new();
             let alerts = AlertDispatcher::new(http.clone(), AlertSettings::default());
-            let state = AdminState {
+            let mut state = AdminState {
                 store: store.clone(),
                 redis,
                 capacity,
@@ -10784,7 +11131,11 @@ mod tests {
                 ssrf: ssrf::SsrfPolicy::from_env(),
                 alerts,
                 local_cache_tx: None,
+                genai_scrub: None,
+                pii_ner_url: None,
+                genai_error: None,
             };
+            tweak(&mut state);
             Some(TestApp {
                 app: router(state),
                 store,
@@ -10823,7 +11174,7 @@ mod tests {
 
     use harness::{
         fixture_model, send, simulate_request, test_admin_app, test_admin_app_discovering,
-        test_admin_app_on, test_admin_app_with_discovery, TEST_ADMIN_TOKEN,
+        test_admin_app_on, test_admin_app_tweaked, test_admin_app_with_discovery, TEST_ADMIN_TOKEN,
     };
 
     fn json_request(
@@ -11704,6 +12055,231 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    fn authed(method: &str, path: &str, body: serde_json::Value) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("build request")
+    }
+
+    fn regex_profile() -> serde_json::Value {
+        serde_json::json!({ "detector": "regex", "entities": [], "language": null, "score_threshold": null })
+    }
+
+    async fn boons_pii_put(t: &harness::TestApp, pii: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        send(&t.app, authed("PUT", "/api/v1/settings/boons", serde_json::json!({ "pii": pii }))).await
+    }
+
+    async fn pii_test_tenant(t: &harness::TestApp) -> (Uuid, String) {
+        let name = format!("t-{}", Uuid::new_v4());
+        let tenant = t.store.create_tenant(&name, 100, 0, None, None).await.expect("tenant");
+        (tenant.id, name)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn put_boons_ner_profile_without_url_400() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let restore = t.store.get_boon_settings().await.expect("read").unwrap_or_default();
+        let (s1, b1) = boons_pii_put(&t, serde_json::json!({
+            "profiles": { "ru": { "detector": "ner", "entities": [], "language": "ru" } }
+        })).await;
+        let (s2, b2) = boons_pii_put(&t, serde_json::json!({ "traces": "ner" })).await;
+        let _ = t.store.put_boon_settings(&restore).await;
+        assert_eq!(s1, StatusCode::BAD_REQUEST, "{b1}");
+        assert_eq!(s2, StatusCode::BAD_REQUEST, "{b2}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn put_boons_ner_profile_with_url_ok_and_url_is_stripped() {
+        let Some(t) = test_admin_app_tweaked(|s| {
+            s.pii_ner_url = Some("http://user:secret@ner.internal:5001/scrub".to_string());
+        })
+        .await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let restore = t.store.get_boon_settings().await.expect("read").unwrap_or_default();
+        let (status, body) = boons_pii_put(&t, serde_json::json!({
+            "profiles": { "ru": { "detector": "ner", "entities": [], "language": "ru" } },
+            "traces": "ru"
+        })).await;
+        let (_, get) = send(&t.app, authed("GET", "/api/v1/settings/boons", serde_json::json!(null))).await;
+        let _ = t.store.put_boon_settings(&restore).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["pii"]["ner_url"], "http://ner.internal:5001/scrub");
+        assert_eq!(get["pii"]["traces"], "ru");
+        assert_eq!(get["pii"]["profiles"]["ru"]["language"], "ru");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn put_boons_unknown_traces_400() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let restore = t.store.get_boon_settings().await.expect("read").unwrap_or_default();
+        let (status, body) = boons_pii_put(&t, serde_json::json!({ "traces": "nope" })).await;
+        let _ = t.store.put_boon_settings(&restore).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn put_boons_builtin_name_400() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let restore = t.store.get_boon_settings().await.expect("read").unwrap_or_default();
+        let mut results = Vec::new();
+        for name in ["off", "regex", "ner"] {
+            results.push(boons_pii_put(&t, serde_json::json!({ "profiles": { name: regex_profile() } })).await.0);
+        }
+        let _ = t.store.put_boon_settings(&restore).await;
+        assert_eq!(results, vec![StatusCode::BAD_REQUEST; 3]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn put_boons_delete_used_profile_400() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let restore = t.store.get_boon_settings().await.expect("read").unwrap_or_default();
+        let (trace_tenant, trace_name) = pii_test_tenant(&t).await;
+        let (guard_tenant, guard_name) = pii_test_tenant(&t).await;
+
+        let (s0, b0) = boons_pii_put(&t, serde_json::json!({ "profiles": { "ru": regex_profile() } })).await;
+        t.store.set_tenant_pii_trace_profile(trace_tenant, Some("ru")).await.expect("trace ref");
+        let (sa, ba) = boons_pii_put(&t, serde_json::json!({ "profiles": {} })).await;
+        t.store.set_tenant_pii_trace_profile(trace_tenant, None).await.expect("clear ref");
+        let (sp, bp) = send(&t.app, authed("PATCH", &format!("/api/v1/tenants/{guard_tenant}/guardrails"), serde_json::json!({
+            "policy": { "action": "redact", "input_scanners": ["pii"], "pii_profile": "ru" }
+        }))).await;
+        let (sb, bb) = boons_pii_put(&t, serde_json::json!({ "profiles": {} })).await;
+        let (sc, bc) = boons_pii_put(&t, serde_json::json!({ "profiles": { "ru": regex_profile() } })).await;
+
+        let _ = t.store.put_boon_settings(&restore).await;
+        let _ = t.store.delete_tenant(trace_tenant).await;
+        let _ = t.store.delete_tenant(guard_tenant).await;
+
+        assert_eq!(s0, StatusCode::OK, "{b0}");
+        assert_eq!(sa, StatusCode::BAD_REQUEST, "{ba}");
+        assert!(ba.to_string().contains(&trace_name), "{ba}");
+        assert_eq!(sp, StatusCode::OK, "{bp}");
+        assert_eq!(sb, StatusCode::BAD_REQUEST, "{bb}");
+        assert!(bb.to_string().contains(&guard_name), "{bb}");
+        assert_eq!(sc, StatusCode::OK, "{bc}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn patch_guardrails_unknown_pii_profile_400() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let (id, _) = pii_test_tenant(&t).await;
+        let (status, body) = send(&t.app, authed("PATCH", &format!("/api/v1/tenants/{id}/guardrails"), serde_json::json!({
+            "policy": { "action": "redact", "input_scanners": ["pii"], "pii_profile": "nope" }
+        }))).await;
+        let _ = t.store.delete_tenant(id).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn genai_export_put_absent_keeps_null_clears() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let (id, _) = pii_test_tenant(&t).await;
+        let path = format!("/api/v1/tenants/{id}/genai-export");
+        let (s1, _) = send(&t.app, authed("PUT", &path, serde_json::json!({ "genai_export": true, "pii_trace_profile": "off" }))).await;
+        let p1 = t.store.get_tenant(id).await.expect("get").pii_trace_profile;
+        let (s2, _) = send(&t.app, authed("PUT", &path, serde_json::json!({ "genai_export": true }))).await;
+        let p2 = t.store.get_tenant(id).await.expect("get").pii_trace_profile;
+        let (s3, b3) = send(&t.app, authed("PUT", &path, serde_json::json!({ "genai_export": true, "pii_trace_profile": "nope" }))).await;
+        let p3 = t.store.get_tenant(id).await.expect("get").pii_trace_profile;
+        let (s4, _) = send(&t.app, authed("PUT", &path, serde_json::json!({ "genai_export": true, "pii_trace_profile": null }))).await;
+        let p4 = t.store.get_tenant(id).await.expect("get").pii_trace_profile;
+        let _ = t.store.delete_tenant(id).await;
+        assert_eq!((s1, s2, s4), (StatusCode::NO_CONTENT, StatusCode::NO_CONTENT, StatusCode::NO_CONTENT));
+        assert_eq!(p1.as_deref(), Some("off"));
+        assert_eq!(p2.as_deref(), Some("off"));
+        assert_eq!(s3, StatusCode::BAD_REQUEST, "{b3}");
+        assert_eq!(p3.as_deref(), Some("off"));
+        assert_eq!(p4, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn pii_check_reports_error_without_url() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let (status, body) = send(&t.app, authed("POST", "/api/v1/settings/boons/pii/check", serde_json::json!({}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, serde_json::json!({ "ok": false, "latency_ms": null, "error": "OBLETH_PII_NER_URL is not set" }));
+        let unauth = axum::http::Request::post("/api/v1/settings/boons/pii/check")
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        assert_eq!(send(&t.app, unauth).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn genai_export_status_reports_profiles() {
+        let Some(t) = test_admin_app_tweaked(|s| {
+            s.genai_scrub = Some("llm".to_string());
+            s.pii_ner_url = Some("http://ner".to_string());
+        })
+        .await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let restore = t.store.get_boon_settings().await.expect("read").unwrap_or_default();
+        let (put, pb) = boons_pii_put(&t, serde_json::json!({ "profiles": { "ru": regex_profile() } })).await;
+        let (status, body) = send(&t.app, authed("GET", "/api/v1/genai-export", serde_json::json!(null))).await;
+        let _ = t.store.put_boon_settings(&restore).await;
+        assert_eq!(put, StatusCode::OK, "{pb}");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, serde_json::json!({
+            "configured": true, "scrub": "llm", "error": null,
+            "profiles": ["ner", "off", "regex", "ru"], "ner_configured": true, "deprecated": "llm"
+        }));
+    }
+
+    #[test]
+    fn strip_url_userinfo_removes_credentials_only() {
+        assert_eq!(strip_url_userinfo("http://u:p@h:1/a@b"), "http://h:1/a@b");
+        assert_eq!(strip_url_userinfo("http://h:1/x"), "http://h:1/x");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn genai_export_status_reports_unconfigured() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let req = axum::http::Request::get("/api/v1/genai-export")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (status, body) = send(&t.app, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "configured": false, "scrub": null, "error": null,
+                "profiles": ["ner", "off", "regex"], "ner_configured": false, "deprecated": null
+            })
+        );
     }
 
     /// The whole point of the endpoint: a full routing verdict with no upstream
@@ -14246,6 +14822,7 @@ mod tests {
     fn fixture_model_route(name: &str) -> ModelRoute {
         let now = chrono::Utc::now();
         ModelRoute {
+            provider: String::new(),
             id: Uuid::new_v4(),
             model_name: name.to_string(),
             aliases: Vec::new(),

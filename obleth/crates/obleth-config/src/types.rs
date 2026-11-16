@@ -145,6 +145,13 @@ pub struct Tenant {
     /// exclude.
     #[serde(default)]
     pub synthetic: bool,
+    /// Whether this tenant's completions are exported as GenAI spans (a key
+    /// can only opt out).
+    #[serde(default)]
+    pub genai_export: bool,
+    /// Tenant override of the trace PII profile. `None` = inherit from gateway.
+    #[serde(default)]
+    pub pii_trace_profile: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -371,6 +378,13 @@ pub struct ResolvedKey {
     /// payloads for replay and debugging.
     #[serde(default)]
     pub tracing_enabled: bool,
+    /// Whether completions are exported over OTLP as GenAI spans: the tenant
+    /// flag AND NOT an explicit key-level `false` (resolved in the store).
+    #[serde(default)]
+    pub genai_export: bool,
+    /// Tenant override of the trace PII profile. `None` = inherit from gateway.
+    #[serde(default)]
+    pub pii_trace_profile: Option<String>,
     /// Per-tenant content policy, if configured. `None` means no guardrails.
     #[serde(default)]
     pub guardrails_policy: Option<GuardrailsPolicy>,
@@ -478,6 +492,10 @@ pub struct ModelRoute {
     /// `bf16` one without reading it out of the model's name.
     #[serde(default = "default_quantization")]
     pub quantization: String,
+    /// Upstream provider name for GenAI export (`gen_ai.provider.name`);
+    /// empty means `openai`. `#[serde(default)]` keeps older payloads readable.
+    #[serde(default)]
+    pub provider: String,
     pub input_cost_per_token: f64,
     pub output_cost_per_token: f64,
     /// Per-generated-image cost in USD (`image` models).
@@ -745,6 +763,10 @@ pub struct ResolvedModel {
     /// payloads deserializable as `unknown`.
     #[serde(default = "default_quantization")]
     pub quantization: String,
+    /// Upstream provider name for GenAI export (`gen_ai.provider.name`);
+    /// empty means `openai`. `#[serde(default)]` keeps older payloads readable.
+    #[serde(default)]
+    pub provider: String,
     pub admission_weight: i64,
     pub max_in_flight: Option<usize>,
     /// How the pool size is decided (see [`ModelRoute::capacity_mode`]). The
@@ -2727,6 +2749,9 @@ pub struct BoonSettings {
     /// chat model can search the web through a registered `search` route.
     #[serde(default)]
     pub web_search: WebSearchBoonSettings,
+    /// PII detection: NER timeouts, named profiles and the trace default.
+    #[serde(default)]
+    pub pii: PiiSettings,
 }
 
 /// Configuration for the vision boon (image-to-text relay).
@@ -3545,6 +3570,9 @@ pub struct GuardrailsPolicy {
     /// When true, scanner errors pass through unchanged.
     #[serde(default = "default_true")]
     pub fail_open: bool,
+    /// Name of the PII profile used by the `pii` scanner. `None` = `regex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pii_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
@@ -3553,6 +3581,188 @@ pub enum GuardrailsAction {
     Block,
     Redact,
     LogOnly,
+}
+
+/// PII detector backend, ordered by strength: `off < regex < ner`.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PiiDetectorKind {
+    Off,
+    Regex,
+    Ner,
+}
+
+impl PiiDetectorKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PiiDetectorKind::Off => "off",
+            PiiDetectorKind::Regex => "regex",
+            PiiDetectorKind::Ner => "ner",
+        }
+    }
+}
+
+/// What to look for and with which detector.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct PiiProfile {
+    pub detector: PiiDetectorKind,
+    /// Entity types for the NER service. Empty = everything the service knows.
+    #[serde(default)]
+    pub entities: Vec<String>,
+    /// Language for the NER service. `None` = the service default.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Confidence threshold. `None` = the service default.
+    #[serde(default)]
+    pub score_threshold: Option<f64>,
+}
+
+impl PiiProfile {
+    pub fn builtin(detector: PiiDetectorKind) -> Self {
+        PiiProfile {
+            detector,
+            entities: Vec::new(),
+            language: None,
+            score_threshold: None,
+        }
+    }
+
+    /// Union of `self` (trace profile) and `guard`: stronger detector, merged
+    /// entities (empty = all), settings from the stronger side, tie -> `self`.
+    pub fn union(&self, guard: &PiiProfile) -> PiiProfile {
+        let detector = self.detector.max(guard.detector);
+        let pick = if guard.detector > self.detector { guard } else { self };
+        let all = |p: &PiiProfile| p.detector != PiiDetectorKind::Off && p.entities.is_empty();
+        let entities = if all(self) || all(guard) {
+            Vec::new()
+        } else {
+            let mut e: Vec<String> = [self, guard]
+                .iter()
+                .filter(|p| p.detector != PiiDetectorKind::Off)
+                .flat_map(|p| p.entities.iter().cloned())
+                .collect();
+            e.sort();
+            e.dedup();
+            e
+        };
+        PiiProfile {
+            detector,
+            entities,
+            language: pick.language.clone(),
+            score_threshold: pick.score_threshold,
+        }
+    }
+}
+
+fn default_pii_model_timeout_ms() -> u64 {
+    1000
+}
+
+/// NER service budgets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct PiiNerSettings {
+    /// Timeout for the trace lane. `None` = env, then 5000.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Timeout for the model-path lane.
+    #[serde(default = "default_pii_model_timeout_ms")]
+    pub model_timeout_ms: u64,
+}
+
+impl Default for PiiNerSettings {
+    fn default() -> Self {
+        PiiNerSettings {
+            timeout_ms: None,
+            model_timeout_ms: default_pii_model_timeout_ms(),
+        }
+    }
+}
+
+/// Gateway-wide PII policy: budgets, named profiles, trace default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, ToSchema)]
+pub struct PiiSettings {
+    #[serde(default)]
+    pub ner: PiiNerSettings,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, PiiProfile>,
+    /// Default trace profile name. `None` = env, then `regex`.
+    #[serde(default)]
+    pub traces: Option<String>,
+}
+
+impl PiiSettings {
+    /// Built-in `off` / `regex` / `ner` always resolve and win over user names.
+    pub fn resolve(&self, name: &str) -> Option<PiiProfile> {
+        match name {
+            "off" => Some(PiiProfile::builtin(PiiDetectorKind::Off)),
+            "regex" => Some(PiiProfile::builtin(PiiDetectorKind::Regex)),
+            "ner" => Some(PiiProfile::builtin(PiiDetectorKind::Ner)),
+            _ => self.profiles.get(name).cloned(),
+        }
+    }
+}
+
+/// The profile a tenant's traces are scrubbed with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceProfile {
+    pub name: String,
+    pub profile: Option<PiiProfile>,
+    pub strengthened: bool,
+}
+
+/// Trace profile for a request: tenant, `pii.traces`, env default, `regex`,
+/// strengthened by the guardrails profile when the policy scans PII and acts.
+pub fn effective_trace_profile(
+    pii: &PiiSettings,
+    tenant: Option<&str>,
+    env_default: &str,
+    policy: Option<&GuardrailsPolicy>,
+) -> TraceProfile {
+    let name = tenant
+        .or(pii.traces.as_deref())
+        .or(Some(env_default).filter(|s| !s.is_empty()))
+        .unwrap_or("regex");
+    let base = if name == "llm" {
+        Some(PiiProfile::builtin(PiiDetectorKind::Regex))
+    } else {
+        pii.resolve(name)
+    };
+    let Some(base) = base else {
+        return TraceProfile {
+            name: name.to_string(),
+            profile: None,
+            strengthened: false,
+        };
+    };
+    let guarded = policy.filter(|p| {
+        p.action != GuardrailsAction::LogOnly
+            && p.input_scanners
+                .iter()
+                .chain(p.output_scanners.iter())
+                .any(|s| s == "pii")
+    });
+    if let Some(p) = guarded {
+        let guard_name = p.pii_profile.as_deref().unwrap_or("regex");
+        // An unresolved guard profile still floors the trace at builtin regex.
+        let guard = pii
+            .resolve(guard_name)
+            .unwrap_or_else(|| PiiProfile::builtin(PiiDetectorKind::Regex));
+        let merged = base.union(&guard);
+        if merged != base {
+            return TraceProfile {
+                name: format!("{name}+{guard_name}"),
+                profile: Some(merged),
+                strengthened: true,
+            };
+        }
+    }
+    TraceProfile {
+        name: name.to_string(),
+        profile: Some(base),
+        strengthened: false,
+    }
 }
 
 /// Per-tenant compression policy. Stored as JSONB on `tenants.compression_policy`.
@@ -4646,6 +4856,7 @@ mod tests {
     #[test]
     fn resolved_key_carries_guardrails_policy() {
         let policy = GuardrailsPolicy {
+            pii_profile: None,
             action: GuardrailsAction::Block,
             input_scanners: vec!["prompt_injection".into()],
             output_scanners: vec![],
@@ -5453,6 +5664,7 @@ mod tests {
 
     fn resolved_fixture() -> ResolvedModel {
         ResolvedModel {
+            provider: String::new(),
             description: String::new(),
             model_name: "glm-5-3".into(),
             aliases: vec!["glm-5-3-fp8".into(), "glm-5-3-mxfp4".into()],
@@ -5517,5 +5729,157 @@ mod tests {
             serde_json::from_str(r#"{"classifier_enabled":false}"#).unwrap();
         assert_eq!(v.messages_default_model, None);
         assert_eq!(v.verdicts_default_model, None);
+    }
+
+    #[test]
+    fn provider_defaults_empty() {
+        let mut v = serde_json::to_value(resolved_fixture()).unwrap();
+        v.as_object_mut().unwrap().remove("provider");
+        let m: ResolvedModel = serde_json::from_value(v).unwrap();
+        assert_eq!(m.provider, "");
+    }
+
+    fn pii_prof(d: PiiDetectorKind, ents: &[&str], lang: Option<&str>) -> PiiProfile {
+        PiiProfile {
+            detector: d,
+            entities: ents.iter().map(|e| e.to_string()).collect(),
+            language: lang.map(String::from),
+            score_threshold: None,
+        }
+    }
+
+    fn pii_policy(
+        action: GuardrailsAction,
+        input: &[&str],
+        output: &[&str],
+    ) -> GuardrailsPolicy {
+        GuardrailsPolicy {
+            action,
+            input_scanners: input.iter().map(|s| s.to_string()).collect(),
+            output_scanners: output.iter().map(|s| s.to_string()).collect(),
+            guard_model: None,
+            ban_keywords: vec![],
+            fail_open: true,
+            pii_profile: None,
+        }
+    }
+
+    #[test]
+    fn union_merges_entities_and_takes_stronger_language() {
+        use PiiDetectorKind::*;
+        let u = pii_prof(Regex, &["EMAIL"], None).union(&pii_prof(Ner, &["PERSON"], Some("ru")));
+        assert_eq!(u, pii_prof(Ner, &["EMAIL", "PERSON"], Some("ru")));
+    }
+
+    #[test]
+    fn union_empty_entities_absorbs() {
+        use PiiDetectorKind::*;
+        let u = pii_prof(Ner, &[], Some("en")).union(&pii_prof(Regex, &["EMAIL"], None));
+        assert_eq!(u, pii_prof(Ner, &[], Some("en")));
+        let u = pii_prof(Regex, &["EMAIL"], None).union(&pii_prof(Ner, &[], None));
+        assert!(u.entities.is_empty());
+        let u = pii_prof(Off, &[], None).union(&pii_prof(Regex, &["EMAIL"], None));
+        assert_eq!(u.entities, vec!["EMAIL".to_string()]);
+    }
+
+    #[test]
+    fn union_tie_keeps_trace_language() {
+        use PiiDetectorKind::*;
+        let u = pii_prof(Regex, &[], Some("en")).union(&pii_prof(Regex, &[], Some("ru")));
+        assert_eq!(u, pii_prof(Regex, &[], Some("en")));
+    }
+
+    #[test]
+    fn resolve_builtins_and_user_profiles() {
+        let mut s = PiiSettings::default();
+        assert_eq!(
+            s.resolve("ner"),
+            Some(pii_prof(PiiDetectorKind::Ner, &[], None))
+        );
+        assert_eq!(s.resolve("nope"), None);
+        s.profiles
+            .insert("ru".into(), pii_prof(PiiDetectorKind::Ner, &[], Some("ru")));
+        assert_eq!(s.resolve("ru").unwrap().language.as_deref(), Some("ru"));
+    }
+
+    #[test]
+    fn effective_default_is_regex() {
+        let t = effective_trace_profile(&PiiSettings::default(), None, "regex", None);
+        assert_eq!(t.name, "regex");
+        assert_eq!(t.profile, Some(pii_prof(PiiDetectorKind::Regex, &[], None)));
+        assert!(!t.strengthened);
+    }
+
+    #[test]
+    fn effective_guardrails_strengthen_tenant_off() {
+        let pii = PiiSettings {
+            traces: Some("ner".into()),
+            ..Default::default()
+        };
+        let p = pii_policy(GuardrailsAction::Redact, &["pii"], &[]);
+        let t = effective_trace_profile(&pii, Some("off"), "regex", Some(&p));
+        assert_eq!(t.name, "off+regex");
+        assert_eq!(t.profile, Some(pii_prof(PiiDetectorKind::Regex, &[], None)));
+        assert!(t.strengthened);
+    }
+
+    #[test]
+    fn effective_unknown_tenant_profile_is_none() {
+        let t = effective_trace_profile(&PiiSettings::default(), Some("gone"), "regex", None);
+        assert_eq!(t.name, "gone");
+        assert!(t.profile.is_none());
+        assert!(!t.strengthened);
+    }
+
+    #[test]
+    fn unresolved_guard_profile_floors_trace_at_regex() {
+        let mut p = pii_policy(GuardrailsAction::Redact, &["pii"], &[]);
+        p.pii_profile = Some("missing".into());
+        let t = effective_trace_profile(&PiiSettings::default(), Some("off"), "regex", Some(&p));
+        assert_eq!(t.name, "off+missing");
+        assert_eq!(t.profile, Some(pii_prof(PiiDetectorKind::Regex, &[], None)));
+        assert!(t.strengthened);
+    }
+
+    #[test]
+    fn log_only_policy_does_not_strengthen() {
+        let p = pii_policy(GuardrailsAction::LogOnly, &["pii"], &[]);
+        let t = effective_trace_profile(&PiiSettings::default(), Some("off"), "regex", Some(&p));
+        assert_eq!(t.name, "off");
+        assert!(!t.strengthened);
+    }
+
+    #[test]
+    fn policy_without_pii_scanner_does_not_strengthen() {
+        let p = pii_policy(GuardrailsAction::Block, &["ban_keywords"], &[]);
+        let t = effective_trace_profile(&PiiSettings::default(), Some("off"), "regex", Some(&p));
+        assert!(!t.strengthened);
+        let p = pii_policy(GuardrailsAction::Block, &[], &["pii"]);
+        let t = effective_trace_profile(&PiiSettings::default(), Some("off"), "regex", Some(&p));
+        assert!(t.strengthened);
+        assert_eq!(t.name, "off+regex");
+    }
+
+    #[test]
+    fn env_llm_maps_to_regex_named_llm() {
+        let t = effective_trace_profile(&PiiSettings::default(), None, "llm", None);
+        assert_eq!(t.name, "llm");
+        assert_eq!(t.profile, Some(pii_prof(PiiDetectorKind::Regex, &[], None)));
+    }
+
+    #[test]
+    fn guardrails_policy_json_roundtrip_unchanged() {
+        let raw = r#"{"action":"redact","input_scanners":["pii"],"output_scanners":[],"guard_model":null,"ban_keywords":[],"fail_open":true}"#;
+        let p: GuardrailsPolicy = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.pii_profile, None);
+        assert_eq!(serde_json::to_string(&p).unwrap(), raw);
+    }
+
+    #[test]
+    fn boon_settings_without_pii_parses() {
+        let s: BoonSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.pii.ner.model_timeout_ms, 1000);
+        assert_eq!(s.pii.ner.timeout_ms, None);
+        assert!(s.pii.profiles.is_empty());
     }
 }

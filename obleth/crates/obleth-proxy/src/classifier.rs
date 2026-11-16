@@ -555,6 +555,7 @@ mod tests {
 
     fn brain(api_base: &str) -> ResolvedModel {
         ResolvedModel {
+            provider: String::new(),
             description: String::new(),
             model_name: "brain-test".to_string(),
             aliases: Vec::new(),

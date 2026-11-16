@@ -1,13 +1,14 @@
 "use client";
 
-import { useState, type ReactNode } from "react";
+import { useState, useTransition, type ReactNode } from "react";
 import Link from "next/link";
 import { Plus, X } from "lucide-react";
+import { checkPiiServiceAction } from "@/app/actions";
 import { SettingsCard } from "@/components/access/ui";
 import { Glyph } from "@/components/deployments/ui";
 import { SelectField, Setting, Switch, TextArea, TextField } from "@/components/models/fields";
 import { Pill } from "@/components/overview/ui";
-import type { BoonSettingsView, CompressorStatusView, KnowledgeSettingsView, ModelRoute, SpeculationCategoryGate } from "@/lib/obleth";
+import type { BoonSettingsView, PiiCheckResult, CompressorStatusView, KnowledgeSettingsView, ModelRoute, SpeculationCategoryGate } from "@/lib/obleth";
 import { BOONS, boonSummary, modelsAsking, SPEC_PROFILES, specProfileOf, specValues, type BoonKey, type SpecValues } from "@/lib/settings-model";
 import { cn } from "@/lib/utils";
 
@@ -88,6 +89,55 @@ function GatesEditor({ gates, onChange }: { gates: SpeculationCategoryGate[]; on
         </div>
       ))}
       <button type="button" onClick={() => onChange([...gates, { tag: "", speculate: false }])} className="mt-1.5 inline-flex items-center gap-1 self-start text-[12.5px] text-secondary-foreground hover:text-foreground"><Plus className="h-3.5 w-3.5" />Add a category</button>
+    </div>
+  );
+}
+
+const PII_BUILTINS = ["off", "regex", "ner"];
+
+/** Where names are detected and masked: the NER service, timeouts, and the profiles a tenant can pick. */
+function PiiCard({ pii }: { pii: NonNullable<BoonSettingsView["pii"]> }) {
+  const [traces, setTraces] = useState(pii.traces ?? "");
+  const [checked, setChecked] = useState<{ res: PiiCheckResult } | { error: string } | null>(null);
+  const [pending, start] = useTransition();
+  const names = Object.keys(pii.profiles).sort();
+  const options = [{ value: "", label: "regex (default)" }, ...[...PII_BUILTINS, ...names.filter((n) => !PII_BUILTINS.includes(n))].map((n) => ({ value: n, label: n }))];
+  const check = () => {
+    setChecked(null);
+    start(async () => {
+      const r = await checkPiiServiceAction();
+      setChecked(r.ok && r.data ? { res: r.data } : { error: r.ok ? "No answer." : r.error });
+    });
+  };
+  return (
+    <div id="boon-pii" className="scroll-mt-24 border-t border-border">
+      <div className="px-[18px] py-2.5 text-[13px]"><span className="font-medium">PII detection</span><span className="block text-[11.5px] text-muted-foreground">Masks personal data in guardrails and exported traces</span></div>
+      <div className="border-t border-border bg-muted/30 pl-[58px]">
+        <Setting label="NER service" hint="Set in the gateway's environment; changing it needs a restart.">
+          <div className="flex flex-wrap items-center gap-3">
+            {pii.ner_url ? <span className="font-mono text-[12.5px]">{pii.ner_url}</span> : <span className="text-[12.5px] text-muted-foreground">not set: OBLETH_PII_NER_URL</span>}
+            <button type="button" onClick={check} disabled={pending} className="inline-flex h-8 items-center justify-center rounded-lg border border-border px-3 text-[12.5px] hover:border-muted-foreground/60">Check service</button>
+            {checked && ("error" in checked
+              ? <span className="text-[12.5px] text-destructive">{checked.error}</span>
+              : checked.res.ok
+                ? <span className="text-[12.5px]">Reachable{checked.res.latency_ms !== null ? `, ${checked.res.latency_ms} ms` : ""}</span>
+                : <span className="text-[12.5px] text-destructive">{checked.res.error ?? "Not reachable"}</span>)}
+          </div>
+        </Setting>
+        <Setting label="Timeouts" hint="Traces wait this long for the service (blank uses the environment value, else 5000); the model path waits the second." fields={["boons.pii_timeout_ms", "boons.pii_model_timeout_ms"]}>
+          <div className="flex flex-wrap gap-3">
+            <span className="inline-flex items-center gap-1.5"><TextField name="boons.pii_timeout_ms" label="Traces timeout" inputMode="decimal" defaultValue={pii.ner.timeout_ms ?? ""} mono className="w-24" /><span className="text-xs text-muted-foreground">ms for traces</span></span>
+            <NumberField name="pii_model_timeout_ms" label="Model path timeout" value={pii.ner.model_timeout_ms} unit="ms on the model path" />
+          </div>
+        </Setting>
+        <Setting label="Trace profile" hint="What exported traces use unless a tenant picks its own." fields={["boons.pii_traces"]}>
+          <div className="w-60"><SelectField name="boons.pii_traces" label="Default trace profile" value={traces} onChange={setTraces} options={options} /></div>
+        </Setting>
+        <Setting label="Profiles" hint="JSON of name to {detector: off | regex | ner, entities, language, score_threshold}. off, regex and ner are built in." fields={["boons.pii_profiles"]}>
+          <TextArea name="boons.pii_profiles" label="PII profiles" rows={6} defaultValue={JSON.stringify(pii.profiles, null, 2)} />
+          <span className="text-[12px] text-muted-foreground">Defined: {names.length === 0 ? "none" : names.map((n, i) => <span key={n} className="font-mono">{i > 0 ? ", " : ""}{n}</span>)}</span>
+        </Setting>
+      </div>
     </div>
   );
 }
@@ -274,6 +324,8 @@ export function BoonsSection({ settings: b, models, knowledge, compressor }: { s
           </div>
         </Setting>
       </>)}
+
+      {b.pii && <PiiCard pii={b.pii} />}
 
       <div id="boon-knowledge" className="grid min-h-[60px] grid-cols-[44px_minmax(0,1.1fr)_minmax(0,1.5fr)_minmax(0,1fr)_84px] items-center gap-3.5 border-t border-border px-[18px] py-2.5 text-[13px]">
         <span className="flex justify-center"><Glyph glyph={knowledge?.enabled ? "on" : "off"} /></span>

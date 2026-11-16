@@ -1392,6 +1392,9 @@ mod pipeline_tests {
             jobs: JobStore::new(store.clone(), scope),
             load: None,
             crash_guard: crate::crash_guard::CrashGuard::disabled(),
+            genai: None,
+            genai_max_request_bytes: 0,
+            pii: crate::pii::PiiDetector::for_tests(),
             batches: None,
         };
         Some(Gateway {
@@ -1499,8 +1502,13 @@ mod pipeline_tests {
             if let Some(ct) = content_type {
                 req = req.header(header::CONTENT_TYPE, ct);
             }
-            crate::proxy::proxy_handler(State(self.state.clone()), req.body(body.into()).unwrap())
-                .await
+            // Boxed so the debug-build future, held by every test's await
+            // points, stays small (the tests run on a 2 MB thread).
+            Box::pin(crate::proxy::proxy_handler(
+                State(self.state.clone()),
+                req.body(body.into()).unwrap(),
+            ))
+            .await
         }
 
         async fn create_json(&self, secret: &str, model: &str, prompt: &str) -> Response<Body> {
@@ -1910,6 +1918,7 @@ mod pipeline_tests {
         let (backend, base) = spawn_backend("g").await;
         gw.register(video_route("video-model", &base)).await;
         let policy = obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action: obleth_config::GuardrailsAction::Block,
             input_scanners: vec!["ban_keywords".into()],
             output_scanners: vec![],

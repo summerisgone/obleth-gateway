@@ -1232,6 +1232,16 @@ async fn run_pipeline(
         Ok(b) => b,
         Err(_) => return error_json(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
+    // The client's body, before any rewrite below; a refcount bump, not a copy.
+    let genai_capture = capture_genai(
+        state.genai.as_ref().map(|_| state.genai_max_request_bytes),
+        &resolved,
+        batch.is_some(),
+        &method,
+        &path,
+        &headers,
+        &body_bytes,
+    );
     let mut json: serde_json::Value =
         serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
     // `stream` decides how the answer is read and what it is billed from. A
@@ -1383,6 +1393,11 @@ async fn run_pipeline(
         failure: None,
         crash_fp: String::new(),
         client: client.clone(),
+        genai: genai_capture,
+        genai_collector: None,
+        genai_start_nanos: unix_nanos_now(),
+        genai_route: GenAiRoute::default(),
+        genai_tool_turns: 0,
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -1741,6 +1756,13 @@ async fn run_pipeline(
                 return resp;
             }
         }
+    }
+    if req_meta.genai.is_some() {
+        req_meta.genai_route = genai_route_of(route.as_deref(), &state.upstream_base);
+        // Created before `accounting` clones the meta, so the cancellation
+        // guard and the stream share one collector.
+        req_meta.genai_collector =
+            Some(crate::genai_export::collector::Collector::new(GENAI_COLLECT_MAX));
     }
     // The name the client used, for its usage row and response headers. The
     // ledger's `model` stays the parent's.
@@ -2168,6 +2190,9 @@ async fn run_pipeline(
                         }),
                     );
                     t.finish("ok");
+                }
+                if let Some(c) = &req_meta.genai_collector {
+                    tap_body(c, &cached.content_type, cached.body.as_bytes());
                 }
                 state.metrics.record_cache(
                     true,
@@ -3012,6 +3037,13 @@ async fn run_pipeline(
         break;
     }
 
+    if req_meta.genai.is_some() {
+        (
+            req_meta.genai_route.server_address,
+            req_meta.genai_route.server_port,
+        ) = server_of(&last_url);
+        accounting.meta.genai_route = req_meta.genai_route.clone();
+    }
     let url = last_url;
     let dispatch_ms = (crate::tracer::now_ms() - dispatch_start) as u32;
     let upstream = match upstream_resp {
@@ -3380,6 +3412,12 @@ async fn run_pipeline(
                     // The usage the loop reports carries the energy measured
                     // for the whole request, every turn included.
                     let mut energy_stamp = accounting.energy_stamp("text/event-stream");
+                    // Only what the client receives is exported, not the
+                    // intermediate tool turns' internals.
+                    let mut reply_tap = ReplyTap::new(
+                        accounting.meta.genai_collector.as_ref(),
+                        "text/event-stream",
+                    );
                     while let Some(item) = driver.next().await {
                         match item {
                             Ok(chunk) => {
@@ -3391,6 +3429,9 @@ async fn run_pipeline(
                                     None => chunk,
                                 };
                                 if !chunk.is_empty() {
+                                    if let Some(tap) = reply_tap.as_mut() {
+                                        tap.push(&chunk);
+                                    }
                                     yield Ok(chunk);
                                 }
                             }
@@ -3402,8 +3443,14 @@ async fn run_pipeline(
                     }
                     if let Some(rest) = energy_stamp.take().map(|s| s.finish(|| accounting.energy_now())) {
                         if !rest.is_empty() {
+                            if let Some(tap) = reply_tap.as_mut() {
+                                tap.push(&rest);
+                            }
                             yield Ok(rest);
                         }
+                    }
+                    if let Some(tap) = reply_tap.take() {
+                        tap.finish();
                     }
                     drop(permit);
                     // A failed client-facing turn settles like a failed
@@ -3623,16 +3670,17 @@ async fn run_pipeline(
                 turn0_usage = outcome.turn0_usage;
                 // guardrails output scan (block/redact action)
                 if let Some(guard_plan) = &plan.guardrails {
-                    match crate::boons::guardrails::apply_output(
+                    match Box::pin(crate::boons::guardrails::apply_output(
                         &state,
                         &guard_plan.settings,
+                        &guard_plan.pii,
                         &guard_plan.policy,
                         &resolved,
                         &req_meta.session_id,
                         request_id,
                         body_json,
                         tracer.as_mut(),
-                    )
+                    ))
                     .await
                     {
                         crate::boons::guardrails::ApplyOutputResult::Block(block) => {
@@ -3750,6 +3798,10 @@ async fn run_pipeline(
         } else {
             final_body
         };
+        // The body after the plan's transforms, as the client receives it.
+        if let Some(c) = &req_meta.genai_collector {
+            tap_body(c, &final_content_type, &final_body);
+        }
         let _ = settle_guard
             .complete(accounting.settle(tokens, ttft_ms, total_ms, status_code, cache_put))
             .await;
@@ -3822,6 +3874,7 @@ async fn run_pipeline(
         // The last bytes sent, so an event the gateway adds starts on an
         // event boundary.
         let mut sent_tail: Vec<u8> = Vec::with_capacity(8);
+        let mut reply_tap = ReplyTap::new(accounting.meta.genai_collector.as_ref(), &content_type_str);
 
         while let Some(item) = byte_stream.next().await {
             match item {
@@ -3859,6 +3912,9 @@ async fn run_pipeline(
                         continue;
                     }
                     crate::upstream_failure::remember_sent(&mut sent_tail, &chunk);
+                    if let Some(tap) = reply_tap.as_mut() {
+                        tap.push(&chunk);
+                    }
                     yield Ok::<Bytes, std::io::Error>(chunk);
                 }
                 Err(e) if failure_watch.as_ref().is_some_and(|w| w.saw_done()) => {
@@ -3902,6 +3958,9 @@ async fn run_pipeline(
                     };
                     if !rest.is_empty() {
                         crate::upstream_failure::remember_sent(&mut sent_tail, &rest);
+                        if let Some(tap) = reply_tap.as_mut() {
+                            tap.push(&rest);
+                        }
                         yield Ok::<Bytes, std::io::Error>(rest);
                     }
                 }
@@ -3911,9 +3970,15 @@ async fn run_pipeline(
                 .map(|s| s.finish(|| accounting.energy_now())) {
                 if !rest.is_empty() {
                     crate::upstream_failure::remember_sent(&mut sent_tail, &rest);
+                    if let Some(tap) = reply_tap.as_mut() {
+                        tap.push(&rest);
+                    }
                     yield Ok::<Bytes, std::io::Error>(rest);
                 }
             }
+        }
+        if let Some(tap) = reply_tap.take() {
+            tap.finish();
         }
 
         // The upstream stream has fully drained: the request no longer occupies
@@ -4728,6 +4793,7 @@ impl StreamAccounting {
                 Ok(completion) => crate::boons::guardrails::monitor_output(
                     &self.state,
                     &self.state.boons.settings().guardrails,
+                    &crate::boons::guardrails::pii_plan(&self.state.boons.settings().pii, policy),
                     policy,
                     &self.resolved,
                     &self.meta.session_id,
@@ -6958,6 +7024,251 @@ pub(crate) struct RequestMeta {
     /// Where the request came from, for the ledger's client columns. Unknown
     /// (empty) for work the gateway runs itself.
     pub(crate) client: crate::client::ClientInfo,
+    /// The request body for GenAI export; `None` when the request is not
+    /// exported.
+    pub(crate) genai: Option<Arc<crate::genai_export::GenAiCapture>>,
+    /// Collects the reply for GenAI export; attached by the response branches.
+    pub(crate) genai_collector: Option<crate::genai_export::collector::Collector>,
+    /// When the request arrived, in unix nanoseconds.
+    pub(crate) genai_start_nanos: u64,
+    /// The provider, routed model and upstream address, once known.
+    pub(crate) genai_route: GenAiRoute,
+    /// Gateway tool-loop turns taken before the final reply.
+    pub(crate) genai_tool_turns: u32,
+}
+
+/// Where a request was routed, as GenAI export records it.
+#[derive(Clone, Default)]
+pub(crate) struct GenAiRoute {
+    pub(crate) provider: String,
+    pub(crate) routed_model: String,
+    pub(crate) server_address: Option<String>,
+    pub(crate) server_port: Option<u16>,
+}
+
+fn unix_nanos_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// The most reply text GenAI export keeps per request.
+const GENAI_COLLECT_MAX: usize = 524_288;
+
+/// Feeds a reply to the GenAI collector as the client gets it: an event stream
+/// chunk by chunk, a JSON body once whole. A JSON body past the collector's
+/// cap is not held, so the tap never copies more than the cap.
+struct ReplyTap {
+    collector: crate::genai_export::collector::Collector,
+    sse: bool,
+    json: Vec<u8>,
+    over: bool,
+}
+
+impl ReplyTap {
+    fn new(
+        collector: Option<&crate::genai_export::collector::Collector>,
+        content_type: &str,
+    ) -> Option<ReplyTap> {
+        Some(ReplyTap {
+            collector: collector?.clone(),
+            sse: relays_event_stream(content_type),
+            json: Vec::new(),
+            over: false,
+        })
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if self.sse {
+            self.collector.feed_sse(chunk);
+        } else if !self.over {
+            if self.json.len().saturating_add(chunk.len()) > GENAI_COLLECT_MAX {
+                self.over = true;
+                self.json = Vec::new();
+            } else {
+                self.json.extend_from_slice(chunk);
+            }
+        }
+    }
+
+    fn finish(self) {
+        if !self.sse && !self.over {
+            self.collector.set_json(&self.json);
+        }
+    }
+}
+
+/// Collects a whole reply body, as the client gets it.
+fn tap_body(collector: &crate::genai_export::collector::Collector, content_type: &str, body: &[u8]) {
+    if relays_event_stream(content_type) {
+        collector.feed_sse(body);
+    } else {
+        collector.set_json(body);
+    }
+}
+
+/// Host and port of an upstream URL; the port defaults from the scheme.
+fn server_of(url: &str) -> (Option<String>, Option<u16>) {
+    match reqwest::Url::parse(url) {
+        Ok(u) => (
+            u.host_str().map(str::to_string),
+            u.port_or_known_default(),
+        ),
+        Err(_) => (None, None),
+    }
+}
+
+fn genai_route_of(route: Option<&ResolvedModel>, default_base: &str) -> GenAiRoute {
+    let base = route
+        .map(|r| r.api_base.as_str())
+        .filter(|b| !b.is_empty())
+        .unwrap_or(default_base);
+    let (server_address, server_port) = server_of(base);
+    GenAiRoute {
+        provider: route.map(|r| r.provider.clone()).unwrap_or_default(),
+        routed_model: route.map(|r| r.upstream_model.clone()).unwrap_or_default(),
+        server_address,
+        server_port,
+    }
+}
+
+/// Snapshot of the request for GenAI export, or `None` when this request is
+/// not exported: no exporter, the key's flag is off, an internal key, a batch
+/// item, or not a completion call. `max_request_bytes` is `None` when the
+/// gateway has no exporter. A body over the limit is marked, not kept.
+fn capture_genai(
+    max_request_bytes: Option<usize>,
+    resolved: &ResolvedKey,
+    batch: bool,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Option<Arc<crate::genai_export::GenAiCapture>> {
+    use crate::genai_export::{ApiSurface, GenAiCapture};
+    let max = max_request_bytes?;
+    if !resolved.genai_export || resolved.internal || batch || *method != Method::POST {
+        return None;
+    }
+    let surface = match surface(headers) {
+        Some("responses") => ApiSurface::Responses,
+        Some(crate::messages::SURFACE) => ApiSurface::Messages,
+        _ => match request_type_for_path(path) {
+            "chat" => ApiSurface::Chat,
+            "completion" => ApiSurface::Completions,
+            _ => return None,
+        },
+    };
+    Some(Arc::new(if body.len() > max {
+        GenAiCapture {
+            body: None,
+            surface,
+            dropped: Some("request_too_large"),
+        }
+    } else {
+        GenAiCapture {
+            body: Some(body.clone()),
+            surface,
+            dropped: None,
+        }
+    }))
+}
+
+/// The export event for a finished request, or `None` when it is not exported.
+#[allow(clippy::too_many_arguments)]
+fn genai_event(
+    pii: &obleth_config::PiiSettings,
+    scrub_default: &str,
+    resolved: &ResolvedKey,
+    meta: &RequestMeta,
+    request_id: Uuid,
+    model: &str,
+    usage: (u32, u32, u32),
+    ttft_ms: u32,
+    total_ms: u32,
+    cache_status: &str,
+    error_class: &str,
+) -> Option<crate::genai_export::GenAiEvent> {
+    use crate::genai_export::{EventMeta, GenAiEvent, Usage};
+    let cap = meta.genai.as_ref()?;
+    let end = unix_nanos_now().max(meta.genai_start_nanos);
+    let ttft = (ttft_ms > 0).then(|| {
+        end.saturating_sub((total_ms.saturating_sub(ttft_ms) as u64) * 1_000_000)
+            .max(meta.genai_start_nanos)
+    });
+    let client_model = if !meta.model_family.is_empty() {
+        &meta.model_family
+    } else if !meta.model_variant.is_empty() {
+        &meta.model_variant
+    } else {
+        model
+    };
+    let routed_model = if meta.genai_route.routed_model.is_empty() {
+        model
+    } else {
+        &meta.genai_route.routed_model
+    };
+    let (ops_trace_id, ops_span_id) = ops_ids();
+    let (input, output, cached) = usage;
+    Some(GenAiEvent {
+        start_unix_nanos: meta.genai_start_nanos,
+        end_unix_nanos: end,
+        ttft_unix_nanos: ttft,
+        enqueued_at: None,
+        surface: cap.surface,
+        request_body: cap.body.clone(),
+        dropped: cap.dropped,
+        output: meta.genai_collector.as_ref().map(|c| c.snapshot()),
+        meta: EventMeta {
+            request_id: request_id.to_string(),
+            tenant_id: resolved.tenant_id.to_string(),
+            key_id: resolved.key_id.to_string(),
+            client_model: client_model.to_string(),
+            routed_model: routed_model.to_string(),
+            model_variant: meta.model_variant.clone(),
+            provider: meta.genai_route.provider.clone(),
+            server_address: meta.genai_route.server_address.clone(),
+            server_port: meta.genai_route.server_port,
+            session_id: meta.session_id.clone(),
+            session_source: meta.session_id_source.to_string(),
+            reasoning_effort: Some(meta.reasoning_effort.clone()).filter(|e| !e.is_empty()),
+            cache_status: cache_status.to_string(),
+            tool_loop_turns: meta.genai_tool_turns,
+            ops_trace_id,
+            ops_span_id,
+            usage: Usage {
+                input: Some(input as u64),
+                output: Some(output as u64),
+                cache_read: (cached > 0).then_some(cached as u64),
+                reasoning: None,
+            },
+            error_type: Some(error_class.to_string()).filter(|e| !e.is_empty()),
+            scrub: obleth_config::effective_trace_profile(
+                pii,
+                resolved.pii_trace_profile.as_deref(),
+                scrub_default,
+                resolved.guardrails_policy.as_ref(),
+            ),
+        },
+    })
+}
+
+/// Trace and span ids of the current span's OTel context, if it has one.
+fn ops_ids() -> (Option<String>, Option<String>) {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    let cx = tracing::Span::current().context();
+    let span = cx.span();
+    let sc = span.span_context();
+    if sc.is_valid() {
+        (
+            Some(sc.trace_id().to_string()),
+            Some(sc.span_id().to_string()),
+        )
+    } else {
+        (None, None)
+    }
 }
 
 /// The name a response cache entry is keyed by.
@@ -7368,6 +7679,23 @@ pub(crate) fn finalize(
     }
     let (error_class, error_reason) =
         obleth_config::ledger_failure(status_code, admission.as_str(), meta.failure.as_ref());
+    if let Some(exporter) = state.genai.as_ref() {
+        if let Some(ev) = genai_event(
+            &state.boons.settings().pii,
+            exporter.scrub_default(),
+            resolved,
+            meta,
+            request_id,
+            model,
+            (input_tokens, output_tokens, cached_input_tokens),
+            ttft_ms,
+            total_ms,
+            cache_status,
+            error_class,
+        ) {
+            exporter.try_send(ev);
+        }
+    }
     state.telemetry.record(UsageRecord {
         request_id,
         tenant_id: resolved.tenant_id,
@@ -7628,6 +7956,8 @@ mod tests {
         weekly_windows: Option<Vec<WeeklyWindow>>,
     ) -> ResolvedKey {
         ResolvedKey {
+            pii_trace_profile: None,
+            genai_export: false,
             key_id: Uuid::nil(),
             tenant_id: Uuid::nil(),
             tenant_name: "t".into(),
@@ -7668,6 +7998,7 @@ mod tests {
     #[test]
     fn legacy_completions_are_refused_only_under_an_enforcing_output_policy() {
         let policy = |action, output: &[&str]| obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action,
             input_scanners: vec![],
             output_scanners: output.iter().map(|s| s.to_string()).collect(),
@@ -7878,6 +8209,7 @@ mod tests {
     #[test]
     fn unscannable_paths_are_refused_only_under_an_enforcing_input_policy() {
         let policy = |action| obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action,
             input_scanners: vec!["pii".into()],
             output_scanners: vec![],
@@ -7910,6 +8242,7 @@ mod tests {
         let mut key = key_with_schedule("UTC", None, None, None);
         assert!(!has_input_guardrails(&key));
         key.guardrails_policy = Some(obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action: obleth_config::GuardrailsAction::LogOnly,
             input_scanners: vec!["pii".into()],
             output_scanners: vec![],
@@ -9051,6 +9384,7 @@ mod tests {
 
     fn model_with(endpoints: Vec<ResolvedEndpoint>) -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
+            provider: String::new(),
             description: String::new(),
             model_name: "m".into(),
             aliases: Vec::new(),
@@ -10200,6 +10534,251 @@ mod tests {
         assert_eq!(super::recorded_ttft(false, 34_800), 0);
     }
 
+    fn genai_key(on: bool) -> ResolvedKey {
+        let mut k = key_with_schedule("UTC", None, None, None);
+        k.genai_export = on;
+        k
+    }
+
+    fn genai_meta() -> RequestMeta {
+        RequestMeta {
+            session_id: "sess-1".into(),
+            session_id_source: "client",
+            request_type: "chat",
+            device_id: String::new(),
+            end_user: String::new(),
+            model_variant: String::new(),
+            reasoning_effort: "high".into(),
+            reasoning_effort_requested: String::new(),
+            model_family: String::new(),
+            streamed: true,
+            failure: None,
+            crash_fp: String::new(),
+            client: crate::client::ClientInfo::default(),
+            genai: None,
+            genai_collector: None,
+            genai_start_nanos: 1_000,
+            genai_route: super::GenAiRoute {
+                provider: "openai".into(),
+                routed_model: "up-m".into(),
+                server_address: Some("api.example.com".into()),
+                server_port: Some(443),
+            },
+            genai_tool_turns: 0,
+        }
+    }
+
+    fn capture(
+        max: Option<usize>,
+        key: &ResolvedKey,
+        batch: bool,
+        body: &'static [u8],
+    ) -> Option<std::sync::Arc<crate::genai_export::GenAiCapture>> {
+        super::capture_genai(
+            max,
+            key,
+            batch,
+            &Method::POST,
+            "/v1/chat/completions",
+            &HeaderMap::new(),
+            &Bytes::from_static(body),
+        )
+    }
+
+    #[test]
+    fn flag_off_no_event() {
+        assert!(capture(Some(1 << 20), &genai_key(false), false, b"{}").is_none());
+        // No exporter configured.
+        assert!(capture(None, &genai_key(true), false, b"{}").is_none());
+        assert!(capture(Some(1 << 20), &genai_key(true), false, b"{}").is_some());
+    }
+
+    #[test]
+    fn internal_key_no_event() {
+        let mut k = genai_key(true);
+        k.internal = true;
+        assert!(capture(Some(1 << 20), &k, false, b"{}").is_none());
+    }
+
+    #[test]
+    fn batch_no_event() {
+        assert!(capture(Some(1 << 20), &genai_key(true), true, b"{}").is_none());
+    }
+
+    #[test]
+    fn oversize_body_dropped_marker() {
+        let c = capture(Some(4), &genai_key(true), false, b"{\"a\":1}").unwrap();
+        assert!(c.body.is_none());
+        assert_eq!(c.dropped, Some("request_too_large"));
+    }
+
+    #[test]
+    fn surface_follows_shim_header_and_path() {
+        use crate::genai_export::ApiSurface;
+        let key = genai_key(true);
+        let body = Bytes::from_static(b"{}");
+        let mut h = HeaderMap::new();
+        h.insert(crate::responses::SURFACE_HEADER, "responses".parse().unwrap());
+        let c = super::capture_genai(Some(99), &key, false, &Method::POST, "/v1/chat/completions", &h, &body)
+            .unwrap();
+        assert_eq!(c.surface, ApiSurface::Responses);
+        let c = super::capture_genai(Some(99), &key, false, &Method::POST, "/v1/completions", &HeaderMap::new(), &body)
+            .unwrap();
+        assert_eq!(c.surface, ApiSurface::Completions);
+        assert!(super::capture_genai(Some(99), &key, false, &Method::POST, "/v1/embeddings", &HeaderMap::new(), &body).is_none());
+    }
+
+    const SSE_CHAT: &[u8] = b"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    const JSON_CHAT: &[u8] = br#"{"id":"c1","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
+
+    fn tap_collector() -> crate::genai_export::collector::Collector {
+        crate::genai_export::collector::Collector::new(super::GENAI_COLLECT_MAX)
+    }
+
+    #[test]
+    fn stream_output_captured() {
+        let c = tap_collector();
+        let mut tap = super::ReplyTap::new(Some(&c), "text/event-stream; charset=utf-8").unwrap();
+        // Chunks split mid-line, as the network delivers them.
+        for part in SSE_CHAT.chunks(7) {
+            tap.push(part);
+        }
+        tap.finish();
+        let out = c.snapshot();
+        assert_eq!(out.choices[0].text, "hello");
+        assert_eq!(out.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(out.id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn buffered_output_captured() {
+        let c = tap_collector();
+        let mut tap = super::ReplyTap::new(Some(&c), "application/json").unwrap();
+        for part in JSON_CHAT.chunks(11) {
+            tap.push(part);
+        }
+        // Nothing is visible until the body is whole.
+        assert!(c.snapshot().choices.is_empty());
+        tap.finish();
+        assert_eq!(c.snapshot().choices[0].text, "hi");
+        // Capture off: no tap at all.
+        assert!(super::ReplyTap::new(None, "application/json").is_none());
+    }
+
+    #[test]
+    fn client_abort_partial_output() {
+        let c = tap_collector();
+        // The cancellation guard holds a clone of the same collector.
+        let guard_view = c.clone();
+        let mut tap = super::ReplyTap::new(Some(&c), "text/event-stream").unwrap();
+        tap.push(&SSE_CHAT[..SSE_CHAT.iter().position(|b| *b == b'\n').unwrap() + 2]);
+        drop(tap); // the client left; the stream is dropped without finish()
+        assert_eq!(guard_view.snapshot().choices[0].text, "hel");
+        let mut meta = genai_meta();
+        meta.genai = capture(Some(1 << 20), &genai_key(true), false, b"{}");
+        meta.genai_collector = Some(guard_view);
+        let ev = super::genai_event(&obleth_config::PiiSettings::default(), "regex", &genai_key(true), &meta, Uuid::nil(), "m", (1, 1, 0), 0, 5, "off", "client_cancel")
+            .unwrap();
+        assert_eq!(ev.output.unwrap().choices[0].text, "hel");
+    }
+
+    #[test]
+    fn json_over_cap_is_not_buffered() {
+        let c = tap_collector();
+        let mut tap = super::ReplyTap::new(Some(&c), "application/json").unwrap();
+        let chunk = vec![b' '; super::GENAI_COLLECT_MAX];
+        tap.push(&chunk);
+        tap.push(&chunk);
+        assert!(tap.json.len() <= super::GENAI_COLLECT_MAX);
+        tap.finish();
+        assert!(c.snapshot().choices.is_empty());
+    }
+
+    #[test]
+    fn cache_hit_output() {
+        for (ct, body) in [("text/event-stream", SSE_CHAT), ("application/json", JSON_CHAT)] {
+            let c = tap_collector();
+            super::tap_body(&c, ct, body);
+            assert!(!c.snapshot().choices[0].text.is_empty(), "{ct}");
+        }
+    }
+
+    #[test]
+    fn guardrail_redacted_output_exported() {
+        let c = tap_collector();
+        let redacted = br#"{"choices":[{"index":0,"message":{"role":"assistant","content":"mail [REDACTED:EMAIL]"},"finish_reason":"stop"}]}"#;
+        super::tap_body(&c, "application/json", redacted);
+        assert_eq!(c.snapshot().choices[0].text, "mail [REDACTED:EMAIL]");
+    }
+
+    #[test]
+    fn structured_output_exported() {
+        // A forced-JSON reply replayed as synthesized SSE reads the same.
+        let c = tap_collector();
+        let sse = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"{\\\"a\\\":1}\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        super::tap_body(&c, "text/event-stream", sse);
+        assert_eq!(c.snapshot().choices[0].text, "{\"a\":1}");
+    }
+
+    #[test]
+    fn upstream_error_has_error_type() {
+        let mut meta = genai_meta();
+        meta.genai = capture(Some(1 << 20), &genai_key(true), false, b"{}");
+        let ev = super::genai_event(&obleth_config::PiiSettings::default(), "regex", &genai_key(true), &meta, Uuid::nil(), "m", (0, 0, 0), 0, 5, "off", "upstream_error")
+            .unwrap();
+        assert_eq!(ev.meta.error_type.as_deref(), Some("upstream_error"));
+    }
+
+    #[tokio::test]
+    async fn event_has_usage_and_session() {
+        use crate::genai_export::{config::GenAiConfig, exporter::Exporter, GenAiEvent};
+        let key = genai_key(true);
+        let mut meta = genai_meta();
+        meta.genai = capture(Some(1 << 20), &key, false, b"{\"model\":\"m\"}");
+        let ev = super::genai_event(&obleth_config::PiiSettings::default(), "regex", &key, &meta, Uuid::nil(), "m", (11, 7, 3), 40, 100, "miss", "")
+            .expect("event");
+        assert_eq!(ev.meta.usage.input, Some(11));
+        assert_eq!(ev.meta.usage.output, Some(7));
+        assert_eq!(ev.meta.usage.cache_read, Some(3));
+        assert_eq!(ev.meta.session_id, "sess-1");
+        assert_eq!(ev.meta.session_source, "client");
+        assert_eq!(ev.meta.provider, "openai");
+        assert_eq!(ev.meta.routed_model, "up-m");
+        assert_eq!(ev.meta.client_model, "m");
+        assert_eq!(ev.meta.server_port, Some(443));
+        assert_eq!(ev.meta.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(ev.meta.error_type, None);
+        assert_eq!(ev.meta.scrub.name, "regex");
+        let mut tenant_key = genai_key(true);
+        tenant_key.pii_trace_profile = Some("off".into());
+        let ev2 = super::genai_event(&obleth_config::PiiSettings::default(), "regex", &tenant_key, &meta, Uuid::nil(), "m", (0, 0, 0), 0, 5, "off", "")
+            .unwrap();
+        assert_eq!(ev2.meta.scrub.name, "off");
+        assert!(ev.ttft_unix_nanos.is_some());
+        assert!(ev.request_body.is_some());
+        // No capture, no event.
+        assert!(super::genai_event(&obleth_config::PiiSettings::default(), "regex", &key, &genai_meta(), Uuid::nil(), "m", (0, 0, 0), 0, 0, "off", "").is_none());
+
+        // The event reaches the exporter's process step.
+        let env = std::collections::HashMap::from([(
+            "OBLETH_GENAI_OTLP_ENDPOINT".to_string(),
+            "http://127.0.0.1:1".to_string(),
+        )]);
+        let cfg = std::sync::Arc::new(GenAiConfig::from_env_map(&env).unwrap().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GenAiEvent>();
+        let process: crate::genai_export::exporter::ProcessFn = std::sync::Arc::new(move |ev| {
+            let _ = tx.send(ev);
+            Box::pin(async { Default::default() })
+        });
+        let handle = Exporter::start(cfg, reqwest::Client::new(), process, &prometheus::Registry::new());
+        assert!(handle.try_send(ev));
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.meta.usage.input, Some(11));
+    }
+
     #[test]
     fn request_meta_carries_device_id_into_usage_record() {
         let meta = RequestMeta {
@@ -10216,12 +10795,18 @@ mod tests {
             failure: None,
             crash_fp: String::new(),
             client: crate::client::ClientInfo::default(),
+            genai: None,
+            genai_collector: None,
+            genai_start_nanos: 0,
+            genai_route: super::GenAiRoute::default(),
+            genai_tool_turns: 0,
         };
         assert_eq!(meta.device_id, "dev-1");
     }
 
     fn minimal_model(name: &str) -> ResolvedModel {
         ResolvedModel {
+            provider: String::new(),
             description: String::new(),
             model_name: name.to_string(),
             aliases: Vec::new(),
@@ -10640,6 +11225,7 @@ mod tests {
         assert_eq!(request_type_for_path("/v1/videos"), "video");
         let mut key = crate::boons::test_support::test_key();
         key.guardrails_policy = Some(obleth_config::GuardrailsPolicy {
+            pii_profile: None,
             action: obleth_config::GuardrailsAction::Block,
             input_scanners: vec!["pii".into()],
             output_scanners: vec!["pii".into()],
@@ -10729,6 +11315,11 @@ mod lifecycle_tests {
             failure: None,
             crash_fp: String::new(),
             client: crate::client::ClientInfo::default(),
+            genai: None,
+            genai_collector: None,
+            genai_start_nanos: 0,
+            genai_route: super::GenAiRoute::default(),
+            genai_tool_turns: 0,
         };
         super::record_called_name(&mut meta, Some("acme"), Some("acme"));
         assert_eq!(meta.model_family, "acme");

@@ -29,7 +29,7 @@ const tenant = (id: string, name: string): Tenant => ({
   id, name, fairshare_group: "default", weight: 100, tokens_per_minute: 0, max_in_flight: null, description: "",
   organization: "", contact_email: "", status: "active", timezone: "UTC", active_from: null, active_until: null,
   weekly_windows: null, budget_tokens: null, budget_cost_usd: null, budget_period: null, budget_started_at: null,
-  allowed_models: null, guardrails_policy: null, compression_policy: null, tracing_enabled: false, synthetic: false,
+  allowed_models: null, guardrails_policy: null, compression_policy: null, tracing_enabled: false, synthetic: false, genai_export: false,
   created_at: "", updated_at: "",
 });
 

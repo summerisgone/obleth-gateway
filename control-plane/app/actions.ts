@@ -31,6 +31,7 @@ import type {
   UpdateAlertSettings,
   UpdateAutoRouterSettings,
   UpdateBoonSettings,
+  PiiCheckResult,
   SpeculationCategoryGate,
   UpdateEnergySettings,
   UpdateKnowledgeSettings,
@@ -595,6 +596,7 @@ export type TenantSettingsSection =
   | "weight"
   | "quota"
   | "tracing"
+  | "genai"
   | "synthetic"
   | "schedule"
   | "budget"
@@ -602,7 +604,7 @@ export type TenantSettingsSection =
   | "guardrails"
   | "compression";
 
-const TENANT_SECTIONS: readonly TenantSettingsSection[] = ["profile", "group", "weight", "quota", "tracing", "synthetic", "schedule", "budget", "allowlist", "guardrails", "compression"];
+const TENANT_SECTIONS: readonly TenantSettingsSection[] = ["profile", "group", "weight", "quota", "tracing", "genai", "synthetic", "schedule", "budget", "allowlist", "guardrails", "compression"];
 
 const TENANT_SECTION_LABELS: Record<TenantSettingsSection, string> = {
   profile: "Profile",
@@ -610,6 +612,7 @@ const TENANT_SECTION_LABELS: Record<TenantSettingsSection, string> = {
   weight: "Weight",
   quota: "Limits",
   tracing: "Tracing",
+  genai: "GenAI export",
   synthetic: "Synthetic",
   schedule: "Access hours",
   budget: "Budget",
@@ -695,6 +698,9 @@ export async function saveTenantSettingsAction(formData: FormData): Promise<Sett
         await obleth.setQuota(id, tpm, mif, audit);
       } else if (section === "tracing") {
         await obleth.setTenantTracing(id, formData.get("tracing_enabled") === "on", audit);
+      } else if (section === "genai") {
+        const piiTrace = formData.has("pii_trace_profile") ? trimmed(formData.get("pii_trace_profile")) || null : undefined;
+        await obleth.setTenantGenaiExport(id, formData.get("genai_export") === "on", audit, piiTrace);
       } else if (section === "synthetic") {
         await obleth.setTenantSynthetic(id, formData.get("synthetic") === "on", audit);
       } else if (section === "schedule") {
@@ -2099,6 +2105,23 @@ function boonSettingsFromForm(formData: FormData): { ok: true; body: UpdateBoonS
   } else {
     body.speculation_draft_chat_template_kwargs = {};
   }
+  if (formData.has("boons.pii_profiles")) {
+    const timeout = trimmed(get("pii_timeout_ms"));
+    const modelTimeout = trimmed(get("pii_model_timeout_ms"));
+    if ((timeout !== "" && !Number.isFinite(Number(timeout))) || (modelTimeout !== "" && !Number.isFinite(Number(modelTimeout)))) return { ok: false, error: "PII timeouts must be numbers." };
+    let profiles: unknown = {};
+    try {
+      profiles = JSON.parse(trimmed(get("pii_profiles")) || "{}");
+    } catch {
+      return { ok: false, error: "The PII profiles aren't valid JSON." };
+    }
+    if (typeof profiles !== "object" || profiles === null || Array.isArray(profiles)) return { ok: false, error: "The PII profiles must be a JSON object of name to profile." };
+    body.pii = {
+      ner: { timeout_ms: timeout === "" ? null : Number(timeout), model_timeout_ms: modelTimeout === "" ? 1000 : Number(modelTimeout) },
+      profiles,
+      traces: trimmed(get("pii_traces")) || null,
+    };
+  }
   const attempts = body.structured_output_max_repair_attempts as number | undefined;
   if (attempts !== undefined && (attempts < 0 || attempts > 3)) return { ok: false, error: "Structured output: 0 to 3 retries." };
   const turns = body.tool_loop_max_turns as number | undefined;
@@ -2370,6 +2393,15 @@ export async function testEnergyQueryAction(
   try {
     const data = await obleth.testEnergyQuery(query);
     return { ok: true, data };
+  } catch (e) {
+    return actionError(e);
+  }
+}
+
+export async function checkPiiServiceAction(): Promise<ActionResult & { data?: PiiCheckResult }> {
+  await requireAdmin();
+  try {
+    return { ok: true, data: await obleth.checkPiiService() };
   } catch (e) {
     return actionError(e);
   }

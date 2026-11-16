@@ -4,7 +4,7 @@ import { tenantHref } from "@/lib/access-model";
 import { requireAdmin } from "@/lib/auth/roles";
 import { listUsers, type AdminUser } from "@/lib/auth/users";
 import { accounts, type Member } from "@/lib/obleth-accounts";
-import { obleth, type ApiKey, type BudgetUsage, type ModelRoute, type Tenant } from "@/lib/obleth";
+import { obleth, type ApiKey, type BudgetUsage, type GenaiExportStatus, type ModelRoute, type Tenant } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
@@ -18,12 +18,13 @@ export default async function TenantDetailPage({ params }: { params: Promise<{ n
   // An id leads to the name, so there is one address per tenant.
   if (tenant.name !== name) redirect(tenantHref(tenant));
 
-  const [keys, users, members, budgets, models] = await Promise.all([
+  const [keys, users, members, budgets, models, genai] = await Promise.all([
     safe(obleth.listKeys(tenant.id), [] as ApiKey[]),
     safe(listUsers(), [] as AdminUser[]),
     safe(accounts.listMembers(tenant.id), [] as Member[]),
     safe(obleth.budgetUsage(), [] as BudgetUsage[]),
     safe(obleth.listModels(), [] as ModelRoute[]),
+    safe(obleth.genaiExportStatus(), null as GenaiExportStatus | null),
   ]);
 
   return (
@@ -36,6 +37,7 @@ export default async function TenantDetailPage({ params }: { params: Promise<{ n
       users={[...new Set(users.map((u) => u.email.toLowerCase()))].sort()}
       budgets={budgets}
       models={models.map((m) => m.model_name).sort()}
+      genai={genai}
     />
   );
 }

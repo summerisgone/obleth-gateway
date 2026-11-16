@@ -8,6 +8,7 @@ mod batches;
 mod completion;
 mod crash_guard;
 mod energy;
+mod genai_export;
 mod jobs;
 mod jwt_auth;
 mod knowledge;
@@ -17,6 +18,7 @@ mod mcp;
 mod messages;
 mod metrics;
 mod output_monitor;
+mod pii;
 mod proxy;
 mod reasoning;
 mod replicas;
@@ -451,6 +453,46 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("GET /v1/load is off (OBLETH_LOAD_ENDPOINT)");
     }
 
+    let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let PiiGenAiStartup { pii_env, genai_cfg, genai_error } = pii_genai_startup(&env_map);
+    for w in &pii_env.warnings {
+        tracing::warn!("{w}");
+    }
+    if let Some(e) = &genai_error {
+        tracing::error!(error = %e, "GenAI OTLP export is off: invalid PII or GenAI configuration");
+    }
+    if genai_cfg.as_ref().is_some_and(|c| c.scrub_default == "llm") {
+        tracing::warn!("OBLETH_GENAI_SCRUB=llm is deprecated and will be removed; use a ner profile");
+    }
+    let pii_detector = Arc::new(pii::PiiDetector::new(
+        &pii_env,
+        reqwest::Client::new(),
+        boons.settings_handle(),
+    ));
+    let genai_max_request_bytes = genai_cfg.as_ref().map_or(0, |c| c.max_request_bytes);
+    let genai_scrub = genai_cfg.as_ref().map(|c| c.scrub_default.clone());
+    let genai = match genai_cfg {
+        Some(cfg) => {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()?;
+            let scrubber = Arc::new(genai_export::scrub::Scrubber::new(
+                cfg.clone(),
+                client.clone(),
+                pii_detector.clone(),
+            ));
+            let process = genai_export::pipeline::process_fn(cfg.clone(), scrubber);
+            tracing::info!("GenAI OTLP export is on");
+            Some(genai_export::exporter::Exporter::start(
+                cfg,
+                client,
+                process,
+                metrics.registry(),
+            ))
+        }
+        None => None,
+    };
+
     let app_state = AppState {
         redis: redis.clone(),
         fairshare: fairshare.clone(),
@@ -488,6 +530,9 @@ async fn main() -> anyhow::Result<()> {
         jobs: jobs::JobStore::new(store.clone(), cfg.job_scope),
         load,
         crash_guard: crate::crash_guard::CrashGuard::new(Some(capacity_discovery.clone())),
+        genai: genai.clone(),
+        genai_max_request_bytes,
+        pii: pii_detector.clone(),
         batches: batches::BatchConfig::from_env()
             .map(|cfg| batches::Batches::new(store.clone(), cfg)),
     };
@@ -672,6 +717,9 @@ async fn main() -> anyhow::Result<()> {
             }
         })),
         capacity_discovery: capacity_discovery.clone(),
+        genai_scrub,
+        genai_error,
+        pii_ner_url: pii_env.ner_url.clone(),
         // Advice findings are judged through the real /v1/verdicts pipeline
         // (auth, fairshare, ledger) as the reserved control-plane key, so the
         // judging shows up in usage like any other caller.
@@ -744,6 +792,9 @@ async fn main() -> anyhow::Result<()> {
     // Only once drained: a draining replica still holds its in-flight slots.
     if let Some(heartbeat) = replica_heartbeat {
         heartbeat.stop().await;
+    }
+    if let Some(exporter) = &genai {
+        exporter.shutdown(Duration::from_secs(5)).await;
     }
     telemetry.shutdown().await;
     if let Some(provider) = otel_provider {
@@ -1705,6 +1756,98 @@ where
     anyhow::bail!("could not connect to {name} after retries: {last}")
 }
 
+struct PiiGenAiStartup {
+    pii_env: pii::PiiEnv,
+    genai_cfg: Option<Arc<genai_export::config::GenAiConfig>>,
+    genai_error: Option<String>,
+}
+
+/// A bad PII or GenAI setting never stops the gateway: NER becomes unavailable
+/// and/or the export turns off, and the message is kept for the admin API.
+fn pii_genai_startup(env: &std::collections::HashMap<String, String>) -> PiiGenAiStartup {
+    let (pii_env, pii_error) = pii::PiiEnv::from_env_map(env);
+    if pii_error.is_some() {
+        return PiiGenAiStartup { pii_env, genai_cfg: None, genai_error: pii_error };
+    }
+    match genai_export::config::GenAiConfig::from_env_map(env) {
+        Ok(cfg) => PiiGenAiStartup { pii_env, genai_cfg: cfg.map(Arc::new), genai_error: None },
+        Err(e) => PiiGenAiStartup { pii_env, genai_cfg: None, genai_error: Some(e) },
+    }
+}
+
+#[cfg(test)]
+mod pii_startup_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_pii_env_keeps_gateway_up() {
+        let env: std::collections::HashMap<String, String> = [
+            ("OBLETH_GENAI_OTLP_ENDPOINT", "http://127.0.0.1:1"),
+            ("OBLETH_PII_NER_URL", "http://ner"),
+            ("OBLETH_PII_NER_CONCURRENCY", "0"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let st = pii_genai_startup(&env);
+        assert!(st.genai_cfg.is_none());
+        assert!(st.genai_error.as_deref().unwrap().contains("OBLETH_PII_NER_CONCURRENCY"));
+        assert!(st.pii_env.ner_url.is_none());
+        let det = pii::PiiDetector::new(
+            &st.pii_env,
+            reqwest::Client::new(),
+            Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
+        );
+        assert!(!det.ner_configured());
+    }
+
+    #[test]
+    fn bad_traces_timeout_keeps_model_ner_and_turns_export_off() {
+        let env: std::collections::HashMap<String, String> = [
+            ("OBLETH_GENAI_OTLP_ENDPOINT", "http://127.0.0.1:1"),
+            ("OBLETH_PII_NER_URL", "http://ner"),
+            ("OBLETH_GENAI_SCRUB_URL", "http://old"),
+            ("OBLETH_GENAI_SCRUB_TIMEOUT_MS", "soon"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let st = pii_genai_startup(&env);
+        assert!(st.genai_cfg.is_none());
+        assert!(st.genai_error.as_deref().unwrap().contains("OBLETH_GENAI_SCRUB_TIMEOUT_MS"));
+        assert_eq!(st.pii_env.warnings.len(), 1);
+        let det = pii::PiiDetector::new(
+            &st.pii_env,
+            reqwest::Client::new(),
+            Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
+        );
+        assert!(det.ner_configured());
+    }
+
+    #[test]
+    fn alias_warnings_survive_a_pii_config_error() {
+        let env: std::collections::HashMap<String, String> = [
+            ("OBLETH_PII_NER_URL", "http://ner"),
+            ("OBLETH_GENAI_SCRUB_URL", "http://old"),
+            ("OBLETH_PII_NER_CONCURRENCY", "0"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let st = pii_genai_startup(&env);
+        assert!(st.genai_error.is_some());
+        assert_eq!(st.pii_env.warnings.len(), 1);
+    }
+
+    #[test]
+    fn valid_env_starts_export() {
+        let env: std::collections::HashMap<String, String> =
+            [("OBLETH_GENAI_OTLP_ENDPOINT".to_string(), "http://127.0.0.1:1".to_string())].into();
+        let st = pii_genai_startup(&env);
+        assert!(st.genai_cfg.is_some() && st.genai_error.is_none());
+    }
+}
+
 #[cfg(test)]
 mod registry_refresh_tests {
     use super::*;
@@ -1738,6 +1881,7 @@ mod registry_refresh_tests {
 
     fn model(name: &str, request_timeout_secs: Option<i64>) -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
+            provider: String::new(),
             description: String::new(),
             model_name: name.to_string(),
             aliases: Vec::new(),
@@ -2047,6 +2191,8 @@ mod shutdown_tests {
 
     fn test_resolved_key() -> obleth_config::ResolvedKey {
         obleth_config::ResolvedKey {
+            pii_trace_profile: None,
+            genai_export: false,
             key_id: uuid::Uuid::new_v4(),
             tenant_id: uuid::Uuid::new_v4(),
             tenant_name: "t".into(),
