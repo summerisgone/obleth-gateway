@@ -7,7 +7,8 @@ let applied = false;
 /** Apply the idempotent auth schema once per process. */
 export async function applyAuthSchema(): Promise<void> {
   if (applied) return;
-  const sql = readFileSync(join(process.cwd(), "db", "auth-schema.sql"), "utf8");
+  const read = (f: string) => readFileSync(join(process.cwd(), "db", f), "utf8");
+  const sql = `${read("auth-schema.sql")}\n${read("connect-schema.sql")}`;
   await getDb().query(sql);
   applied = true;
 }

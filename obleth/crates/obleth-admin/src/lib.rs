@@ -448,6 +448,7 @@ pub fn router(state: AdminState) -> Router {
                 .delete(delete_mcp_server),
         )
         .route("/api/v1/audit", get(get_audit))
+        .route("/api/v1/audit/events", post(post_audit_event))
         .route("/api/v1/batches", get(batches::list_batches))
         .route("/api/v1/batches/:id", get(batches::get_batch))
         .route("/api/v1/batches/:id/cancel", post(batches::cancel_batch))
@@ -1910,6 +1911,25 @@ pub struct AuditEntryView {
     pub entity_id: String,
     pub detail: serde_json::Value,
 }
+
+/// Body of `POST /api/v1/audit/events`: an audit row written on behalf of
+/// the control plane for something that is not an admin API mutation.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AuditEventBody {
+    pub action: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    #[serde(default)]
+    pub detail: serde_json::Value,
+}
+
+/// Actions the control plane may record through `POST /api/v1/audit/events`.
+const CONTROL_PLANE_AUDIT_ACTIONS: &[&str] = &[
+    "connect_approve",
+    "connect_deny",
+    "connect_exchange",
+    "connect_revoke",
+];
 
 // ---- handlers ------------------------------------------------------------
 
@@ -10519,6 +10539,34 @@ async fn get_daily_stats(
         days,
         items,
     }))
+}
+
+async fn post_audit_event(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(body): Json<AuditEventBody>,
+) -> Result<StatusCode> {
+    if !CONTROL_PLANE_AUDIT_ACTIONS.contains(&body.action.as_str()) {
+        return Err(AdminError::BadRequest("unknown audit action".into()));
+    }
+    let entity_type: String = body.entity_type.trim().chars().take(64).collect();
+    let entity_id: String = body.entity_id.trim().chars().take(256).collect();
+    if entity_type.is_empty() || entity_id.is_empty() {
+        return Err(AdminError::BadRequest(
+            "entity_type and entity_id are required".into(),
+        ));
+    }
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            &body.action,
+            &entity_type,
+            &entity_id,
+            body.detail,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(

@@ -1,5 +1,6 @@
 import { oidcProviderLabels } from "@/lib/auth/providers";
 import { LoginForm } from "./login-form";
+import { safeNext } from "@/lib/auth/safe-next";
 
 // OIDC_PROVIDERS is read at request time, not build time. Without this, Next
 // statically prerenders the page during `next build` (when OIDC_PROVIDERS is
@@ -7,7 +8,8 @@ import { LoginForm } from "./login-form";
 // runtime — even when the env var is set in the deployed container.
 export const dynamic = "force-dynamic";
 
-export default function LoginPage() {
+export default async function LoginPage({ searchParams }: { searchParams: Promise<{ next?: string | string[] }> }) {
   const providers = oidcProviderLabels();
-  return <LoginForm providers={providers} />;
+  const { next } = await searchParams;
+  return <LoginForm providers={providers} next={safeNext(next)} />;
 }

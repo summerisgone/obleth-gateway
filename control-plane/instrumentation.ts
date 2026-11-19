@@ -5,6 +5,10 @@ export async function register() {
   const { bootstrapAdmin } = await import("@/lib/auth/bootstrap");
   await applyAuthSchema();
   await bootstrapAdmin();
+  // Keys issued by /connect with an expiry: the gateway has no key expiry, so
+  // delete them here once it passes.
+  const { startConnectSweeper } = await import("@/lib/connect/sweeper");
+  startConnectSweeper();
   // Best effort and not awaited: the gateway may still be starting; a failure
   // is retried on the next start.
   const { backfillMemberships } = await import("@/lib/auth/backfill-memberships");

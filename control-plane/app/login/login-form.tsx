@@ -13,9 +13,11 @@ import type { OidcProviderLabel } from "@/lib/auth/providers";
 
 interface LoginFormProps {
   providers: OidcProviderLabel[];
+  /** Where to go after sign-in (already checked by safeNext). */
+  next?: string;
 }
 
-export function LoginForm({ providers }: LoginFormProps) {
+export function LoginForm({ providers, next }: LoginFormProps) {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -32,7 +34,7 @@ export function LoginForm({ providers }: LoginFormProps) {
       setError("Invalid credentials");
       return;
     }
-    router.push("/");
+    router.push(next ?? "/");
     router.refresh();
   }
 
@@ -92,7 +94,7 @@ export function LoginForm({ providers }: LoginFormProps) {
                   <span className="bg-card px-2 text-muted-foreground">or</span>
                 </div>
               </div>
-              <SsoButtons providers={providers} />
+              <SsoButtons providers={providers} next={next} />
             </>
           )}
         </CardContent>

@@ -2,6 +2,7 @@ import { getSessionCookie } from "better-auth/cookies";
 import { NextResponse, type NextRequest } from "next/server";
 import { contentSecurityPolicy, generateNonce } from "@/lib/csp";
 import { sentByAnotherSite } from "@/lib/auth/origin";
+import { parseRedirectUri, redirectOrigin } from "@/lib/connect/redirect-uri";
 
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
@@ -20,12 +21,17 @@ export async function proxy(request: NextRequest) {
   // A fresh nonce per document. Forwarding the policy on the *request* is what
   // lets Next.js stamp the nonce on the script tags it renders; the same value
   // goes back on the response so the browser enforces it.
-  const csp = contentSecurityPolicy(generateNonce());
+  // The connect page's form answers with a redirect to the app's loopback
+  // address, and Chrome applies form-action to that redirect too.
+  const onConnectPage = pathname === "/connect";
+  const callback = onConnectPage ? parseRedirectUri(request.nextUrl.searchParams.get("redirect_uri")) : null;
+  const csp = contentSecurityPolicy(generateNonce(), callback ? { formAction: redirectOrigin(callback) } : {});
   const requestHeaders = new Headers(request.headers);
   requestHeaders.set("content-security-policy", csp);
   const pass = () => {
     const res = NextResponse.next({ request: { headers: requestHeaders } });
     res.headers.set("Content-Security-Policy", csp);
+    if (pathname.startsWith("/connect")) res.headers.set("X-Frame-Options", "DENY");
     return res;
   };
 
@@ -33,6 +39,10 @@ export async function proxy(request: NextRequest) {
     pathname.startsWith("/login") ||
     pathname.startsWith("/awaiting-approval") ||
     pathname.startsWith("/api/auth") ||
+    // The connect page signs the visitor in itself (it validates the request
+    // first); its API routes are called by the desktop host without a cookie.
+    pathname.startsWith("/connect") ||
+    pathname.startsWith("/api/connect") ||
     pathname.startsWith("/_next") ||
     pathname.includes(".")
   ) {

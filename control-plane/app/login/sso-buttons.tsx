@@ -6,9 +6,10 @@ import type { OidcProviderLabel } from "@/lib/auth/providers";
 
 interface SsoButtonsProps {
   providers: OidcProviderLabel[];
+  next?: string;
 }
 
-export function SsoButtons({ providers }: SsoButtonsProps) {
+export function SsoButtons({ providers, next }: SsoButtonsProps) {
   if (providers.length === 0) return null;
   return (
     <div className="space-y-2">
@@ -19,7 +20,7 @@ export function SsoButtons({ providers }: SsoButtonsProps) {
           variant="outline"
           className="w-full"
           onClick={() =>
-            authClient.signIn.oauth2({ providerId: p.providerId, callbackURL: "/" })
+            authClient.signIn.oauth2({ providerId: p.providerId, callbackURL: next ?? "/" })
           }
         >
           Sign in with {p.displayName}
