@@ -19,6 +19,8 @@
 
 export interface CspOptions {
   development?: boolean;
+  /** One more origin forms may post to (the connect page's loopback callback). */
+  formAction?: string;
 }
 
 export function contentSecurityPolicy(nonce: string, opts: CspOptions = {}): string {
@@ -33,7 +35,7 @@ export function contentSecurityPolicy(nonce: string, opts: CspOptions = {}): str
     "connect-src 'self' blob: data:",
     "frame-ancestors 'none'",
     "base-uri 'self'",
-    "form-action 'self'",
+    `form-action 'self'${opts.formAction ? ` ${opts.formAction}` : ""}`,
     "object-src 'none'",
   ].join("; ");
 }

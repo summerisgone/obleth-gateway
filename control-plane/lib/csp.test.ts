@@ -59,3 +59,10 @@ describe("generateNonce", () => {
     expect(Buffer.from(a, "base64")).toHaveLength(16);
   });
 });
+
+describe("connect form-action", () => {
+  it("adds the loopback origin to form-action only when asked", () => {
+    expect(contentSecurityPolicy("n", {})).toContain("form-action 'self';");
+    expect(contentSecurityPolicy("n", { formAction: "http://127.0.0.1:5000" })).toContain("form-action 'self' http://127.0.0.1:5000;");
+  });
+});
